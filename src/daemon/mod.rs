@@ -185,15 +185,42 @@ async fn handle_connection(
                 raw,
                 lease_token,
             } => {
+                let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::run(&host, &command, session, timeout_secs, raw).await
-                    {
-                        Ok(reply) => Response::Run(reply),
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
-                    },
+                    Ok(()) => {
+                        audit::record(
+                            "run_started",
+                            serde_json::json!({
+                                "host": host, "session": session_hint, "command": command,
+                            }),
+                        );
+                        match session::run(&host, &command, session, timeout_secs, raw).await {
+                            Ok(reply) => {
+                                audit::record(
+                                    "run_settled",
+                                    serde_json::json!({
+                                        "host": host, "session": reply.session,
+                                        "command": command, "state": reply.state,
+                                        "exit_code": reply.exit_code,
+                                    }),
+                                );
+                                Response::Run(reply)
+                            }
+                            Err(e) => {
+                                audit::record(
+                                    "run_settled",
+                                    serde_json::json!({
+                                        "host": host, "session": session_hint, "command": command,
+                                        "state": "error", "error": e.to_string(),
+                                    }),
+                                );
+                                Response::Error {
+                                    message: e.to_string(),
+                                }
+                            }
+                        }
+                    }
                 };
                 chan.send(&resp).await?;
             }
@@ -222,10 +249,19 @@ async fn handle_connection(
                 newline,
                 lease_token,
             } => {
+                let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
                     Ok(()) => match session::send(&host, &keys, session, newline).await {
-                        Ok(()) => Response::Ok,
+                        Ok(()) => {
+                            // Never log `keys`: it can carry a password/answer
+                            // typed into an interactive prompt (DESIGN.md §4).
+                            audit::record(
+                                "send",
+                                serde_json::json!({"host": host, "session": session_hint}),
+                            );
+                            Response::Ok
+                        }
                         Err(e) => Response::Error {
                             message: e.to_string(),
                         },
@@ -238,10 +274,17 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
+                let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
                     Ok(()) => match session::interrupt(&host, session).await {
-                        Ok(()) => Response::Ok,
+                        Ok(()) => {
+                            audit::record(
+                                "interrupt",
+                                serde_json::json!({"host": host, "session": session_hint}),
+                            );
+                            Response::Ok
+                        }
                         Err(e) => Response::Error {
                             message: e.to_string(),
                         },
@@ -274,14 +317,60 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
+                let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
                     Ok(()) => match session::kill(&host, session).await {
-                        Ok(()) => Response::Ok,
+                        Ok(()) => {
+                            audit::record(
+                                "session_killed",
+                                serde_json::json!({"host": host, "session": session_hint}),
+                            );
+                            Response::Ok
+                        }
                         Err(e) => Response::Error {
                             message: e.to_string(),
                         },
                     },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::Put {
+                host,
+                local_path,
+                remote_path,
+                session,
+                lease_token,
+            } => {
+                let resp = match require_lease(peer, &host, &lease_token).await {
+                    Err(denied) => denied,
+                    Ok(()) => match session::put(&host, session, &local_path, &remote_path).await {
+                        Ok(reply) => Response::Transfer(reply),
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::Get {
+                host,
+                remote_path,
+                local_path,
+                session,
+                force,
+                lease_token,
+            } => {
+                let resp = match require_lease(peer, &host, &lease_token).await {
+                    Err(denied) => denied,
+                    Ok(()) => {
+                        match session::get(&host, session, &remote_path, &local_path, force).await {
+                            Ok(reply) => Response::Transfer(reply),
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
+                        }
+                    }
                 };
                 chan.send(&resp).await?;
             }
@@ -296,9 +385,19 @@ async fn handle_connection(
                     .await?;
                     continue;
                 };
-                let resp = match lease::request_lease(caller_pid, hosts).await {
-                    Ok(lease::RequestOutcome::AlreadyAuthorized) => Response::Ok,
-                    Ok(lease::RequestOutcome::Pending(info)) => Response::LeaseRequestPending(info),
+                let resp = match lease::request_lease(caller_pid, hosts.clone()).await {
+                    Ok(outcome) => {
+                        audit::record(
+                            "lease_requested",
+                            serde_json::json!({"hosts": hosts, "caller_pid": caller_pid}),
+                        );
+                        match outcome {
+                            lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
+                            lease::RequestOutcome::Pending(info) => {
+                                Response::LeaseRequestPending(info)
+                            }
+                        }
+                    }
                     Err(e) => Response::Error {
                         message: e.to_string(),
                     },
@@ -336,6 +435,13 @@ async fn handle_connection(
                 .await
                 {
                     Ok(mut info) => {
+                        audit::record(
+                            "lease_approved",
+                            serde_json::json!({
+                                "hosts": info.hosts, "anchor_name": info.anchor_name,
+                                "anchor_pid": info.anchor_pid,
+                            }),
+                        );
                         // DESIGN.md §4: with the vault now unlocked, resolve
                         // each granted host the same way a real connection
                         // will (vault entry first) and tell the CLI which
@@ -351,6 +457,15 @@ async fn handle_connection(
                             }
                         }
                         Response::LeaseActivated(info)
+                    }
+                    Err(e @ lease::LeaseError::SelfApproval { .. }) => {
+                        audit::record(
+                            "lease_denied_self_approval",
+                            serde_json::json!({"request_id": id, "error": e.to_string()}),
+                        );
+                        Response::Error {
+                            message: e.to_string(),
+                        }
                     }
                     Err(e) => Response::Error {
                         message: e.to_string(),

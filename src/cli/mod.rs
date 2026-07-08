@@ -6,10 +6,11 @@ mod client;
 
 pub use args::Cli;
 use args::{
-    AddArgs, ApproveArgs, Command, DaemonAction, InterruptArgs, KillArgs, LsArgs, OpenArgs,
-    PeekArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
+    AddArgs, ApproveArgs, Command, DaemonAction, GetArgs, InterruptArgs, KillArgs, LogArgs, LsArgs,
+    OpenArgs, PeekArgs, PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
 };
 
+use crate::daemon::audit;
 use crate::daemon::ssh;
 use crate::proto::{
     self, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response, RunReply,
@@ -41,17 +42,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Vault(args) => match args.action {
             VaultAction::Init => cmd_vault_init().await,
         },
-        Command::Put(_) => not_implemented("put"),
-        Command::Get(_) => not_implemented("get"),
-        Command::Log(_) => not_implemented("log"),
+        Command::Put(args) => cmd_put(args).await,
+        Command::Get(args) => cmd_get(args).await,
+        Command::Log(args) => cmd_log(args).await,
     }
-}
-
-fn not_implemented(name: &str) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "`sloosh {name}` is not implemented yet. Milestone 1 only wires up `status` and `daemon`; \
-         see DESIGN.md §6 for the full phase-1 command surface as it lands."
-    )
 }
 
 async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
@@ -599,4 +593,185 @@ async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("removed '{}' from the vault", args.alias);
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// put/get over SFTP (DESIGN.md §5-6).
+// ---------------------------------------------------------------------
+
+/// Resolve `path` to an absolute path against *this* process's current
+/// directory. Required before sending a local path to the daemon: the
+/// daemon reads/writes the local filesystem directly on the CLI's behalf
+/// (file content never crosses the socket), but the daemon's own working
+/// directory is not the caller's, so a relative path would resolve
+/// somewhere else entirely on that side. Existence is not required here —
+/// `get`'s local destination may not exist yet — this is pure path
+/// arithmetic, not a filesystem check.
+fn resolve_local_path(path: &str) -> anyhow::Result<String> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Ok(path.to_string());
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        anyhow::anyhow!(
+            "could not resolve local path '{path}' to an absolute path: could not determine \
+             the current directory ({e})"
+        )
+    })?;
+    Ok(cwd.join(p).to_string_lossy().into_owned())
+}
+
+async fn cmd_put(args: PutArgs) -> anyhow::Result<()> {
+    let local_path = resolve_local_path(&args.local_path)?;
+    let req = Request::Put {
+        host: args.host,
+        local_path,
+        remote_path: args.remote_path,
+        session: args.session,
+        lease_token: lease_token_from_env(),
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Transfer(reply) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Put: {resp:?}");
+    };
+    println!(
+        "put: {} -> {}:{} ({} bytes)",
+        reply.local_path, reply.host, reply.remote_path, reply.bytes_transferred
+    );
+    Ok(())
+}
+
+async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
+    let local_path = resolve_local_path(&args.local_path)?;
+    let req = Request::Get {
+        host: args.host,
+        remote_path: args.remote_path,
+        local_path,
+        session: args.session,
+        force: args.force,
+        lease_token: lease_token_from_env(),
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Transfer(reply) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Get: {resp:?}");
+    };
+    println!(
+        "get: {}:{} -> {} ({} bytes)",
+        reply.host, reply.remote_path, reply.local_path, reply.bytes_transferred
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `sloosh log` (DESIGN.md §4) — reads ~/.sloosh/audit.jsonl directly, no
+// daemon round-trip needed: the CLI and daemon run as the same user.
+// ---------------------------------------------------------------------
+
+async fn cmd_log(args: LogArgs) -> anyhow::Result<()> {
+    let path = audit::audit_log_path();
+    let raw_lines = audit::read_raw_lines(&path)
+        .map_err(|e| anyhow::anyhow!("could not read audit log at {}: {e}", path.display()))?;
+
+    let mut parsed: Vec<(String, serde_json::Value)> = Vec::new();
+    for line in raw_lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            parsed.push((line, v));
+        }
+        // Malformed lines are silently skipped here (audit::record's own
+        // best-effort posture means a torn write is expected to be rare and
+        // not worth failing `sloosh log` over).
+    }
+
+    let filtered: Vec<(String, serde_json::Value)> = parsed
+        .into_iter()
+        .filter(|(_, v)| {
+            args.host
+                .as_deref()
+                .is_none_or(|h| v.get("host").and_then(|x| x.as_str()) == Some(h))
+        })
+        .collect();
+
+    let start = filtered.len().saturating_sub(args.count);
+    let tail = &filtered[start..];
+
+    if tail.is_empty() {
+        match &args.host {
+            Some(h) => println!("no audit log entries for host '{h}'"),
+            None => println!("no audit log entries yet (~/.sloosh/audit.jsonl)"),
+        }
+        return Ok(());
+    }
+
+    if args.json {
+        for (raw, _) in tail {
+            println!("{raw}");
+        }
+    } else {
+        for (_, v) in tail {
+            print_audit_event_human(v);
+        }
+    }
+    Ok(())
+}
+
+fn print_audit_event_human(v: &serde_json::Value) {
+    let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("?");
+    let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("?");
+    let mut fields = String::new();
+    if let Some(obj) = v.as_object() {
+        let mut keys: Vec<&String> = obj.keys().filter(|k| *k != "ts" && *k != "event").collect();
+        keys.sort();
+        for k in keys {
+            fields.push_str(&format!(" {k}={}", render_field_value(&obj[k])));
+        }
+    }
+    println!("{ts}  {event}{fields}");
+}
+
+fn render_field_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests deliberately never call `std::env::set_current_dir` (that
+    // mutates process-global state and would race with every other test
+    // running concurrently in this binary) — they only *read* the real
+    // current directory to compute the expected answer, then check
+    // `resolve_local_path` agrees with it.
+
+    #[test]
+    fn absolute_path_is_returned_unchanged() {
+        let abs = if cfg!(windows) {
+            "C:\\tmp\\thing.txt"
+        } else {
+            "/tmp/thing.txt"
+        };
+        assert_eq!(resolve_local_path(abs).unwrap(), abs);
+    }
+
+    #[test]
+    fn relative_path_is_resolved_against_the_current_directory() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let expected = cwd
+            .join("some/relative/path.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_local_path("some/relative/path.txt").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn bare_filename_is_resolved_against_the_current_directory() {
+        let cwd = std::env::current_dir().expect("current dir");
+        let expected = cwd.join("file.txt").to_string_lossy().into_owned();
+        assert_eq!(resolve_local_path("file.txt").unwrap(), expected);
+    }
 }

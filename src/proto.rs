@@ -182,6 +182,39 @@ pub enum Request {
         alias: String,
         master_password: SecretString,
     },
+    /// Upload a local file to a host over SFTP, reusing the target
+    /// session's existing SSH connection (DESIGN.md §5: "put/get 走既有连接
+    /// 的 SFTP channel" — no redial/reauth per transfer). The CLI resolves
+    /// `local_path` to an absolute path before sending: the daemon's
+    /// working directory is not the caller's, so a relative path here would
+    /// resolve against the wrong place. Overwriting an existing file at
+    /// `remote_path` is allowed unconditionally — the remote host is the
+    /// disposable workspace.
+    Put {
+        host: String,
+        local_path: String,
+        remote_path: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        lease_token: Option<String>,
+    },
+    /// Download a remote file to the local filesystem over SFTP, same
+    /// connection-reuse contract as `Put`. Refuses to overwrite an existing
+    /// local file unless `force` is set — unlike `put`, the destination
+    /// here is the user's own machine, so accidental overwrite is worse
+    /// than a refusal.
+    Get {
+        host: String,
+        remote_path: String,
+        local_path: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        lease_token: Option<String>,
+    },
 }
 
 fn default_run_timeout_secs() -> u64 {
@@ -218,6 +251,8 @@ pub enum Response {
     VaultExists { exists: bool },
     /// Reply to `Request::ApproveLease`.
     LeaseActivated(LeaseActivatedInfo),
+    /// Reply to `Request::Put`/`Request::Get`.
+    Transfer(TransferReply),
 }
 
 /// Reply to `Request::Run`.
@@ -343,6 +378,16 @@ pub struct LeaseActivatedInfo {
     /// daemon-side.
     #[serde(default)]
     pub unverified_hosts: Vec<UnverifiedHostKey>,
+}
+
+/// Reply to `Request::Put`/`Request::Get` (DESIGN.md §5-6).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TransferReply {
+    pub host: String,
+    pub session: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub bytes_transferred: u64,
 }
 
 /// One granted host that still needs its host key fetched, shown to the
@@ -666,6 +711,65 @@ mod tests {
             state: "idle".to_string(),
             idle_secs: 0,
             dead_reason: None,
+        }));
+    }
+
+    #[test]
+    fn put_get_requests_round_trip_with_defaults() {
+        round_trip(Request::Put {
+            host: "box".to_string(),
+            local_path: "/home/u/file.txt".to_string(),
+            remote_path: "/tmp/file.txt".to_string(),
+            session: None,
+            lease_token: None,
+        });
+        round_trip(Request::Get {
+            host: "box".to_string(),
+            remote_path: "/tmp/file.txt".to_string(),
+            local_path: "/home/u/file.txt".to_string(),
+            session: Some("dev".to_string()),
+            force: true,
+            lease_token: Some("deadbeef".to_string()),
+        });
+
+        // Old clients that omit `session`/`force`/`lease_token` entirely
+        // must still parse (#[serde(default)] discipline).
+        let json = r#"{"type":"Put","host":"box","local_path":"/a","remote_path":"/b"}"#;
+        let req: Request = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            req,
+            Request::Put {
+                host: "box".to_string(),
+                local_path: "/a".to_string(),
+                remote_path: "/b".to_string(),
+                session: None,
+                lease_token: None,
+            }
+        );
+
+        let json = r#"{"type":"Get","host":"box","remote_path":"/a","local_path":"/b"}"#;
+        let req: Request = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            req,
+            Request::Get {
+                host: "box".to_string(),
+                remote_path: "/a".to_string(),
+                local_path: "/b".to_string(),
+                session: None,
+                force: false,
+                lease_token: None,
+            }
+        );
+    }
+
+    #[test]
+    fn transfer_reply_round_trips() {
+        round_trip(Response::Transfer(TransferReply {
+            host: "box".to_string(),
+            session: "default".to_string(),
+            local_path: "/home/u/file.txt".to_string(),
+            remote_path: "/tmp/file.txt".to_string(),
+            bytes_transferred: 1234,
         }));
     }
 }

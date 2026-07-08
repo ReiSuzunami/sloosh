@@ -40,6 +40,31 @@ impl ProcessInfo for ProcessTree {
     fn exe_basename(pid: u32) -> Option<String> {
         parse_stat(pid).map(|s| s.comm)
     }
+
+    fn exe_path_basename(pid: u32) -> Option<String> {
+        // `/proc/<pid>/exe` is a symlink to the executable's on-disk path —
+        // a second, independent name signal from `comm` above (see
+        // `procs::pick_display_name`).
+        let target = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        target.file_name().map(|n| n.to_string_lossy().into_owned())
+    }
+
+    fn argv0_basename(pid: u32) -> Option<String> {
+        // `/proc/<pid>/cmdline` is the argument vector, NUL-separated; the
+        // first token is argv[0] — the third name signal (see
+        // `procs::pick_display_name`), and the one `ps` displays.
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let first = cmdline.split(|&b| b == 0).next()?;
+        if first.is_empty() {
+            return None;
+        }
+        let arg0 = String::from_utf8_lossy(first);
+        // argv[0] may already be a bare name with no slashes ("claude");
+        // `Path::file_name` returns such strings unchanged.
+        std::path::Path::new(arg0.as_ref())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
 }
 
 struct StatFields {
@@ -126,6 +151,20 @@ mod tests {
 
         let comm = ProcessTree::exe_basename(pid).expect("exe_basename for our own pid");
         assert!(!comm.is_empty());
+    }
+
+    #[test]
+    fn exe_path_basename_resolves_for_self_and_is_nonempty() {
+        let pid = std::process::id();
+        let name = ProcessTree::exe_path_basename(pid).expect("exe_path_basename for our own pid");
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn argv0_basename_resolves_for_self_and_is_nonempty() {
+        let pid = std::process::id();
+        let name = ProcessTree::argv0_basename(pid).expect("argv0_basename for our own pid");
+        assert!(!name.is_empty());
     }
 
     #[test]

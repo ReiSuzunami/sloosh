@@ -16,12 +16,17 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use russh_sftp::client::SftpSession;
+use russh_sftp::client::error::Error as SftpClientError;
+use russh_sftp::protocol::{OpenFlags, StatusCode};
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::sleep_until;
 use tracing::{info, warn};
 
+use crate::daemon::audit;
 use crate::daemon::ssh::{self, SshError};
-use crate::proto::SessionSummary;
+use crate::proto::{SessionSummary, TransferReply};
 use crate::transport::unix::sloosh_home;
 
 /// Bound on how much output we keep in memory per session (DESIGN.md §5).
@@ -92,6 +97,64 @@ pub enum SessionError {
          directory exists and is writable by this user. (io: {0})"
     )]
     Io(#[from] std::io::Error),
+
+    // -- put/get (DESIGN.md §5-6) -------------------------------------------
+    #[error(
+        "local file '{path}' does not exist or is not readable — check the path (`sloosh put` \
+         resolves relative paths from the directory it's run in, since the daemon's own working \
+         directory is not yours). (io: {source})"
+    )]
+    LocalFileMissing {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error(
+        "local destination '{path}' already exists — `sloosh get` refuses to overwrite a file \
+         on your machine unless you pass --force. (Overwriting the *remote* file on `put` is \
+         always allowed: the remote host is the disposable workspace; your local machine is not, \
+         so `get` is more careful about it.) Pass --force to overwrite it, or choose a different \
+         local path."
+    )]
+    LocalDestinationExists { path: String },
+
+    #[error(
+        "could not write local destination '{path}' — check that its containing directory \
+         exists and is writable by this user. (io: {source})"
+    )]
+    LocalDestinationUnwritable {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error(
+        "remote path '{path}' on '{host}' over SFTP: {reason} — check the path, and that the \
+         remote user has permission to reach it."
+    )]
+    RemotePath {
+        host: String,
+        path: String,
+        reason: String,
+    },
+
+    #[error(
+        "could not start the SFTP subsystem on '{host}' — the remote sshd may not have SFTP \
+         enabled (look for a `Subsystem sftp ...` line in its sshd_config), or the connection \
+         dropped mid-handshake. Try `sftp {host}` by hand to compare. (sftp: {reason})"
+    )]
+    Sftp { host: String, reason: String },
+
+    #[error(
+        "transfer between local '{local}' and remote '{remote}' on '{host}' failed partway \
+         through — the connection may have dropped, or a disk may be full. Retry; if it keeps \
+         happening, check `sloosh peek {host}` doesn't show the session as dead. (io: {source})"
+    )]
+    Transfer {
+        host: String,
+        local: String,
+        remote: String,
+        source: std::io::Error,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +840,10 @@ async fn create_session(host: &str, name: &str) -> Result<Arc<SessionInner>, Ses
         }
     }
 
+    audit::record(
+        "session_opened",
+        serde_json::json!({"host": host, "session": name}),
+    );
     Ok(inner)
 }
 
@@ -884,6 +951,10 @@ async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
     if state.dead.is_none() {
         warn!(host = %inner.host, session = %inner.name, reason, "session died");
         state.dead = Some(reason.to_string());
+        audit::record(
+            "session_dead",
+            serde_json::json!({"host": inner.host, "session": inner.name, "reason": reason}),
+        );
     }
     state.busy = false;
     state.current_run = None;
@@ -1259,6 +1330,205 @@ pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
 /// Summaries of all live sessions, for `status`.
 pub async fn list_summaries() -> Vec<SessionSummary> {
     ls(None).await
+}
+
+// ---------------------------------------------------------------------------
+// `put`/`get` over SFTP (DESIGN.md §5-6)
+// ---------------------------------------------------------------------------
+
+/// Get (or create) the named session, then open a fresh SFTP-subsystem
+/// channel on its *existing* SSH connection (DESIGN.md §5: "put/get 走既有
+/// 连接的 SFTP channel" — reuse the authenticated connection, never redial or
+/// reauthenticate per transfer). Returns the resolved session name alongside
+/// the SFTP handle so callers can echo it back in their reply.
+async fn sftp_session(
+    host: &str,
+    session: Option<String>,
+) -> Result<(String, SftpSession), SessionError> {
+    let name = default_session_name(session);
+    let inner = get_or_create_session(host, &name).await?;
+    let channel = inner
+        ._connection
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(SshError::from)?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(SshError::from)?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| SessionError::Sftp {
+            host: host.to_string(),
+            reason: e.to_string(),
+        })?;
+    Ok((name, sftp))
+}
+
+/// Translate an SFTP protocol error on `path` into a self-teaching
+/// `SessionError` — `NoSuchFile`/`PermissionDenied` get a specific message
+/// (DESIGN.md §7); anything else falls back to the generic SFTP error.
+fn remote_path_error(host: &str, path: &str, err: SftpClientError) -> SessionError {
+    if let SftpClientError::Status(status) = &err {
+        let reason = match status.status_code {
+            StatusCode::NoSuchFile => Some("no such file or directory"),
+            StatusCode::PermissionDenied => Some("permission denied"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return SessionError::RemotePath {
+                host: host.to_string(),
+                path: path.to_string(),
+                reason: reason.to_string(),
+            };
+        }
+    }
+    SessionError::Sftp {
+        host: host.to_string(),
+        reason: err.to_string(),
+    }
+}
+
+/// `put <host> <local-path> <remote-path>` — upload a local file over SFTP
+/// (DESIGN.md §5-6). `local_path` must already be absolute: the CLI resolves
+/// relative paths before sending, since the daemon's own working directory
+/// is not the caller's. File content is read directly off this process's
+/// local filesystem and written directly to the remote one — it never
+/// crosses the CLI<->daemon socket, only the two paths and the resulting
+/// byte count do. Overwriting an existing file at `remote_path` is always
+/// allowed: the remote host is the disposable workspace.
+pub async fn put(
+    host: &str,
+    session: Option<String>,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<TransferReply, SessionError> {
+    let mut local_file = tokio::fs::File::open(local_path).await.map_err(|source| {
+        SessionError::LocalFileMissing {
+            path: local_path.to_string(),
+            source,
+        }
+    })?;
+
+    let (session_name, sftp) = sftp_session(host, session).await?;
+
+    let mut remote_file = sftp
+        .open_with_flags(
+            remote_path,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+        )
+        .await
+        .map_err(|e| remote_path_error(host, remote_path, e))?;
+
+    let bytes_transferred = tokio::io::copy(&mut local_file, &mut remote_file)
+        .await
+        .map_err(|source| SessionError::Transfer {
+            host: host.to_string(),
+            local: local_path.to_string(),
+            remote: remote_path.to_string(),
+            source,
+        })?;
+    let _ = remote_file.shutdown().await;
+
+    audit::record(
+        "put",
+        serde_json::json!({
+            "host": host,
+            "session": session_name,
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "bytes": bytes_transferred,
+        }),
+    );
+
+    Ok(TransferReply {
+        host: host.to_string(),
+        session: session_name,
+        local_path: local_path.to_string(),
+        remote_path: remote_path.to_string(),
+        bytes_transferred,
+    })
+}
+
+/// `get <host> <remote-path> <local-path>` — download a remote file over
+/// SFTP (DESIGN.md §5-6), same connection-reuse contract as `put`. Refuses
+/// to overwrite an existing local file unless `force`: unlike `put`, the
+/// destination here is the user's own machine, so an accidental overwrite is
+/// worse than a refusal. The existence check is checked up front (fail fast
+/// without even dialing SFTP) and re-checked atomically via `create_new`
+/// when actually opening the destination, closing the TOCTOU window between
+/// the two.
+pub async fn get(
+    host: &str,
+    session: Option<String>,
+    remote_path: &str,
+    local_path: &str,
+    force: bool,
+) -> Result<TransferReply, SessionError> {
+    if !force && tokio::fs::try_exists(local_path).await.unwrap_or(false) {
+        return Err(SessionError::LocalDestinationExists {
+            path: local_path.to_string(),
+        });
+    }
+
+    let (session_name, sftp) = sftp_session(host, session).await?;
+
+    let mut remote_file = sftp
+        .open(remote_path)
+        .await
+        .map_err(|e| remote_path_error(host, remote_path, e))?;
+
+    let mut open_opts = tokio::fs::OpenOptions::new();
+    open_opts.write(true);
+    if force {
+        open_opts.create(true).truncate(true);
+    } else {
+        open_opts.create_new(true);
+    }
+    let mut local_file = match open_opts.open(local_path).await {
+        Ok(f) => f,
+        Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SessionError::LocalDestinationExists {
+                path: local_path.to_string(),
+            });
+        }
+        Err(source) => {
+            return Err(SessionError::LocalDestinationUnwritable {
+                path: local_path.to_string(),
+                source,
+            });
+        }
+    };
+
+    let bytes_transferred = tokio::io::copy(&mut remote_file, &mut local_file)
+        .await
+        .map_err(|source| SessionError::Transfer {
+            host: host.to_string(),
+            local: local_path.to_string(),
+            remote: remote_path.to_string(),
+            source,
+        })?;
+    let _ = local_file.flush().await;
+
+    audit::record(
+        "get",
+        serde_json::json!({
+            "host": host,
+            "session": session_name,
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "bytes": bytes_transferred,
+        }),
+    );
+
+    Ok(TransferReply {
+        host: host.to_string(),
+        session: session_name,
+        local_path: local_path.to_string(),
+        remote_path: remote_path.to_string(),
+        bytes_transferred,
+    })
 }
 
 /// Spawn the background idle-session reaper. Call once, at daemon startup.

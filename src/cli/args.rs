@@ -194,6 +194,11 @@ pub enum VaultAction {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    long_about = "Upload a local file to a host over SFTP, reusing the session's existing SSH \
+connection (no redial, no reauth). An existing file at the remote path is always overwritten: \
+the remote host is the disposable workspace, so `put` doesn't ask."
+)]
 pub struct PutArgs {
     /// Destination host.
     pub host: String,
@@ -207,6 +212,12 @@ pub struct PutArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    long_about = "Download a remote file from a host over SFTP, reusing the session's existing \
+SSH connection (no redial, no reauth). Unlike `put`, an existing file at the local destination \
+is left alone unless you pass --force: the remote host is a disposable workspace, but your local \
+machine is not, so `get` refuses to clobber it by default."
+)]
 pub struct GetArgs {
     /// Source host.
     pub host: String,
@@ -217,6 +228,9 @@ pub struct GetArgs {
     /// Named parallel session whose connection to reuse.
     #[arg(long)]
     pub session: Option<String>,
+    /// Overwrite an existing local file at the destination path.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -249,10 +263,10 @@ pub struct LogArgs {
     /// Only show entries for this host.
     #[arg(long)]
     pub host: Option<String>,
-    /// Only show entries at or after this time (e.g. "2026-07-01T00:00:00Z").
+    /// Number of most-recent entries to show.
+    #[arg(short = 'n', long = "count", default_value_t = 50)]
+    pub count: usize,
+    /// Print raw NDJSON lines instead of a human-readable summary.
     #[arg(long)]
-    pub since: Option<String>,
-    /// Keep following the log as new entries are appended.
-    #[arg(long)]
-    pub follow: bool,
+    pub json: bool,
 }

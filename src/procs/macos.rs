@@ -44,6 +44,122 @@ impl ProcessInfo for ProcessTree {
     fn exe_basename(pid: u32) -> Option<String> {
         query(pid).and_then(|p| p.comm)
     }
+
+    fn exe_path_basename(pid: u32) -> Option<String> {
+        exe_path(pid).and_then(|p| {
+            std::path::Path::new(&p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+
+    fn argv0_basename(pid: u32) -> Option<String> {
+        argv0(pid).and_then(|a| {
+            // argv[0] is often a bare name with no slashes ("claude");
+            // `Path::file_name` returns such strings unchanged.
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+    }
+}
+
+/// The process's on-disk executable path via `proc_pidpath` (libproc, part
+/// of `libSystem` — no extra linking needed on macOS). A second, independent
+/// name signal from `p_comm` above (see `procs::pick_display_name`).
+fn exe_path(pid: u32) -> Option<String> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is a valid, correctly-sized buffer for the duration of
+    // the call; `proc_pidpath` only reads `pid` and writes up to
+    // `buf.len()` bytes into `buf`, returning the number of bytes written
+    // (or a negative value on error).
+    let ret = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as u32,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..ret as usize])
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// The process's `argv[0]` via `sysctl(KERN_PROCARGS2)` — the third name
+/// signal (see `procs::pick_display_name`), and the one `ps -o comm`
+/// actually displays. Only works for same-user processes (the kernel
+/// refuses other users' argument vectors), which is fine: lease anchoring
+/// only ever inspects the calling user's own process tree.
+///
+/// Result buffer layout (confirmed against a C probe on this machine, and
+/// long relied on by `ps`/`procps` ports):
+///
+/// ```text
+/// i32 argc | exec_path\0 | \0 padding... | argv[0]\0 | argv[1]\0 | ... | env...
+/// ```
+fn argv0(pid: u32) -> Option<String> {
+    // Upper bound for the buffer: the kernel's KERN_ARGMAX.
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib: [libc::c_int; 2] = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: `mib` is a valid 2-element c_int array; `argmax`/`size`
+    // describe a real c_int-sized output buffer for the duration of the
+    // call; `sysctl` only writes up to `size` bytes into it.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut argmax as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || argmax <= 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; argmax as usize];
+    let mut size = buf.len();
+    let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    // SAFETY: same shape as above — `buf`/`size` describe a real,
+    // correctly-sized buffer; `sysctl` writes at most `size` bytes and
+    // updates `size` with the number actually written.
+    let ret = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 || size < 4 {
+        return None;
+    }
+    let buf = &buf[..size];
+
+    // Skip the leading i32 argc, then the NUL-terminated exec_path, then
+    // the run of NUL padding, landing on argv[0].
+    let mut i = 4;
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    while i < buf.len() && buf[i] == 0 {
+        i += 1;
+    }
+    let start = i;
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    std::str::from_utf8(&buf[start..i]).ok().map(str::to_string)
 }
 
 struct RawProc {
@@ -138,6 +254,23 @@ mod tests {
         // The test binary's comm name is truncated to 16 chars by the
         // kernel; just check it's non-empty and plausible.
         assert!(!comm.is_empty());
+    }
+
+    #[test]
+    fn exe_path_basename_resolves_for_self_and_is_nonempty() {
+        let pid = std::process::id();
+        let name = ProcessTree::exe_path_basename(pid).expect("exe_path_basename for our own pid");
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn argv0_basename_resolves_for_self_and_is_nonempty() {
+        // Our own process is same-user by definition, so KERN_PROCARGS2
+        // must be readable; the test binary is invoked by path, so its
+        // argv[0] basename should match its executable path basename.
+        let pid = std::process::id();
+        let name = ProcessTree::argv0_basename(pid).expect("argv0_basename for our own pid");
+        assert!(!name.is_empty());
     }
 
     #[test]

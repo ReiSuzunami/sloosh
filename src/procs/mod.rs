@@ -29,10 +29,33 @@ pub trait ProcessInfo {
     /// ancestor chain (DESIGN.md §4: lease binds to (PID, start time)).
     fn start_time(pid: u32) -> Option<SystemTime>;
 
-    /// Basename of the process's executable (e.g. `"claude"`, `"zsh"`),
-    /// used by the anchor-selection algorithm in `daemon::lease` to skip
-    /// over the `sloosh` CLI itself and intermediate shells.
+    /// Kernel-reported short process name (`p_comm` on macOS,
+    /// `/proc/<pid>/comm` on Linux — e.g. `"claude"`, `"zsh"`), used by the
+    /// anchor-selection algorithm in `daemon::lease` to skip over the
+    /// `sloosh` CLI itself and intermediate shells, and as the primary
+    /// source for the anchor's human-facing display name.
     fn exe_basename(pid: u32) -> Option<String>;
+
+    /// Basename of the process's *actual on-disk executable path*
+    /// (`proc_pidpath` on macOS, `readlink /proc/<pid>/exe` on Linux) — a
+    /// second, independent name signal. Some agent CLIs are packaged so
+    /// that the kernel-reported `comm` ends up being a bare version string
+    /// (e.g. `"2.1.204"`) rather than the tool's name; `pick_display_name`
+    /// below uses this as a fallback for exactly that case. `None` if the
+    /// path can't be resolved (e.g. permission denied, or the process has
+    /// already exited).
+    fn exe_path_basename(pid: u32) -> Option<String>;
+
+    /// Basename of the process's `argv[0]` (`sysctl KERN_PROCARGS2` on
+    /// macOS, first NUL-separated token of `/proc/<pid>/cmdline` on Linux)
+    /// — a third, independent name signal. Live evidence against a real
+    /// agent install showed both `comm` *and* the on-disk executable path
+    /// being a bare version string (the exec'd file itself was named
+    /// `2.1.204`), while `argv[0]` — what `ps -o comm` displays — carried
+    /// the actual tool name (`claude`). `argv[0]` may already be a bare
+    /// name with no slashes; basename of that is the name itself. `None`
+    /// on any error (e.g. another user's process, or the process exited).
+    fn argv0_basename(pid: u32) -> Option<String>;
 }
 
 /// One process in a walked ancestry chain.
@@ -41,6 +64,44 @@ pub struct AncestorInfo {
     pub pid: u32,
     pub start_time: SystemTime,
     pub exe_basename: Option<String>,
+    pub exe_path_basename: Option<String>,
+    pub argv0_basename: Option<String>,
+}
+
+/// Does `s` look like a bare version string (e.g. `"2.1.204"`, `"10"`)
+/// rather than a real program name? Pure and platform-independent so it's
+/// directly unit-testable: every character is an ASCII digit or `.`, and
+/// there's at least one character.
+pub fn looks_like_version_string(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Pick the best human-facing process name from the three signals
+/// `ProcessInfo` can offer, in preference order: the kernel-reported
+/// `comm`, the resolved executable path's basename, and the `argv[0]`
+/// basename. The first signal that is present and does *not* look like a
+/// bare version string wins. If every present signal looks version-like
+/// (or none are present), fall back to the first present signal in the
+/// same order — *some* identity beats none.
+///
+/// This is the fix for the live-observed bug where an agent CLI's
+/// versioned install made both `comm` and the on-disk executable name its
+/// literal version number (the exec'd file was named `2.1.204`), so
+/// `sloosh status`/lease-approval prompts showed `"2.1.204"` instead of
+/// the tool's name — only `argv[0]` (what `ps -o comm` displays) carried
+/// the real name.
+pub fn pick_display_name(
+    comm: Option<&str>,
+    exe_path_basename: Option<&str>,
+    argv0_basename: Option<&str>,
+) -> Option<String> {
+    let signals = [comm, exe_path_basename, argv0_basename];
+    signals
+        .into_iter()
+        .flatten()
+        .find(|s| !looks_like_version_string(s))
+        .or_else(|| signals.into_iter().flatten().next())
+        .map(str::to_string)
 }
 
 /// Walk `pid`'s ancestry (itself first, then parent, grandparent, ...),
@@ -66,6 +127,8 @@ pub fn ancestry_chain<P: ProcessInfo>(pid: u32) -> Vec<AncestorInfo> {
         pid: current_pid,
         start_time: current_start,
         exe_basename: P::exe_basename(current_pid),
+        exe_path_basename: P::exe_path_basename(current_pid),
+        argv0_basename: P::argv0_basename(current_pid),
     });
 
     loop {
@@ -87,6 +150,8 @@ pub fn ancestry_chain<P: ProcessInfo>(pid: u32) -> Vec<AncestorInfo> {
             pid: parent_pid,
             start_time: parent_start,
             exe_basename: P::exe_basename(parent_pid),
+            exe_path_basename: P::exe_path_basename(parent_pid),
+            argv0_basename: P::argv0_basename(parent_pid),
         });
         current_pid = parent_pid;
         current_start = parent_start;
@@ -124,6 +189,15 @@ mod tests {
         }
         fn exe_basename(pid: u32) -> Option<String> {
             FAKE_TREE.with(|t| t.borrow().get(&pid).map(|p| p.exe.clone()))
+        }
+        fn exe_path_basename(_pid: u32) -> Option<String> {
+            // Not exercised by the ancestry-walking tests below; the
+            // pick_display_name tests exercise this signal directly instead.
+            None
+        }
+        fn argv0_basename(_pid: u32) -> Option<String> {
+            // Same as exe_path_basename above.
+            None
         }
     }
 
@@ -186,5 +260,96 @@ mod tests {
         set_proc(30, Some(30), 400, "init-like");
         let chain = ancestry_chain::<FakeProcessInfo>(30);
         assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn looks_like_version_string_matches_pure_digit_and_dot_strings() {
+        assert!(looks_like_version_string("2.1.204"));
+        assert!(looks_like_version_string("10"));
+        assert!(looks_like_version_string("..."));
+        assert!(!looks_like_version_string("claude"));
+        assert!(!looks_like_version_string("claude-2.1.204"));
+        assert!(!looks_like_version_string("2.1.204-beta"));
+        assert!(!looks_like_version_string(""));
+    }
+
+    #[test]
+    fn pick_display_name_prefers_comm_when_it_looks_like_a_real_name() {
+        assert_eq!(
+            pick_display_name(Some("claude"), Some("node"), Some("bun")),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            pick_display_name(Some("claude"), None, None),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_falls_back_to_exe_path_basename_when_comm_is_version_like() {
+        assert_eq!(
+            pick_display_name(Some("2.1.204"), Some("claude"), None),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_falls_back_to_argv0_when_comm_and_exe_path_are_version_like() {
+        // The live-observed bug this three-signal design fixes: a versioned
+        // agent install where the exec'd file is literally named after the
+        // version, so comm AND the on-disk path basename are both
+        // "2.1.204" — only argv[0] carries the real tool name.
+        assert_eq!(
+            pick_display_name(Some("2.1.204"), Some("2.1.204"), Some("claude")),
+            Some("claude".to_string())
+        );
+        // Same but with the middle signal missing entirely.
+        assert_eq!(
+            pick_display_name(Some("2.1.204"), None, Some("claude")),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_keeps_comm_when_all_signals_are_version_like() {
+        assert_eq!(
+            pick_display_name(Some("2.1.204"), Some("2.1.204"), Some("2.1")),
+            Some("2.1.204".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_keeps_version_like_comm_when_it_is_the_only_signal() {
+        assert_eq!(
+            pick_display_name(Some("2.1.204"), None, None),
+            Some("2.1.204".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_falls_back_in_order_when_comm_missing() {
+        assert_eq!(
+            pick_display_name(None, Some("claude"), Some("other")),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            pick_display_name(None, None, Some("claude")),
+            Some("claude".to_string())
+        );
+        // A version-like exe_path_basename is skipped in favor of a real
+        // argv[0] name, but wins as last resort when argv[0] is absent.
+        assert_eq!(
+            pick_display_name(None, Some("2.1.204"), Some("claude")),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            pick_display_name(None, Some("2.1.204"), None),
+            Some("2.1.204".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_display_name_is_none_when_all_signals_are_missing() {
+        assert_eq!(pick_display_name(None, None, None), None);
     }
 }

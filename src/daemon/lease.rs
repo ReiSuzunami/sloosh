@@ -21,6 +21,7 @@
 //! in the caller's current chain, so descendants spawned after approval
 //! (e.g. subagents) inherit the lease automatically.
 
+use crate::daemon::audit;
 use crate::daemon::vault::{self, VaultError};
 use crate::procs::{self, AncestorInfo};
 use crate::proto::{LeaseActivatedInfo, LeaseRequestSummary, LeaseSummary};
@@ -132,7 +133,11 @@ impl Anchor {
         Anchor {
             pid: a.pid,
             start_time: a.start_time,
-            name: a.exe_basename.clone(),
+            name: procs::pick_display_name(
+                a.exe_basename.as_deref(),
+                a.exe_path_basename.as_deref(),
+                a.argv0_basename.as_deref(),
+            ),
         }
     }
 
@@ -186,8 +191,20 @@ async fn prune_expired(st: &mut LeaseState) {
         .retain(|_, p| now.duration_since(p.created_at) < PENDING_EXPIRY);
 
     let had_active = !st.active.is_empty();
-    st.active
-        .retain(|l| now.duration_since(l.last_used) < IDLE_TIMEOUT);
+    let (kept, expired): (Vec<ActiveLease>, Vec<ActiveLease>) = std::mem::take(&mut st.active)
+        .into_iter()
+        .partition(|l| now.duration_since(l.last_used) < IDLE_TIMEOUT);
+    st.active = kept;
+    for l in &expired {
+        let mut hosts: Vec<String> = l.hosts.iter().cloned().collect();
+        hosts.sort();
+        audit::record(
+            "lease_expired",
+            serde_json::json!({
+                "hosts": hosts, "anchor_name": l.anchor.name, "anchor_pid": l.anchor.pid,
+            }),
+        );
+    }
     if had_active && st.active.is_empty() {
         vault::clear_cache().await;
     }
@@ -548,6 +565,8 @@ mod tests {
             pid,
             start_time: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
             exe_basename: name.map(str::to_string),
+            exe_path_basename: None,
+            argv0_basename: None,
         }
     }
 
