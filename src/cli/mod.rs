@@ -6,13 +6,18 @@ mod client;
 
 pub use args::Cli;
 use args::{
-    Command, DaemonAction, InterruptArgs, KillArgs, LsArgs, OpenArgs, PeekArgs, RunArgs, SendArgs,
-    StatusArgs,
+    AddArgs, ApproveArgs, Command, DaemonAction, InterruptArgs, KillArgs, LsArgs, OpenArgs,
+    PeekArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
 };
 
-use crate::proto::{self, PeekReply, Request, Response, RunReply, SessionSummary, StatusReply};
+use crate::daemon::ssh;
+use crate::proto::{
+    self, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response, RunReply,
+    SecretString, SessionSummary, StatusReply,
+};
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
+use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 
 /// Run the parsed CLI command. Errors are rendered by `main` and always
@@ -29,10 +34,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Open(args) => cmd_open(args).await,
         Command::Ls(args) => cmd_ls(args).await,
         Command::Kill(args) => cmd_kill(args).await,
-        Command::Request(_) => not_implemented("request"),
-        Command::Approve(_) => not_implemented("approve"),
-        Command::Add(_) => not_implemented("add"),
-        Command::Rm(_) => not_implemented("rm"),
+        Command::Request(args) => cmd_request(args).await,
+        Command::Approve(args) => cmd_approve(args).await,
+        Command::Add(args) => cmd_add(args).await,
+        Command::Rm(args) => cmd_rm(args).await,
+        Command::Vault(args) => match args.action {
+            VaultAction::Init => cmd_vault_init().await,
+        },
         Command::Put(_) => not_implemented("put"),
         Command::Get(_) => not_implemented("get"),
         Command::Log(_) => not_implemented("log"),
@@ -139,8 +147,21 @@ fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
     }
     println!("  leases:   {}", reply.leases.len());
     for l in &reply.leases {
-        println!("    - {} (expires in {}s)", l.host, l.expires_in_secs);
+        println!(
+            "    - {} — {} (pid {}), idle timeout in {}s",
+            l.hosts.join(", "),
+            l.anchor_name.as_deref().unwrap_or("unknown process"),
+            l.anchor_pid,
+            l.idle_remaining_secs,
+        );
     }
+}
+
+/// `SLOOSH_LEASE` escape-hatch token from the environment, if this process
+/// has one set (DESIGN.md §4) — forwarded on every host-touching request so
+/// the daemon can check it before falling back to ancestry matching.
+fn lease_token_from_env() -> Option<String> {
+    std::env::var("SLOOSH_LEASE").ok()
 }
 
 /// Connect (auto-spawning the daemon if needed) and send one request,
@@ -172,6 +193,7 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         session: args.session,
         timeout_secs: args.timeout,
         raw: args.raw,
+        lease_token: lease_token_from_env(),
     };
     let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
     let Response::Run(reply) = resp else {
@@ -211,6 +233,7 @@ async fn cmd_peek(args: PeekArgs) -> anyhow::Result<()> {
         session: args.session,
         tail: args.tail,
         raw: args.raw,
+        lease_token: lease_token_from_env(),
     };
     let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
     let Response::Peek(reply) = resp else {
@@ -244,6 +267,7 @@ async fn cmd_send(args: SendArgs) -> anyhow::Result<()> {
         keys: args.keys,
         session: args.session,
         newline: args.newline,
+        lease_token: lease_token_from_env(),
     };
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("sent");
@@ -254,6 +278,7 @@ async fn cmd_interrupt(args: InterruptArgs) -> anyhow::Result<()> {
     let req = Request::Interrupt {
         host: args.host,
         session: args.session,
+        lease_token: lease_token_from_env(),
     };
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("interrupted");
@@ -264,6 +289,7 @@ async fn cmd_open(args: OpenArgs) -> anyhow::Result<()> {
     let req = Request::Open {
         host: args.host,
         name: args.name,
+        lease_token: lease_token_from_env(),
     };
     let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
     let Response::Session(summary) = resp else {
@@ -277,6 +303,7 @@ async fn cmd_kill(args: KillArgs) -> anyhow::Result<()> {
     let req = Request::Kill {
         host: args.host,
         session: args.session,
+        lease_token: lease_token_from_env(),
     };
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("killed");
@@ -310,4 +337,266 @@ fn print_session_summary_human(s: &SessionSummary) {
         line.push_str(&format!(" ({reason})"));
     }
     println!("{line}");
+}
+
+// ---------------------------------------------------------------------
+// Vault + lease authorization flow (DESIGN.md §4).
+// ---------------------------------------------------------------------
+
+/// Refuse to run a human-only command outside a real terminal (DESIGN.md
+/// §2, §4): credential enrollment and lease approval are never meant to be
+/// driven by an agent, so a non-interactive caller gets a self-teaching
+/// error instead of a hung prompt or (worse) an ignored secret.
+fn require_tty(command: &str) -> anyhow::Result<()> {
+    if std::io::stdin().is_terminal() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "`sloosh {command}` is a human-only command and refuses to run without a real \
+             terminal attached to stdin (DESIGN.md §4). If you are a coding agent: do not try to \
+             work around this — ask your user to run `sloosh {command}` themselves, in their own \
+             terminal."
+        )
+    }
+}
+
+async fn cmd_request(args: RequestArgs) -> anyhow::Result<()> {
+    let req = Request::RequestLease {
+        hosts: args.hosts.clone(),
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    match resp {
+        Response::Ok => {
+            println!(
+                "already authorized: an active lease already covers {}",
+                args.hosts.join(", ")
+            );
+        }
+        Response::LeaseRequestPending(info) => print_pending_request_instructions(&info),
+        other => anyhow::bail!("daemon sent an unexpected reply to RequestLease: {other:?}"),
+    }
+    Ok(())
+}
+
+fn print_pending_request_instructions(info: &LeaseRequestSummary) {
+    let anchor = info.anchor_name.as_deref().unwrap_or("an unknown process");
+    println!(
+        "Approval needed. Ask your user to run this in ANOTHER terminal:\n\n    sloosh approve {}\n\nGrants: {} — requested by {} (pid {}). Then wait; do not poll.",
+        info.id,
+        info.hosts.join(", "),
+        anchor,
+        info.anchor_pid,
+    );
+    if !info.vault_exists {
+        println!(
+            "\nNote: no credential vault exists yet, so the approve will be refused until your \
+             user first runs `sloosh vault init` (also in their own terminal) to set a master \
+             password."
+        );
+    }
+}
+
+async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
+    require_tty("approve")?;
+
+    let describe_req = Request::DescribeLeaseRequest {
+        id: args.request_id.clone(),
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&describe_req).await?)?;
+    let Response::LeaseRequestPending(info) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to DescribeLeaseRequest: {resp:?}");
+    };
+
+    println!("Lease request {}", info.id);
+    println!("  hosts:        {}", info.hosts.join(", "));
+    println!(
+        "  requested by: {} (pid {})",
+        info.anchor_name.as_deref().unwrap_or("unknown process"),
+        info.anchor_pid
+    );
+    println!("  age:          {}s", info.age_secs);
+    if !info.vault_exists {
+        anyhow::bail!(
+            "no credential vault exists yet, so this request can't be approved (approval \
+             verifies your master password, and there isn't one set) — run `sloosh vault init` \
+             first to create the vault, then re-run `sloosh approve {}`",
+            info.id
+        );
+    }
+    println!();
+
+    let master_password = prompt_master_password(true)?;
+
+    let approve_req = Request::ApproveLease {
+        id: args.request_id,
+        master_password,
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&approve_req).await?)?;
+    let Response::LeaseActivated(activated) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
+    };
+
+    // Host-key confirmation happens after the lease is activated, because
+    // only then can the daemon resolve vault-only aliases (the vault is
+    // unlocked by the approval itself). The daemon reports which resolved
+    // endpoints have no recorded key yet; this process dials each one
+    // directly (a read-only probe, no secrets involved) so the human can
+    // confirm its fingerprint (DESIGN.md §4).
+    for unverified in &activated.unverified_hosts {
+        confirm_and_record_host_key(&unverified.host, &unverified.hostname, unverified.port)
+            .await?;
+    }
+
+    print_lease_activated(&activated);
+    Ok(())
+}
+
+async fn cmd_vault_init() -> anyhow::Result<()> {
+    require_tty("vault init")?;
+
+    let vault_exists_resp =
+        bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
+    let Response::VaultExists { exists } = vault_exists_resp else {
+        anyhow::bail!("daemon sent an unexpected reply to VaultExists: {vault_exists_resp:?}");
+    };
+    if exists {
+        println!(
+            "a credential vault already exists — nothing to do. Use `sloosh add`/`sloosh rm` to \
+             manage its entries."
+        );
+        return Ok(());
+    }
+
+    println!("Creating the sloosh credential vault (~/.sloosh/vault).");
+    let master_password = prompt_master_password(false)?;
+    bail_on_error_or_unexpected(send_request(&Request::InitVault { master_password }).await?)?;
+    println!(
+        "vault created. You can now approve lease requests (`sloosh approve <ID>`) and add \
+         credentials (`sloosh add <alias> --hostname <host>`)."
+    );
+    Ok(())
+}
+
+/// Prompt for the master password: a single prompt if a vault already
+/// exists, or a "set + confirm twice" flow for first-time setup (DESIGN.md
+/// §1 "首次使用时提示设置主密码, 确认两次").
+fn prompt_master_password(vault_exists: bool) -> anyhow::Result<SecretString> {
+    if vault_exists {
+        let pw = rpassword::prompt_password("Master password: ")?;
+        return Ok(SecretString::new(pw));
+    }
+    loop {
+        let pw1 = rpassword::prompt_password("Set a new master password: ")?;
+        if pw1.is_empty() {
+            println!("master password cannot be empty; try again.");
+            continue;
+        }
+        let pw2 = rpassword::prompt_password("Confirm master password: ")?;
+        if pw1 == pw2 {
+            return Ok(SecretString::new(pw1));
+        }
+        println!("passwords did not match; try again.");
+    }
+}
+
+/// Dial `hostname:port` directly (not through the daemon — this is a plain
+/// read-only network probe with no secrets involved), show the human the
+/// host key's SHA256 fingerprint, and on confirmation record it in
+/// `~/.sloosh/known_hosts` (DESIGN.md §4). The endpoint comes pre-resolved
+/// from the daemon's `ApproveLease` reply, which applies the same precedence
+/// a real connection will (vault entry — visible to the daemon now the
+/// approval unlocked it — then `~/.ssh/config`, then the literal alias), so
+/// vault-only aliases get their real address confirmed too.
+async fn confirm_and_record_host_key(host: &str, hostname: &str, port: u16) -> anyhow::Result<()> {
+    print!("Fetching host key for {host} ({hostname}:{port})... ");
+    std::io::stdout().flush().ok();
+    let key = match ssh::fetch_host_key(hostname, port).await {
+        Ok(key) => key,
+        Err(e) => {
+            println!("failed.");
+            println!(
+                "warning: could not fetch a host key for '{host}' to record automatically \
+                 ({e}); continuing without recording one — the connection will still refuse to \
+                 trust an unrecorded key. Run `ssh {host}` by hand once if you need to accept it \
+                 manually."
+            );
+            return Ok(());
+        }
+    };
+    println!("done.");
+
+    let fingerprint = key.fingerprint(russh::keys::HashAlg::Sha256);
+    print!(
+        "Host key fingerprint for {host} ({hostname}:{port}):\n    {fingerprint}\nTrust this key and remember it? [y/N] "
+    );
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        ssh::record_sloosh_known_host(hostname, port, &key)?;
+        println!("recorded in ~/.sloosh/known_hosts");
+    } else {
+        println!(
+            "not recorded — connecting to '{host}' will refuse to trust its key until this is \
+             resolved (record it here, or add it to ~/.ssh/known_hosts by hand)."
+        );
+    }
+    Ok(())
+}
+
+fn print_lease_activated(info: &LeaseActivatedInfo) {
+    println!(
+        "approved: {} (pid {}) can now access {}",
+        info.anchor_name.as_deref().unwrap_or("unknown process"),
+        info.anchor_pid,
+        info.hosts.join(", "),
+    );
+    println!(
+        "\nEscape hatch, only if needed (e.g. the caller isn't a descendant of this approval's \
+         anchor process): set SLOOSH_LEASE={} in that process's environment. This token is shown \
+         only this once.",
+        info.token
+    );
+}
+
+async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
+    require_tty("add")?;
+
+    let ssh_password = rpassword::prompt_password(format!("SSH password for {}: ", args.alias))?;
+
+    let vault_exists_resp =
+        bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
+    let Response::VaultExists { exists } = vault_exists_resp else {
+        anyhow::bail!("daemon sent an unexpected reply to VaultExists: {vault_exists_resp:?}");
+    };
+    if !exists {
+        println!("No credential vault exists yet — this creates one.");
+    }
+    let master_password = prompt_master_password(exists)?;
+
+    let req = Request::AddCred {
+        alias: args.alias.clone(),
+        hostname: args.hostname,
+        port: args.port,
+        user: args.user,
+        ssh_password: SecretString::new(ssh_password),
+        master_password,
+        replace: false,
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("added '{}' to the vault", args.alias);
+    Ok(())
+}
+
+async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
+    require_tty("rm")?;
+
+    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
+    let req = Request::RmCred {
+        alias: args.alias.clone(),
+        master_password,
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("removed '{}' from the vault", args.alias);
+    Ok(())
 }

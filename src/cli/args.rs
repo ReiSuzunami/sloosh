@@ -44,6 +44,8 @@ pub enum Command {
     Add(AddArgs),
     /// Remove a credential from the vault.
     Rm(RmArgs),
+    /// Manage the credential vault itself (e.g. first-time initialization).
+    Vault(VaultArgs),
     /// Upload a local file to a host over SFTP.
     Put(PutArgs),
     /// Download a remote file from a host over SFTP.
@@ -161,12 +163,34 @@ pub struct ApproveArgs {
 pub struct AddArgs {
     /// Alias the agent will refer to this credential by (never the credential itself).
     pub alias: String,
+    /// Real hostname/address to connect to.
+    #[arg(long)]
+    pub hostname: String,
+    /// Remote username (defaults to the local user if omitted).
+    #[arg(long)]
+    pub user: Option<String>,
+    /// SSH port (defaults to 22 if omitted).
+    #[arg(long)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
 pub struct RmArgs {
     /// Alias of the credential to remove.
     pub alias: String,
+}
+
+#[derive(Debug, Args)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub action: VaultAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VaultAction {
+    /// Create the credential vault and set its master password (interactive, human-only).
+    /// Required once before any `sloosh approve` can succeed: approval never creates the vault.
+    Init,
 }
 
 #[derive(Debug, Args)]

@@ -2,14 +2,18 @@
 //! (`Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`), and
 //! `known_hosts` handling (DESIGN.md §2, §3).
 //!
-//! Trust posture for this milestone: **no vault, no lease enforcement**.
-//! Any local caller that can reach the daemon's Unix socket (same-user,
-//! mode 0600 — see `transport::unix`) can open SSH sessions to any host
-//! reachable from `~/.ssh/config`. DESIGN.md §4's lease/vault layer lands in
-//! milestone 3 and will gate this; until then the socket's own permissions
-//! are the only access control (see the note in `daemon/mod.rs`).
+//! Authorization gate (DESIGN.md §4): lease enforcement happens one layer up
+//! in `daemon/mod.rs`, before any of this module's connection logic runs —
+//! by the time `connect`/`connect_resolved` are reached, the caller has
+//! already proven a human approved access to this host. What lives here is
+//! purely mechanical: resolve connection parameters (vault entries take
+//! precedence over `~/.ssh/config` for a given alias — DESIGN.md §4),
+//! verify the host key, and authenticate (ssh-agent, then unencrypted
+//! `IdentityFile` keys, then — only while the vault's derived key is cached,
+//! i.e. at least one lease is active — the vault's stored password).
 
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -18,6 +22,10 @@ use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
+use zeroize::Zeroize;
+
+use crate::daemon::vault;
+use crate::transport::unix::sloosh_home;
 
 /// Everything that can go wrong establishing an SSH connection. Variants
 /// carry self-teaching messages (DESIGN.md §7): the human reading a CLI
@@ -88,14 +96,16 @@ pub enum SshError {
     },
 
     #[error(
-        "host key for {host}:{port} is not in ~/.ssh/known_hosts, so sloosh refuses to trust it. \
-         Run `ssh {host}` by hand once, accept and record its fingerprint, then retry."
+        "host key for {host}:{port} is not in ~/.ssh/known_hosts or ~/.sloosh/known_hosts, so \
+         sloosh refuses to trust it. If this host is in the vault, its key is normally recorded \
+         automatically the first time `sloosh approve` grants access to it; otherwise run \
+         `ssh {host}` by hand once, accept and record its fingerprint, then retry."
     )]
     UnknownHostKey { host: String, port: u16 },
 
     #[error(
         "REFUSING TO CONNECT: the host key presented by {host}:{port} does NOT match the one \
-         recorded in ~/.ssh/known_hosts (line {line}). This usually means the host was reinstalled, \
+         recorded in known_hosts (line {line}). This usually means the host was reinstalled, \
          OR that you are the target of a man-in-the-middle attack. sloosh will not proceed \
          automatically — verify out of band and update known_hosts yourself if the change is expected."
     )]
@@ -106,8 +116,8 @@ pub enum SshError {
     },
 
     #[error(
-        "could not check the server's key against ~/.ssh/known_hosts — make sure the file \
-         exists and is readable, then retry. (keys: {0})"
+        "could not check the server's key against known_hosts — make sure ~/.ssh/known_hosts \
+         and ~/.sloosh/known_hosts exist and are readable, then retry. (keys: {0})"
     )]
     KnownHosts(#[from] russh::keys::Error),
 
@@ -118,9 +128,10 @@ pub enum SshError {
     EncryptedIdentity { path: PathBuf },
 
     #[error(
-        "no working authentication method for {host} (tried ssh-agent identities and unencrypted \
-         IdentityFile keys from ~/.ssh/config; password auth via the vault lands in milestone 3). \
-         Load a key into ssh-agent with `ssh-add`, or add an `IdentityFile` entry to ~/.ssh/config."
+        "no working authentication method for {host} (tried ssh-agent identities, unencrypted \
+         IdentityFile keys from ~/.ssh/config, and a vault password if '{host}' has one). Load a \
+         key into ssh-agent with `ssh-add`, add an `IdentityFile` entry to ~/.ssh/config, or \
+         `sloosh add {host} --hostname <h>` to store a password in the vault."
     )]
     AuthFailed { host: String },
 
@@ -357,6 +368,15 @@ fn ssh_config_path() -> PathBuf {
     home_dir().join(".ssh").join("config")
 }
 
+/// sloosh's own known_hosts file (DESIGN.md §4): host keys for vault-backed
+/// hosts, auto-recorded during `sloosh approve` after the human confirms the
+/// fingerprint. Consulted only after `~/.ssh/known_hosts` comes up empty, so
+/// a host the user already trusts via plain `ssh` never needs re-confirming
+/// here.
+fn sloosh_known_hosts_path() -> PathBuf {
+    sloosh_home().join("known_hosts")
+}
+
 /// Resolve the local user for the "no config entry" default (DESIGN.md §2).
 fn current_user() -> String {
     if let Ok(u) = std::env::var("USER")
@@ -450,8 +470,31 @@ pub struct Handler {
 impl russh::client::Handler for Handler {
     type Error = SshError;
 
+    /// Checked against `~/.ssh/known_hosts` first (so anything the user
+    /// already trusts via plain `ssh` keeps working untouched), then against
+    /// sloosh's own `~/.sloosh/known_hosts` (DESIGN.md §4). A mismatch in
+    /// either file is a hard refusal — never silently fall through to the
+    /// other file once a *different* key has been recorded for this host.
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
         match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                return Err(SshError::HostKeyMismatch {
+                    host: self.host.clone(),
+                    port: self.port,
+                    line,
+                });
+            }
+            Err(e) => return Err(SshError::KnownHosts(e)),
+        }
+
+        match russh::keys::check_known_hosts_path(
+            &self.host,
+            self.port,
+            server_public_key,
+            sloosh_known_hosts_path(),
+        ) {
             Ok(true) => Ok(true),
             Ok(false) => Err(SshError::UnknownHostKey {
                 host: self.host.clone(),
@@ -467,14 +510,126 @@ impl russh::client::Handler for Handler {
     }
 }
 
+/// A `Handler` that accepts whatever host key is presented and just records
+/// it, for use by `fetch_host_key` — the approve-flow's out-of-band
+/// fingerprint display never wants to fail the connection over an unknown
+/// key, since seeing the key *is* the point.
+struct KeyCapturingHandler {
+    captured: Arc<Mutex<Option<PublicKey>>>,
+}
+
+impl russh::client::Handler for KeyCapturingHandler {
+    type Error = SshError;
+
+    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
+        let mut guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(server_public_key.clone());
+        Ok(true)
+    }
+}
+
+/// Whether *any* key is already recorded for `hostname:port` in either
+/// known_hosts file, regardless of whether it would actually match a live
+/// connection's key. Used by the `sloosh approve` flow (DESIGN.md §4) to
+/// decide whether a host needs the fetch-fingerprint-confirm dance at all —
+/// real verification (which rejects a mismatch outright) still happens in
+/// `Handler::check_server_key` at actual connection time.
+pub fn host_has_known_key(hostname: &str, port: u16) -> bool {
+    let in_ssh = russh::keys::known_hosts::known_host_keys(hostname, port).unwrap_or_default();
+    if !in_ssh.is_empty() {
+        return true;
+    }
+    let in_sloosh =
+        russh::keys::known_hosts::known_host_keys_path(hostname, port, sloosh_known_hosts_path())
+            .unwrap_or_default();
+    !in_sloosh.is_empty()
+}
+
+/// Dial `hostname:port` far enough to receive its host key (key exchange
+/// only — no authentication attempted), for the `sloosh approve` fingerprint
+/// display (DESIGN.md §4). Used directly by the CLI process, not routed
+/// through the daemon: it's a plain read-only network probe with no secrets
+/// involved.
+pub async fn fetch_host_key(hostname: &str, port: u16) -> Result<PublicKey, SshError> {
+    let tcp = open_tcp(hostname, port).await?;
+    let config = Arc::new(russh::client::Config::default());
+    let captured: Arc<Mutex<Option<PublicKey>>> = Arc::new(Mutex::new(None));
+    let handler = KeyCapturingHandler {
+        captured: captured.clone(),
+    };
+    russh::client::connect_stream(config, tcp, handler)
+        .await
+        .map_err(|e| add_handshake_context(e, hostname, port))?;
+    captured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .ok_or(SshError::Handshake {
+            host: hostname.to_string(),
+            port,
+            source: russh::Error::Disconnect,
+        })
+}
+
+/// Record `key` as the trusted host key for `hostname:port` in sloosh's own
+/// known_hosts file (`~/.sloosh/known_hosts`, mode 0600), called after the
+/// human confirms the fingerprint during `sloosh approve` (DESIGN.md §4).
+pub fn record_sloosh_known_host(
+    hostname: &str,
+    port: u16,
+    key: &PublicKey,
+) -> Result<(), SshError> {
+    let path = sloosh_known_hosts_path();
+    russh::keys::known_hosts::learn_known_hosts_path(hostname, port, key, &path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| SshError::KnownHosts(russh::keys::Error::IO(e)))?;
+    Ok(())
+}
+
+/// Resolve `alias` to the endpoint an actual connection would dial, with
+/// the same precedence as `connect` (vault entry — only visible while the
+/// vault is unlocked — then `~/.ssh/config`, then the alias as a literal
+/// hostname). Used daemon-side during `approve` to tell the CLI which
+/// endpoints still need a host-key fingerprint confirmation; the endpoint
+/// itself is not a secret.
+pub async fn resolve_endpoint(alias: &str) -> (String, u16) {
+    let config = SshConfig::load_default();
+    let host_cfg = resolve_host_config(&config, alias).await;
+    (host_cfg.hostname, host_cfg.port)
+}
+
 /// Connect to `alias`, resolving it through `~/.ssh/config`, handling a
 /// single `ProxyJump` hop if configured, verifying the host key, and
 /// authenticating via ssh-agent then unencrypted `IdentityFile` keys
 /// (DESIGN.md §2, §3).
 pub async fn connect(alias: &str) -> Result<Connection, SshError> {
     let config = SshConfig::load_default();
-    let host_cfg = config.resolve(alias);
+    let host_cfg = resolve_host_config(&config, alias).await;
     connect_resolved(&config, host_cfg).await
+}
+
+/// Resolve `alias`, preferring a vault entry over `~/.ssh/config` (DESIGN.md
+/// §4: "vault 别名优先于 ~/.ssh/config 中同名条目"). Only ever finds a vault
+/// entry while the vault's derived key is cached (i.e. at least one lease is
+/// active) — `vault::get_entry` returns `None` otherwise, so this quietly
+/// falls back to the plain config-file resolution, exactly like an alias
+/// that was never in the vault at all.
+async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
+    if let Some(entry) = vault::get_entry(alias).await {
+        return HostConfig {
+            alias: alias.to_string(),
+            hostname: entry.hostname,
+            port: entry.port.unwrap_or(22),
+            user: entry.user.unwrap_or_else(current_user),
+            // Vault entries don't carry key-based identities or a jump host
+            // (DESIGN.md §4 only specifies password auth for vault entries);
+            // a vault-backed host that also needs one of those should keep
+            // using ~/.ssh/config instead.
+            identity_files: Vec::new(),
+            proxy_jump: None,
+        };
+    }
+    config.resolve(alias)
 }
 
 async fn connect_resolved(
@@ -502,7 +657,7 @@ async fn connect_via_proxy_jump(
     if jump_spec.contains(',') {
         return Err(SshError::ProxyJumpChainUnsupported);
     }
-    let mut jump_cfg = config.resolve(parse_proxy_jump_alias(jump_spec));
+    let mut jump_cfg = resolve_host_config(config, parse_proxy_jump_alias(jump_spec)).await;
     apply_proxy_jump_overrides(jump_spec, &mut jump_cfg);
     if jump_cfg.proxy_jump.is_some() {
         // A jump host that itself needs a jump host would be a two-hop
@@ -637,11 +792,9 @@ where
     Ok(handle)
 }
 
-/// Auth order (DESIGN.md §2, §3): ssh-agent identities first, then
-/// unencrypted `IdentityFile` keys. Password auth is deliberately **not**
-/// implemented here — see the seam below — it needs the vault (milestone 3)
-/// to source a credential without the plaintext ever touching the CLI or
-/// the agent's context.
+/// Auth order (DESIGN.md §2, §3, §4): ssh-agent identities first, then
+/// unencrypted `IdentityFile` keys, then a vault-stored password (only
+/// available while the vault is unlocked, i.e. while a lease is active).
 async fn authenticate(
     handle: &mut russh::client::Handle<Handler>,
     host_cfg: &HostConfig,
@@ -683,13 +836,27 @@ async fn authenticate(
         }
     }
 
-    // ---- M3 seam -----------------------------------------------------
-    // Password auth belongs here: fetch a credential for `host_cfg.alias`
-    // out of the unlocked vault (never from a CLI argument — DESIGN.md §4)
-    // and call `handle.authenticate_password(&host_cfg.user, password)`,
-    // zeroizing the password immediately after. Not implemented in
-    // milestone 2: there is no vault yet.
-    // --------------------------------------------------------------------
+    // Vault password auth (DESIGN.md §4): only ever finds an entry while
+    // the vault's derived key is cached, i.e. while at least one lease is
+    // active — the credential never comes from a CLI argument or the
+    // agent's context, only from the daemon's in-memory unlocked vault.
+    if let Some(entry) = vault::get_entry(&host_cfg.alias).await {
+        let vault::AuthMethod::Password { password } = entry.auth;
+        let mut password = password;
+        let result = handle
+            .authenticate_password(&host_cfg.user, password.clone())
+            .await;
+        // We can zeroize our own copy; the copy `russh` moved onto its
+        // internal message channel is out of our control (the crate's
+        // `authenticate_password` takes the password by value, not by
+        // reference) — noted as a known limitation, not a full guarantee.
+        password.zeroize();
+        match result {
+            Ok(res) if res.success() => return Ok(()),
+            Ok(_) => debug!(alias = %host_cfg.alias, "vault password rejected by server"),
+            Err(e) => debug!(alias = %host_cfg.alias, error = %e, "vault password auth error"),
+        }
+    }
 
     if let Some(path) = encrypted_identities.into_iter().next() {
         return Err(SshError::EncryptedIdentity { path });

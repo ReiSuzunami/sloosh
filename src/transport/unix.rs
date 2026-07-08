@@ -28,9 +28,15 @@ pub enum TransportError {
 }
 
 /// `~/.sloosh` — home for the daemon log, socket (on macOS), audit log,
-/// vault and spool. Resolved from `$HOME`, which is always set on the
+/// vault, known_hosts and spool. `$SLOOSH_HOME` always wins if set (same
+/// override pattern as `$SLOOSH_SOCKET` below — used by tests so a live-SSH
+/// integration test run can't ever touch the real developer's vault or
+/// known_hosts), otherwise resolved from `$HOME`, which is always set on the
 /// Unix-only platforms this milestone targets.
 pub fn sloosh_home() -> PathBuf {
+    if let Ok(p) = std::env::var("SLOOSH_HOME") {
+        return PathBuf::from(p);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".sloosh")
 }

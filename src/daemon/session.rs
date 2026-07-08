@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +39,22 @@ const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
 const IDLE_REAP_AFTER: Duration = Duration::from_secs(8 * 60 * 60);
 /// How often the idle reaper wakes up to check.
 const IDLE_REAP_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How long `open`/first `run` waits for the shell-init frame's marker
+/// (banner consumption, D2) before giving up and proceeding degraded.
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Shell-quiescing commands sent (framed with their own sentinel) as the
+/// first line of every new session:
+/// - `stty -echo` turns off tty-driver echo even if the server ignored the
+///   ECHO=0 PTY mode we request in `ssh.rs`;
+/// - `set +o emacs` / `set +o vi` disable readline/zle line editing, which
+///   otherwise re-echoes input *itself*, regardless of tty echo settings —
+///   this was the actual source of command echoes observed live;
+/// - the rest disables color, prompts, and history so nothing but real
+///   command output shows up.
+const INIT_COMMANDS: &str = "stty -echo 2>/dev/null; set +o emacs 2>/dev/null; \
+     set +o vi 2>/dev/null; export NO_COLOR=1 TERM=dumb; unset HISTFILE; \
+     PS1='' PROMPT_COMMAND=''";
 
 /// Everything that can go wrong operating on a session. Self-teaching
 /// messages per DESIGN.md §7.
@@ -50,8 +67,10 @@ pub enum SessionError {
     NotFound { host: String, session: String },
 
     #[error(
-        "session '{session}' on '{host}' is still busy running a previous command; `sloosh peek \
-         {host} --session {session}` to check on it, or wait for it to finish, before running another"
+        "session '{session}' on '{host}' is still busy running a previous command — `sloosh peek \
+         {host} --session {session}` to check on it and wait for it to finish. If it stays busy \
+         (e.g. a command that survived an interrupt, or a wedged shell), `sloosh kill {host} \
+         --session {session}` and reopen it"
     )]
     Busy { host: String, session: String },
 
@@ -149,63 +168,244 @@ impl RingBuffer {
 // Sentinel command/output framing
 // ---------------------------------------------------------------------------
 
-/// Generate a sentinel unlikely to appear in any command's own output.
+/// Fixed shape of every sentinel: `__sloosh_<32 lowercase hex>__`. The
+/// scrubber below recognizes sentinels *by this pattern*, not by comparing
+/// against a list of currently-armed sentinel strings — that way stale
+/// markers (e.g. a resync probe from an interrupt whose run already
+/// finished) are still scrubbed out of agent-visible output instead of
+/// leaking as payload.
+const SENTINEL_PREFIX: &[u8] = b"__sloosh_";
+const SENTINEL_HEX_LEN: usize = 32;
+const SENTINEL_SUFFIX: &[u8] = b"__";
+const SENTINEL_LEN: usize = SENTINEL_PREFIX.len() + SENTINEL_HEX_LEN + SENTINEL_SUFFIX.len();
+/// `$?` is 0..=255, so at most three digits between the two sentinels.
+const MARKER_MAX_DIGITS: usize = 3;
+
+/// Generate a sentinel unlikely to appear in any command's own output. Must
+/// match the `SENTINEL_*` pattern constants above — the scrubber recognizes
+/// sentinels by shape.
 fn make_sentinel() -> String {
     let n: u128 = rand::rng().random();
-    format!("__sloosh_{n:032x}__")
+    let s = format!("__sloosh_{n:032x}__");
+    debug_assert_eq!(s.len(), SENTINEL_LEN);
+    s
+}
+
+/// The `printf` that emits a `<sentinel><exit-code><sentinel>` marker line
+/// for whatever command ran last. Used as the tail of every framed command,
+/// and standalone as the resync probe after an `interrupt` (see
+/// `interrupt`): sent on its own line, it reports `$?` of the interrupted
+/// command line without depending on that line's own marker ever running.
+fn marker_printf(sentinel: &str) -> String {
+    format!("printf '\\n{sentinel}%s{sentinel}\\n' $?\n")
 }
 
 /// Build the literal line written to the PTY for one `run`: run the
 /// command, then print exit status bracketed by the sentinel so the reader
 /// can find where the command's own output ends (DESIGN.md §3).
 fn frame_command(command: &str, sentinel: &str) -> String {
-    format!("{command}; printf '\\n{sentinel}%s{sentinel}\\n' $?\n")
+    format!("{command}; {}", marker_printf(sentinel))
 }
 
-/// Result of successfully locating a sentinel marker in accumulated output.
-struct SentinelMatch {
-    /// Length of the command's own output, i.e. everything before the
-    /// marker (with the marker's own leading `\n` from `printf` dropped).
-    output_len: usize,
-    exit_code: i32,
+/// Result of matching the raw PTY stream against the marker pattern
+/// (optionally-preceding newline + `<sentinel><digits><sentinel>`).
+#[derive(Debug)]
+enum MarkerScan {
+    /// Definitely not a marker at this position; the byte is payload.
+    No,
+    /// Consistent with a marker so far, but the buffer ended before it
+    /// completed — hold these bytes and wait for more data.
+    Partial,
+    /// A complete marker: `len` bytes consumed (including any leading
+    /// separator newline), plus the sentinel string and exit code found.
+    Complete {
+        len: usize,
+        sentinel: String,
+        exit_code: i32,
+    },
 }
 
-/// Scan `buf` for a complete `<sentinel><digits><sentinel>` marker.
-///
-/// Always rescans from the start of `buf` rather than keeping streaming
-/// parse state; this is deliberate — it makes chunked/split reads trivially
-/// correct (and trivially testable: feed the same growing buffer in via
-/// arbitrary chunk boundaries and the result never depends on where the
-/// splits fall), at the cost of doing `O(n)` work per chunk instead of
-/// `O(1)`. Session output volumes make that cost irrelevant in practice.
-fn find_sentinel(buf: &[u8], sentinel: &str) -> Option<SentinelMatch> {
-    let needle = sentinel.as_bytes();
-    if needle.is_empty() {
-        return None;
-    }
-    let first = find_subslice(buf, needle)?;
-    let after_first = first + needle.len();
-    let second_rel = find_subslice(&buf[after_first..], needle)?;
-    let second = after_first + second_rel;
+/// Match `buf` (from position 0) against `<sentinel><digits><sentinel>`
+/// where both sentinels must be byte-identical.
+fn scan_marker(buf: &[u8]) -> MarkerScan {
+    let mut i = 0;
 
-    let code_str = std::str::from_utf8(&buf[after_first..second]).ok()?;
-    let exit_code: i32 = code_str.trim().parse().ok()?;
-
-    let mut output_len = first;
-    if output_len > 0 && buf[output_len - 1] == b'\n' {
-        output_len -= 1;
+    // First sentinel: prefix + hex + suffix.
+    for &expected in SENTINEL_PREFIX {
+        match buf.get(i) {
+            None => return MarkerScan::Partial,
+            Some(&b) if b == expected => i += 1,
+            Some(_) => return MarkerScan::No,
+        }
     }
-    Some(SentinelMatch {
-        output_len,
+    for _ in 0..SENTINEL_HEX_LEN {
+        match buf.get(i) {
+            None => return MarkerScan::Partial,
+            Some(&(b'0'..=b'9' | b'a'..=b'f')) => i += 1,
+            Some(_) => return MarkerScan::No,
+        }
+    }
+    for &expected in SENTINEL_SUFFIX {
+        match buf.get(i) {
+            None => return MarkerScan::Partial,
+            Some(&b) if b == expected => i += 1,
+            Some(_) => return MarkerScan::No,
+        }
+    }
+    let sentinel_end = i;
+
+    // Exit status digits.
+    let digits_start = i;
+    while i < buf.len() && buf[i].is_ascii_digit() && (i - digits_start) < MARKER_MAX_DIGITS {
+        i += 1;
+    }
+    if i == buf.len() {
+        return MarkerScan::Partial;
+    }
+    if i == digits_start {
+        return MarkerScan::No;
+    }
+    let digits_end = i;
+
+    // Second sentinel, byte-identical to the first. This is what lets an
+    // echoed framed command (`... printf '\n<sent>%s<sent>\n' $?`) pass as
+    // ordinary bytes: its `%s` between the sentinels fails the digit check
+    // above, and any lone sentinel fails here.
+    for k in 0..SENTINEL_LEN {
+        match buf.get(i) {
+            None => return MarkerScan::Partial,
+            Some(&b) if b == buf[k] => i += 1,
+            Some(_) => return MarkerScan::No,
+        }
+    }
+
+    let sentinel = String::from_utf8_lossy(&buf[..sentinel_end]).into_owned();
+    let exit_code: i32 = std::str::from_utf8(&buf[digits_start..digits_end])
+        .expect("checked ASCII digits")
+        .parse()
+        .expect("1..=3 ASCII digits always parse as i32");
+    MarkerScan::Complete {
+        len: i,
+        sentinel,
         exit_code,
-    })
+    }
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+/// Like `scan_marker`, but allowing the marker to be preceded by the
+/// separator newline `printf` emits before it (arriving as `\r\n` through
+/// the PTY, or bare `\n`/`\r`). Matching the separator as part of the
+/// marker means it gets scrubbed along with it — the ring buffer receives
+/// exactly the command's own output, no framing residue.
+fn scan_sep_marker(buf: &[u8]) -> MarkerScan {
+    let mut i = 0;
+    if buf.get(i) == Some(&b'\r') {
+        i += 1;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    if buf.get(i) == Some(&b'\n') {
+        i += 1;
+    }
+    if i == buf.len() {
+        return MarkerScan::Partial;
+    }
+    match scan_marker(&buf[i..]) {
+        MarkerScan::Complete {
+            len,
+            sentinel,
+            exit_code,
+        } => MarkerScan::Complete {
+            len: len + i,
+            sentinel,
+            exit_code,
+        },
+        other => other,
+    }
+}
+
+/// What the scrubber hands back, in stream order.
+#[derive(Debug)]
+enum ScrubEvent {
+    /// Command/shell output with all framing internals removed.
+    Payload(Vec<u8>),
+    /// A complete marker was recognized (and removed from the stream).
+    Marker { sentinel: String, exit_code: i32 },
+}
+
+/// Streaming scrubber sitting between the raw PTY byte stream and the ring
+/// buffer / spool file: sentinel marker lines (and their surrounding
+/// newlines) never reach agent-visible output — `peek` and `run` replies
+/// only ever see payload (the D1 invariant: no `__sloosh_*__` line ever
+/// appears in a reply).
+///
+/// Bytes that might be the beginning of a marker that hasn't fully arrived
+/// yet are held back until the next feed resolves them, so chunk splits can
+/// never leak half a sentinel (holdback is bounded by one marker's length
+/// plus a couple of newline bytes).
+#[derive(Debug, Default)]
+struct FrameScrubber {
+    /// Unresolved tail of the stream (potential partial marker).
+    held: Vec<u8>,
+    /// Swallow the newline `printf` emits *after* a marker, even across a
+    /// chunk boundary.
+    eat_newline: bool,
+}
+
+impl FrameScrubber {
+    fn feed(&mut self, data: &[u8]) -> Vec<ScrubEvent> {
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(data);
+        let mut events = Vec::new();
+        let mut payload = Vec::new();
+        let mut i = 0;
+        while i < buf.len() {
+            if self.eat_newline {
+                if buf[i] == b'\r' {
+                    i += 1;
+                    continue;
+                }
+                self.eat_newline = false;
+                if buf[i] == b'\n' {
+                    i += 1;
+                    continue;
+                }
+                // Not a newline after all: fall through, ordinary byte.
+            }
+            let b = buf[i];
+            if matches!(b, b'\r' | b'\n' | b'_') {
+                match scan_sep_marker(&buf[i..]) {
+                    MarkerScan::Complete {
+                        len,
+                        sentinel,
+                        exit_code,
+                    } => {
+                        if !payload.is_empty() {
+                            events.push(ScrubEvent::Payload(std::mem::take(&mut payload)));
+                        }
+                        events.push(ScrubEvent::Marker {
+                            sentinel,
+                            exit_code,
+                        });
+                        i += len;
+                        self.eat_newline = true;
+                        continue;
+                    }
+                    MarkerScan::Partial => {
+                        self.held = buf[i..].to_vec();
+                        if !payload.is_empty() {
+                            events.push(ScrubEvent::Payload(payload));
+                        }
+                        return events;
+                    }
+                    MarkerScan::No => {}
+                }
+            }
+            payload.push(b);
+            i += 1;
+        }
+        if !payload.is_empty() {
+            events.push(ScrubEvent::Payload(payload));
+        }
+        events
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,18 +466,26 @@ fn strip_ansi(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Defensive fallback for echo suppression: if PTY-level `ECHO`/`ECHONL`
-/// suppression (set via `request_pty` terminal modes in `ssh.rs`) was
-/// ignored by the remote shell/server, the very first line of a command's
-/// output is often just the shell echoing the command line back. Strip it
-/// if it matches the command we sent, verbatim.
-fn strip_echoed_command(output: &[u8], command: &str) -> Vec<u8> {
+/// Defensive fallback for echo suppression: if every other layer (PTY
+/// `ECHO`/`ECHONL` modes in `ssh.rs`, plus the `stty -echo` /
+/// `set +o emacs` sent in `INIT_COMMANDS`) was ignored by the remote
+/// shell/server, the very first line of a command's output is the shell
+/// echoing the line we sent back. Strip it if it matches any of the given
+/// candidates (the framed command line, or the bare command), tolerating a
+/// trailing `\r` from PTY newline translation.
+fn strip_echoed_command(output: &[u8], candidates: &[&str]) -> Vec<u8> {
     let first_line_end = output.iter().position(|&b| b == b'\n');
     let Some(end) = first_line_end else {
         return output.to_vec();
     };
-    let first_line = &output[..end];
-    if first_line == command.trim_end().as_bytes() {
+    let mut first_line = &output[..end];
+    if first_line.last() == Some(&b'\r') {
+        first_line = &first_line[..first_line.len() - 1];
+    }
+    if candidates
+        .iter()
+        .any(|c| first_line == c.trim_end().as_bytes())
+    {
         output[end + 1..].to_vec()
     } else {
         output.to_vec()
@@ -316,11 +524,21 @@ fn shape_output(raw: &[u8], raw_mode: bool) -> (String, bool, u64) {
 
 struct CurrentRun {
     sentinel: String,
-    start_offset: u64,
+    /// Armed by `interrupt` while this run is in flight: a second sentinel
+    /// sent as a standalone probe line right after Ctrl-C. Whichever marker
+    /// arrives first settles the run — the original sentinel (the command
+    /// survived/trapped SIGINT and finished normally) or this one (the
+    /// command line was aborted, so its own marker will never print).
+    resync: Option<String>,
 }
 
 struct RunOutcome {
-    exit_code: i32,
+    /// `None` when the run was settled by an interrupt resync probe — the
+    /// command's own exit status is unknowable at that point.
+    exit_code: Option<i32>,
+    /// True when the resync probe (not the command's own marker) settled
+    /// the run.
+    interrupted: bool,
     end_offset: u64,
 }
 
@@ -339,6 +557,14 @@ struct SessionState {
     current_run: Option<CurrentRun>,
     last_result: Option<RunOutcome>,
     spool_file: Option<std::fs::File>,
+    /// Removes framing internals from the raw PTY stream before anything
+    /// reaches `ring`/`spool_file`.
+    scrubber: FrameScrubber,
+    /// True from session open until the shell-init frame's marker arrives:
+    /// everything the shell prints before then (login banner, MOTD, prompt
+    /// residue, the init line's own echo) is discarded, never committed to
+    /// the ring — so it can't be attributed to the first user command (D2).
+    discard_until_ready: bool,
 }
 
 /// Everything needed to operate a live session. Kept alive by the registry
@@ -467,6 +693,8 @@ async fn create_session(host: &str, name: &str) -> Result<Arc<SessionInner>, Ses
         current_run: None,
         last_result: None,
         spool_file: None,
+        scrubber: FrameScrubber::default(),
+        discard_until_ready: true,
     });
     let (wake_tx, _wake_rx) = watch::channel(0u64);
 
@@ -479,21 +707,75 @@ async fn create_session(host: &str, name: &str) -> Result<Arc<SessionInner>, Ses
         _connection: conn,
     });
 
-    {
-        let mut reg = registry().lock().await;
-        reg.insert((host.to_string(), name.to_string()), inner.clone());
-    }
-
+    let mut wake_rx = inner.wake_tx.subscribe();
     tokio::spawn(reader_loop(inner.clone(), read_half));
 
-    // Quiesce the shell for scripted use (DESIGN.md §3): disable color and
-    // fancy prompts, drop bash history for this session, and blank the
-    // prompt/PROMPT_COMMAND so nothing but real command output shows up.
-    // Sent as an ordinary shell line, same as any `run` — its noise just
-    // predates the first real command's `start_offset`, so it never
-    // pollutes that command's captured output.
-    let init = "export NO_COLOR=1 TERM=dumb; unset HISTFILE; PS1='' PROMPT_COMMAND=''\n";
-    let _ = inner.write_half.data_bytes(init.as_bytes().to_vec()).await;
+    // Quiesce the shell for scripted use (DESIGN.md §3), framed with its
+    // own sentinel: everything the shell prints before that marker — login
+    // banner, MOTD, prompt residue, the init line's own echo — is discarded
+    // by the `discard_until_ready` gate, so none of it can ever be
+    // attributed to the first user command.
+    let init_sentinel = make_sentinel();
+    let init_line = frame_command(INIT_COMMANDS, &init_sentinel);
+    if let Err(e) = inner.write_half.data_bytes(init_line.into_bytes()).await {
+        mark_dead(&inner, &format!("failed to initialize session shell: {e}")).await;
+        return Err(SessionError::Dead {
+            host: host.to_string(),
+            session: name.to_string(),
+            reason: format!("failed to initialize session shell: {e}"),
+        });
+    }
+
+    // Wait for the init marker so the session starts clean. On timeout
+    // (non-POSIX shell that never ran our printf?), proceed anyway with a
+    // warning — the session is degraded (banner may leak into early output)
+    // but not useless.
+    let deadline = tokio::time::Instant::now() + SESSION_READY_TIMEOUT;
+    loop {
+        {
+            let state = inner.state.lock().await;
+            if let Some(reason) = &state.dead {
+                return Err(SessionError::Dead {
+                    host: host.to_string(),
+                    session: name.to_string(),
+                    reason: reason.clone(),
+                });
+            }
+            if !state.discard_until_ready {
+                break;
+            }
+        }
+        tokio::select! {
+            _ = wake_rx.changed() => {}
+            _ = sleep_until(deadline) => {
+                warn!(
+                    host,
+                    session = name,
+                    "shell init marker never arrived; proceeding without banner consumption \
+                     (login banner may appear in early session output)"
+                );
+                inner.state.lock().await.discard_until_ready = false;
+                break;
+            }
+        }
+    }
+
+    {
+        let mut reg = registry().lock().await;
+        match reg.entry((host.to_string(), name.to_string())) {
+            Entry::Occupied(existing) => {
+                // Lost a concurrent-create race for the same key: keep the
+                // established session, close ours.
+                let existing = existing.get().clone();
+                drop(reg);
+                let _ = inner.write_half.close().await;
+                return Ok(existing);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(inner.clone());
+            }
+        }
+    }
 
     Ok(inner)
 }
@@ -522,29 +804,79 @@ async fn reader_loop(inner: Arc<SessionInner>, mut read_half: ssh::ChannelReadHa
 
 async fn on_data(inner: &Arc<SessionInner>, data: &[u8]) {
     let mut state = inner.state.lock().await;
-    state.ring.push_slice(data);
-    state.last_activity = Instant::now();
-    if let Some(file) = state.spool_file.as_mut() {
-        // Local disk writes are small and fast; a brief synchronous write
-        // here is simpler and cheaper than wiring up tokio::fs for this
-        // milestone (avoids an extra dependency edge for negligible gain).
-        let _ = file.write_all(data);
-    }
-    if let Some(current) = &state.current_run {
-        let (segment, _dropped) = state.ring.since(current.start_offset);
-        if let Some(m) = find_sentinel(&segment, &current.sentinel) {
-            let end_offset = current.start_offset + m.output_len as u64;
-            state.last_result = Some(RunOutcome {
-                exit_code: m.exit_code,
-                end_offset,
-            });
-            state.busy = false;
-            state.current_run = None;
-            state.spool_file = None; // dropped => flushed and closed
-        }
-    }
+    ingest(&mut state, data);
     drop(state);
     inner.wake_tx.send_modify(|v| *v = v.wrapping_add(1));
+}
+
+/// Core of the reader path, factored out of `on_data` so it's directly
+/// unit-testable without an SSH connection: scrub the raw PTY bytes, commit
+/// payload to the ring/spool (unless still inside the init discard gate),
+/// and settle runs when their markers arrive. Events are processed in
+/// stream order so `end_offset` snapshots exclude any payload that arrived
+/// after a marker within the same chunk.
+fn ingest(state: &mut SessionState, data: &[u8]) {
+    state.last_activity = Instant::now();
+    for event in state.scrubber.feed(data) {
+        match event {
+            ScrubEvent::Payload(bytes) => {
+                if state.discard_until_ready {
+                    // Login banner / MOTD / prompt residue / init echo —
+                    // consumed during open, never agent-visible (D2).
+                    continue;
+                }
+                state.ring.push_slice(&bytes);
+                if let Some(file) = state.spool_file.as_mut() {
+                    // Local disk writes are small and fast; a brief
+                    // synchronous write here is simpler and cheaper than
+                    // wiring up tokio::fs for this milestone.
+                    let _ = file.write_all(&bytes);
+                }
+            }
+            ScrubEvent::Marker {
+                sentinel,
+                exit_code,
+            } => handle_marker(state, &sentinel, exit_code),
+        }
+    }
+}
+
+/// A complete marker arrived (already scrubbed from payload). Decide what
+/// it settles: the init gate, the current run (normally via its own
+/// sentinel, or as `interrupted` via the armed resync probe sentinel), or
+/// nothing (a stale probe from a run that already finished — swallowed).
+fn handle_marker(state: &mut SessionState, sentinel: &str, exit_code: i32) {
+    if state.discard_until_ready {
+        // The shell-init frame completed; the session is now clean.
+        state.discard_until_ready = false;
+        return;
+    }
+    let Some(current) = &state.current_run else {
+        // Stale marker (e.g. a resync probe whose run was already settled
+        // by its own sentinel) — scrubbed from output, nothing to settle.
+        return;
+    };
+    let outcome = if sentinel == current.sentinel {
+        RunOutcome {
+            exit_code: Some(exit_code),
+            interrupted: false,
+            end_offset: state.ring.total_written,
+        }
+    } else if current.resync.as_deref() == Some(sentinel) {
+        // The command line was aborted by Ctrl-C before its own marker
+        // could print; the resync probe settles the run as interrupted.
+        RunOutcome {
+            exit_code: None,
+            interrupted: true,
+            end_offset: state.ring.total_written,
+        }
+    } else {
+        return; // unknown/stale marker — swallow
+    };
+    state.last_result = Some(outcome);
+    state.busy = false;
+    state.current_run = None;
+    state.spool_file = None; // dropped => flushed and closed
 }
 
 async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
@@ -555,6 +887,7 @@ async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
     }
     state.busy = false;
     state.current_run = None;
+    state.spool_file = None; // dropped => flushed and closed
     drop(state);
     inner.wake_tx.send_modify(|v| *v = v.wrapping_add(1));
 }
@@ -644,13 +977,17 @@ pub async fn run(
         state.spool_file = Some(file);
         state.current_run = Some(CurrentRun {
             sentinel: sentinel.clone(),
-            start_offset,
+            resync: None,
         });
         state.last_result = None;
     }
 
     let cmd_line = frame_command(command, &sentinel);
-    if let Err(e) = inner.write_half.data_bytes(cmd_line.into_bytes()).await {
+    if let Err(e) = inner
+        .write_half
+        .data_bytes(cmd_line.clone().into_bytes())
+        .await
+    {
         mark_dead(&inner, &format!("failed to write to session: {e}")).await;
         let state = inner.state.lock().await;
         let reason = state.dead.clone().unwrap_or_default();
@@ -707,18 +1044,25 @@ pub async fn run(
     let outcome = state
         .last_result
         .take()
-        .expect("busy cleared without dying implies the sentinel was found and recorded a result");
+        .expect("busy cleared without dying implies a marker was found and recorded a result");
     let (all_since_start, _dropped) = state.ring.since(start_offset);
     let want_len = ((outcome.end_offset - start_offset) as usize).min(all_since_start.len());
     let command_output = &all_since_start[..want_len];
-    let command_output = strip_echoed_command(command_output, command);
+    // Defensive only — echo is normally killed at the PTY/stty/readline
+    // level; see `strip_echoed_command`. Match either the framed line we
+    // actually wrote or the bare command.
+    let command_output = strip_echoed_command(command_output, &[cmd_line.as_str(), command]);
     let (output, truncated, total_bytes) = shape_output(&command_output, raw);
 
     Ok(RunReply {
         host: host.to_string(),
         session: name,
-        state: "done".to_string(),
-        exit_code: Some(outcome.exit_code),
+        state: if outcome.interrupted {
+            "interrupted".to_string()
+        } else {
+            "done".to_string()
+        },
+        exit_code: outcome.exit_code,
         output,
         truncated,
         total_bytes,
@@ -814,11 +1158,24 @@ pub async fn send(
 }
 
 /// `interrupt <host>` — sends Ctrl-C (0x03), DESIGN.md §6.
+///
+/// If a run is in flight, Ctrl-C usually aborts the *whole* framed command
+/// line in the interactive shell — including the trailing marker `printf` —
+/// so the run's own sentinel would never arrive and the session would stay
+/// `busy` forever (D3). To resync, we follow the 0x03 with a standalone
+/// probe line carrying a fresh sentinel, and arm the current run to accept
+/// EITHER marker: the original (command survived/trapped SIGINT and
+/// finished normally — the queued probe then reports late and is swallowed
+/// as stale) or the probe's (command was killed — the run settles as
+/// `interrupted`, exit code unknown). If neither ever arrives (shell truly
+/// wedged, e.g. Ctrl-C swallowed by a full-screen program), the session
+/// stays busy and the `Busy` error on the next `run` points at `sloosh
+/// kill` as the recovery path.
 pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), SessionError> {
     let name = default_session_name(session);
     let inner = get_existing_session(host, &name).await?;
-    {
-        let state = inner.state.lock().await;
+    let probe = {
+        let mut state = inner.state.lock().await;
         if let Some(reason) = &state.dead {
             return Err(SessionError::Dead {
                 host: host.to_string(),
@@ -826,12 +1183,31 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
                 reason: reason.clone(),
             });
         }
-    }
+        if state.busy
+            && let Some(current) = state.current_run.as_mut()
+        {
+            // Re-arming on repeat interrupts replaces the probe sentinel;
+            // an older probe's marker (if its printf still runs) is
+            // scrubbed and swallowed as stale by `handle_marker`.
+            let resync_sentinel = make_sentinel();
+            current.resync = Some(resync_sentinel.clone());
+            Some(marker_printf(&resync_sentinel))
+        } else {
+            None
+        }
+    };
     inner
         .write_half
         .data_bytes(vec![0x03u8])
         .await
         .map_err(SshError::from)?;
+    if let Some(probe_line) = probe {
+        inner
+            .write_half
+            .data_bytes(probe_line.into_bytes())
+            .await
+            .map_err(SshError::from)?;
+    }
     Ok(())
 }
 
@@ -960,59 +1336,271 @@ mod tests {
         assert_eq!(ring.tail(100), b"0123456789");
     }
 
-    // --- sentinel framing ---------------------------------------------
+    // --- sentinel framing / scrubber ----------------------------------
 
-    #[test]
-    fn find_sentinel_locates_marker_and_exit_code() {
-        let sentinel = "SENT1234";
-        let buf = format!("hello world\n{sentinel}0{sentinel}\n");
-        let m = find_sentinel(buf.as_bytes(), sentinel).expect("should find marker");
-        assert_eq!(&buf.as_bytes()[..m.output_len], b"hello world");
-        assert_eq!(m.exit_code, 0);
-    }
-
-    #[test]
-    fn find_sentinel_nonzero_exit_code() {
-        let sentinel = "SENT";
-        let buf = format!("oops\n{sentinel}127{sentinel}\n");
-        let m = find_sentinel(buf.as_bytes(), sentinel).expect("should find marker");
-        assert_eq!(m.exit_code, 127);
-    }
-
-    #[test]
-    fn find_sentinel_returns_none_when_incomplete() {
-        let sentinel = "SENT";
-        // Only the first occurrence has arrived so far.
-        let buf = format!("output so far\n{sentinel}0");
-        assert!(find_sentinel(buf.as_bytes(), sentinel).is_none());
-    }
-
-    #[test]
-    fn find_sentinel_handles_chunked_split_reads() {
-        // Simulate the reader task's behavior: it always rescans the full
-        // accumulated buffer, so feeding the same bytes in via ever-growing
-        // prefixes must agree on the final answer regardless of where any
-        // individual split falls (including splitting the sentinel itself).
-        let sentinel = "CHUNKY99";
-        let full = format!("first line\nsecond line\n{sentinel}42{sentinel}\n");
-        let bytes = full.as_bytes();
-        let mut found = None;
-        for split in 1..=bytes.len() {
-            if let Some(m) = find_sentinel(&bytes[..split], sentinel) {
-                found = Some(m);
-                break;
+    /// Collect a scrubber event stream into (concatenated payload, markers).
+    fn drain(events: Vec<ScrubEvent>) -> (Vec<u8>, Vec<(String, i32)>) {
+        let mut payload = Vec::new();
+        let mut markers = Vec::new();
+        for event in events {
+            match event {
+                ScrubEvent::Payload(bytes) => payload.extend_from_slice(&bytes),
+                ScrubEvent::Marker {
+                    sentinel,
+                    exit_code,
+                } => markers.push((sentinel, exit_code)),
             }
         }
-        let m = found.expect("should eventually find the marker as the buffer grows");
-        assert_eq!(m.exit_code, 42);
-        assert_eq!(&bytes[..m.output_len], b"first line\nsecond line");
+        (payload, markers)
     }
 
     #[test]
-    fn find_sentinel_rejects_non_numeric_between_markers() {
-        let sentinel = "SENT";
-        let buf = format!("weird\n{sentinel}notanumber{sentinel}\n");
-        assert!(find_sentinel(buf.as_bytes(), sentinel).is_none());
+    fn scrubber_extracts_marker_and_clean_payload() {
+        let s = make_sentinel();
+        let stream = format!("hello world\r\n\r\n{s}0{s}\r\n");
+        let mut sc = FrameScrubber::default();
+        let (payload, markers) = drain(sc.feed(stream.as_bytes()));
+        assert_eq!(payload, b"hello world\r\n");
+        assert_eq!(markers, vec![(s, 0)]);
+    }
+
+    #[test]
+    fn scrubber_nonzero_exit_code() {
+        let s = make_sentinel();
+        let stream = format!("oops\r\n\r\n{s}127{s}\r\n");
+        let mut sc = FrameScrubber::default();
+        let (_, markers) = drain(sc.feed(stream.as_bytes()));
+        assert_eq!(markers[0].1, 127);
+    }
+
+    #[test]
+    fn scrubber_result_is_invariant_across_all_chunk_splits() {
+        // The D1 invariant, exercised against every possible split point
+        // (including splits inside the sentinel and inside the separator
+        // newlines): payload and markers must come out identical, and no
+        // sentinel byte sequence may ever appear in the payload.
+        let s = make_sentinel();
+        let stream = format!("line one\r\nline two\r\n\r\n{s}42{s}\r\nafter");
+        let bytes = stream.as_bytes();
+
+        let mut reference = FrameScrubber::default();
+        let (ref_payload, ref_markers) = drain(reference.feed(bytes));
+        assert_eq!(ref_payload, b"line one\r\nline two\r\nafter");
+        assert_eq!(ref_markers, vec![(s.clone(), 42)]);
+        assert!(
+            !String::from_utf8_lossy(&ref_payload).contains("__sloosh_"),
+            "sentinel leaked into payload"
+        );
+
+        for split in 0..=bytes.len() {
+            let mut sc = FrameScrubber::default();
+            let mut events = sc.feed(&bytes[..split]);
+            events.extend(sc.feed(&bytes[split..]));
+            let (payload, markers) = drain(events);
+            assert_eq!(payload, ref_payload, "split at {split} changed payload");
+            assert_eq!(markers, ref_markers, "split at {split} changed markers");
+        }
+
+        // Byte-at-a-time, the worst case.
+        let mut sc = FrameScrubber::default();
+        let mut events = Vec::new();
+        for b in bytes {
+            events.extend(sc.feed(std::slice::from_ref(b)));
+        }
+        let (payload, markers) = drain(events);
+        assert_eq!(payload, ref_payload);
+        assert_eq!(markers, ref_markers);
+    }
+
+    #[test]
+    fn scrubber_releases_lone_sentinel_and_echo_lookalikes_as_payload() {
+        // A lone sentinel (no digits+twin), or an echoed framed command
+        // (`%s` between the sentinels), is not a marker: pattern scan must
+        // release it as payload rather than hold it forever.
+        let s = make_sentinel();
+        let mut sc = FrameScrubber::default();
+        let stream = format!("{s}%s{s} not a marker\r\nnext");
+        let (payload, markers) = drain(sc.feed(stream.as_bytes()));
+        assert_eq!(payload, stream.as_bytes());
+        assert!(markers.is_empty());
+
+        // Sentinel-ish text with non-hex characters is plain payload too.
+        // (A chunk-final "\r\n" is briefly held back as a potential marker
+        // separator — the trailing "x" here resolves it as payload.)
+        let mut sc = FrameScrubber::default();
+        let (payload, markers) = drain(sc.feed(b"__sloosh_zzz not hex\r\nx"));
+        assert_eq!(payload, b"__sloosh_zzz not hex\r\nx");
+        assert!(markers.is_empty());
+    }
+
+    #[test]
+    fn scrubber_holds_partial_marker_until_it_resolves() {
+        let s = make_sentinel();
+        let mut sc = FrameScrubber::default();
+        // Feed output plus the separator and half the marker.
+        let head = format!("out\r\n\r\n{}", &s[..20]);
+        let (payload, markers) = drain(sc.feed(head.as_bytes()));
+        assert_eq!(payload, b"out\r\n", "separator + partial marker held back");
+        assert!(markers.is_empty());
+        // Now the rest of the marker.
+        let tail = format!("{}0{s}\r\n", &s[20..]);
+        let (payload, markers) = drain(sc.feed(tail.as_bytes()));
+        assert!(payload.is_empty());
+        assert_eq!(markers, vec![(s, 0)]);
+    }
+
+    #[test]
+    fn scrubber_eats_trailing_newline_after_marker_across_splits() {
+        let s = make_sentinel();
+        let mut sc = FrameScrubber::default();
+        let (_, markers) = drain(sc.feed(format!("{s}0{s}").as_bytes()));
+        assert_eq!(markers.len(), 1);
+        // The printf's trailing newline arrives split across two feeds.
+        assert!(drain(sc.feed(b"\r")).0.is_empty());
+        assert!(drain(sc.feed(b"\n")).0.is_empty());
+        let (payload, _) = drain(sc.feed(b"next"));
+        assert_eq!(payload, b"next");
+    }
+
+    // --- ingest / marker handling (D2, D3) -----------------------------
+
+    fn test_state() -> SessionState {
+        SessionState {
+            ring: RingBuffer::new(RING_CAPACITY),
+            cursor: 0,
+            busy: false,
+            dead: None,
+            last_activity: Instant::now(),
+            run_seq: 0,
+            current_run: None,
+            last_result: None,
+            spool_file: None,
+            scrubber: FrameScrubber::default(),
+            discard_until_ready: false,
+        }
+    }
+
+    fn ring_contents(state: &SessionState) -> Vec<u8> {
+        state.ring.tail(usize::MAX)
+    }
+
+    #[test]
+    fn banner_and_init_echo_are_discarded_until_init_marker() {
+        // D2: everything before the shell-init frame's marker — banner,
+        // MOTD, prompt residue, the init line's own echo (which contains
+        // sentinel-lookalike text) — is consumed during open.
+        let init_sentinel = make_sentinel();
+        let mut state = test_state();
+        state.discard_until_ready = true;
+
+        let echoed_init = frame_command(INIT_COMMANDS, &init_sentinel);
+        let stream = format!(
+            "Welcome to Ubuntu 24.04 LTS\r\n* Docs: https://example\r\nroot@vm:~# {}\r\n\r\n{init_sentinel}0{init_sentinel}\r\n",
+            echoed_init.trim_end()
+        );
+        ingest(&mut state, stream.as_bytes());
+
+        assert!(!state.discard_until_ready, "init marker clears the gate");
+        assert!(
+            ring_contents(&state).is_empty(),
+            "banner/prompt/init echo must never reach the ring, got {:?}",
+            String::from_utf8_lossy(&ring_contents(&state))
+        );
+
+        // The first real output after the gate is committed normally. (The
+        // chunk-final "\r\n" is briefly held back as a potential marker
+        // separator; the next chunk resolves it as payload.)
+        ingest(&mut state, b"real output\r\n");
+        ingest(&mut state, b"more\r\nx");
+        assert_eq!(ring_contents(&state), b"real output\r\nmore\r\nx");
+    }
+
+    #[test]
+    fn resync_probe_marker_settles_interrupted_run() {
+        // D3, race A: Ctrl-C killed the command line, so only the resync
+        // probe's marker ever arrives — the run settles as interrupted
+        // instead of wedging the session in busy forever.
+        let s1 = make_sentinel();
+        let rs = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: s1,
+            resync: Some(rs.clone()),
+        });
+
+        ingest(
+            &mut state,
+            format!("partial output\r\n\r\n{rs}130{rs}\r\n").as_bytes(),
+        );
+
+        assert!(!state.busy, "resync marker must clear busy");
+        assert!(state.current_run.is_none());
+        let outcome = state.last_result.as_ref().expect("run settled");
+        assert!(outcome.interrupted);
+        assert_eq!(outcome.exit_code, None, "exit code unknowable after ^C");
+        assert_eq!(ring_contents(&state), b"partial output\r\n");
+    }
+
+    #[test]
+    fn original_marker_wins_when_command_survives_interrupt() {
+        // D3, race B: the command survived/trapped SIGINT and finished
+        // normally — its own marker arrives first and settles the run with
+        // a real exit code; the queued probe's marker arrives later and is
+        // swallowed as stale (and scrubbed from output).
+        let s1 = make_sentinel();
+        let rs = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: s1.clone(),
+            resync: Some(rs.clone()),
+        });
+
+        ingest(
+            &mut state,
+            format!("done\r\n\r\n{s1}0{s1}\r\n\r\n{rs}0{rs}\r\n").as_bytes(),
+        );
+
+        assert!(!state.busy);
+        let outcome = state.last_result.as_ref().expect("run settled");
+        assert!(!outcome.interrupted);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(
+            ring_contents(&state),
+            b"done\r\n",
+            "neither marker may leak into the ring"
+        );
+    }
+
+    #[test]
+    fn stale_probe_marker_between_runs_is_swallowed() {
+        let rs = make_sentinel();
+        let mut state = test_state();
+        ingest(&mut state, format!("{rs}0{rs}\r\n").as_bytes());
+        assert!(state.last_result.is_none());
+        assert!(ring_contents(&state).is_empty());
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn end_offset_excludes_payload_arriving_after_marker_in_same_chunk() {
+        let s1 = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: s1.clone(),
+            resync: None,
+        });
+
+        ingest(
+            &mut state,
+            format!("out\r\n\r\n{s1}0{s1}\r\ntrailing").as_bytes(),
+        );
+
+        let outcome = state.last_result.as_ref().expect("run settled");
+        assert_eq!(outcome.end_offset, b"out\r\n".len() as u64);
+        assert_eq!(ring_contents(&state), b"out\r\ntrailing");
     }
 
     // --- ANSI stripping -------------------------------------------------
@@ -1053,14 +1641,25 @@ mod tests {
     #[test]
     fn strip_echoed_command_removes_matching_first_line() {
         let out = b"ls -la\ntotal 0\n-rw-r--r-- 1 u u 0 file\n";
-        let stripped = strip_echoed_command(out, "ls -la");
+        let stripped = strip_echoed_command(out, &["ls -la"]);
         assert_eq!(stripped, b"total 0\n-rw-r--r-- 1 u u 0 file\n");
+    }
+
+    #[test]
+    fn strip_echoed_command_matches_framed_line_with_cr() {
+        // The echoed line is the *framed* command (with the sentinel
+        // printf), CR-terminated by PTY newline translation.
+        let s = make_sentinel();
+        let framed = frame_command("echo hi", &s);
+        let out = format!("{}\r\nhi\r\n", framed.trim_end());
+        let stripped = strip_echoed_command(out.as_bytes(), &[framed.as_str(), "echo hi"]);
+        assert_eq!(stripped, b"hi\r\n");
     }
 
     #[test]
     fn strip_echoed_command_leaves_output_alone_when_not_echoed() {
         let out = b"total 0\nfile\n";
-        let stripped = strip_echoed_command(out, "ls -la");
+        let stripped = strip_echoed_command(out, &["ls -la"]);
         assert_eq!(stripped, out);
     }
 

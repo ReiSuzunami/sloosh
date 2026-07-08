@@ -1,5 +1,6 @@
-//! Live-SSH integration tests for the milestone 2 session command set
-//! (`run`/`peek`/`send`/`interrupt`/`open`/`ls`/`kill`).
+//! Live-SSH integration tests for the milestone 2/3 session command set
+//! (`run`/`peek`/`send`/`interrupt`/`open`/`ls`/`kill`), now gated behind an
+//! active lease (DESIGN.md §4) same as any other caller.
 //!
 //! These need a real, reachable SSH host to connect to, so they're gated
 //! behind the `SLOOSH_TEST_SSH_HOST` environment variable (an alias
@@ -9,9 +10,13 @@
 //! network access nobody granted.
 //!
 //! To exercise for real: `SLOOSH_TEST_SSH_HOST=myhost cargo test --test
-//! ssh_session -- --ignored` isn't needed — just set the env var, the test
-//! notices and runs.
+//! ssh_session -- --test-threads=1` — single-threaded because each test
+//! points `$SLOOSH_HOME` (and thus the vault) at its own temp directory via
+//! a process-global env var, so it can't ever touch the real developer's
+//! `~/.sloosh/vault`; that isolation only holds with one test running at a
+//! time.
 
+use sloosh::daemon::{lease, vault};
 use sloosh::proto::{Request, Response};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
@@ -30,6 +35,57 @@ fn temp_socket_path(tag: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Point `$SLOOSH_HOME` at a private temp directory for the rest of this
+/// process, so the lease/vault machinery `start_daemon`+`grant_lease_for_test`
+/// exercise below never touches the real developer's `~/.sloosh/vault`.
+fn set_test_home(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!(
+        "sloosh-ssh-itest-home-{tag}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).expect("create test SLOOSH_HOME");
+    // SAFETY: `$SLOOSH_HOME` is process-global, but these live-SSH tests are
+    // only ever run manually (gated behind `SLOOSH_TEST_SSH_HOST`) and the
+    // module doc comment above tells the operator to use
+    // `--test-threads=1` in that case, so no other thread is concurrently
+    // reading/writing the environment.
+    unsafe {
+        std::env::set_var("SLOOSH_HOME", &home);
+    }
+    home
+}
+
+/// Grant this test process itself a lease for `host` (DESIGN.md §4), calling
+/// the lease/vault machinery directly in-process rather than going through
+/// `sloosh request`/`sloosh approve` — this test binary *is* the caller
+/// whose ancestry the daemon will check, so `std::process::id()` is the
+/// right anchor to request against. The vault is created first (approval
+/// never creates it), and approval goes through `approve_lease_for_chain`
+/// with an empty approver chain: the daemon-side self-approval guard would
+/// (correctly) reject the real `approve_lease` here, since the approver and
+/// the requester are the same process.
+async fn grant_lease_for_test(host: &str) {
+    if !vault::exists() {
+        vault::create(
+            &vault::VaultData::default(),
+            b"sloosh-live-test-master-password",
+        )
+        .expect("create test vault");
+    }
+    let pid = std::process::id();
+    match lease::request_lease(pid, vec![host.to_string()])
+        .await
+        .expect("request test lease")
+    {
+        lease::RequestOutcome::AlreadyAuthorized => {}
+        lease::RequestOutcome::Pending(info) => {
+            lease::approve_lease_for_chain(&[], &info.id, b"sloosh-live-test-master-password")
+                .await
+                .expect("approve test lease");
+        }
+    }
+}
+
 async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
@@ -43,9 +99,13 @@ async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
 }
 
 /// Start a fresh daemon on its own temp socket and return a connected
-/// channel to it. Each test gets an isolated daemon so session state never
-/// leaks between tests.
-async fn start_daemon(tag: &str) -> (UnixChannel, std::path::PathBuf) {
+/// channel to it, having already granted this test process a lease for
+/// `host` (DESIGN.md §4) so the session commands below aren't refused.
+/// Each test gets an isolated daemon (and, via `set_test_home`, an isolated
+/// vault) so state never leaks between tests.
+async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf) {
+    set_test_home(tag);
+    grant_lease_for_test(host).await;
     let socket_path = temp_socket_path(tag);
     let daemon_socket = socket_path.clone();
     tokio::spawn(async move {
@@ -61,7 +121,7 @@ async fn run_executes_command_and_returns_output() {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
     };
-    let (mut chan, _socket) = start_daemon("run-basic").await;
+    let (mut chan, _socket) = start_daemon("run-basic", &host).await;
 
     chan.send(&Request::Run {
         host: host.clone(),
@@ -69,6 +129,7 @@ async fn run_executes_command_and_returns_output() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run");
@@ -93,7 +154,7 @@ async fn peek_send_and_default_session_reuse() {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
     };
-    let (mut chan, _socket) = start_daemon("peek-send").await;
+    let (mut chan, _socket) = start_daemon("peek-send", &host).await;
 
     // First run creates the default session.
     chan.send(&Request::Run {
@@ -102,6 +163,7 @@ async fn peek_send_and_default_session_reuse() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run 1");
@@ -118,6 +180,7 @@ async fn peek_send_and_default_session_reuse() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run 2");
@@ -152,7 +215,7 @@ async fn kill_then_run_creates_a_fresh_session() {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
     };
-    let (mut chan, _socket) = start_daemon("kill-reopen").await;
+    let (mut chan, _socket) = start_daemon("kill-reopen", &host).await;
 
     chan.send(&Request::Run {
         host: host.clone(),
@@ -160,6 +223,7 @@ async fn kill_then_run_creates_a_fresh_session() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run");
@@ -170,6 +234,7 @@ async fn kill_then_run_creates_a_fresh_session() {
     chan.send(&Request::Kill {
         host: host.clone(),
         session: None,
+        lease_token: None,
     })
     .await
     .expect("send Kill");
@@ -181,6 +246,7 @@ async fn kill_then_run_creates_a_fresh_session() {
     chan.send(&Request::Kill {
         host: host.clone(),
         session: None,
+        lease_token: None,
     })
     .await
     .expect("send Kill again");
@@ -196,6 +262,7 @@ async fn kill_then_run_creates_a_fresh_session() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run after kill");
@@ -212,11 +279,12 @@ async fn named_session_is_independent_of_default() {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
     };
-    let (mut chan, _socket) = start_daemon("named-session").await;
+    let (mut chan, _socket) = start_daemon("named-session", &host).await;
 
     chan.send(&Request::Open {
         host: host.clone(),
         name: "extra".to_string(),
+        lease_token: None,
     })
     .await
     .expect("send Open");
@@ -231,6 +299,7 @@ async fn named_session_is_independent_of_default() {
         session: None,
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run default");
@@ -245,6 +314,7 @@ async fn named_session_is_independent_of_default() {
         session: Some("extra".to_string()),
         timeout_secs: 30,
         raw: false,
+        lease_token: None,
     })
     .await
     .expect("send Run extra");
