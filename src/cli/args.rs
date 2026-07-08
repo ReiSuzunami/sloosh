@@ -66,11 +66,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub session: Option<String>,
     /// Give up waiting after this many seconds and return a `running` status (does not kill the command).
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 60)]
     pub timeout: u64,
     /// Skip ANSI-escape stripping and return the raw PTY output.
     #[arg(long)]
     pub raw: bool,
+    /// Print machine-readable JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +89,9 @@ pub struct PeekArgs {
     /// Skip ANSI-escape stripping and return the raw PTY output.
     #[arg(long)]
     pub raw: bool,
+    /// Print machine-readable JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +103,9 @@ pub struct SendArgs {
     /// Named parallel session, if not using the host's default session.
     #[arg(long)]
     pub session: Option<String>,
+    /// Append a newline after the keys (equivalent to pressing Enter).
+    #[arg(long)]
+    pub newline: bool,
 }
 
 #[derive(Debug, Args)]
@@ -121,6 +130,9 @@ pub struct LsArgs {
     /// Only list sessions for this host.
     #[arg(long)]
     pub host: Option<String>,
+    /// Print machine-readable JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

@@ -5,9 +5,12 @@ mod args;
 mod client;
 
 pub use args::Cli;
-use args::{Command, DaemonAction, StatusArgs};
+use args::{
+    Command, DaemonAction, InterruptArgs, KillArgs, LsArgs, OpenArgs, PeekArgs, RunArgs, SendArgs,
+    StatusArgs,
+};
 
-use crate::proto::{self, Request, Response, StatusReply};
+use crate::proto::{self, PeekReply, Request, Response, RunReply, SessionSummary, StatusReply};
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
 use std::path::Path;
@@ -19,13 +22,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Status(args) => cmd_status(args).await,
         Command::Daemon(args) => cmd_daemon(args.action).await,
 
-        Command::Run(_) => not_implemented("run"),
-        Command::Peek(_) => not_implemented("peek"),
-        Command::Send(_) => not_implemented("send"),
-        Command::Interrupt(_) => not_implemented("interrupt"),
-        Command::Open(_) => not_implemented("open"),
-        Command::Ls(_) => not_implemented("ls"),
-        Command::Kill(_) => not_implemented("kill"),
+        Command::Run(args) => cmd_run(args).await,
+        Command::Peek(args) => cmd_peek(args).await,
+        Command::Send(args) => cmd_send(args).await,
+        Command::Interrupt(args) => cmd_interrupt(args).await,
+        Command::Open(args) => cmd_open(args).await,
+        Command::Ls(args) => cmd_ls(args).await,
+        Command::Kill(args) => cmd_kill(args).await,
         Command::Request(_) => not_implemented("request"),
         Command::Approve(_) => not_implemented("approve"),
         Command::Add(_) => not_implemented("add"),
@@ -138,4 +141,173 @@ fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
     for l in &reply.leases {
         println!("    - {} (expires in {}s)", l.host, l.expires_in_secs);
     }
+}
+
+/// Connect (auto-spawning the daemon if needed) and send one request,
+/// returning the raw response. All the new session commands share this
+/// shape; only the response-matching differs per command.
+async fn send_request(req: &Request) -> anyhow::Result<Response> {
+    let socket_path = unix::resolve_socket_path();
+    let mut chan = client::connect_or_spawn(&socket_path).await?;
+    chan.send(req).await?;
+    match chan.recv().await? {
+        Some(resp) => Ok(resp),
+        None => anyhow::bail!(
+            "daemon closed the connection without responding; check ~/.sloosh/daemon.log for a crash"
+        ),
+    }
+}
+
+fn bail_on_error_or_unexpected(resp: Response) -> anyhow::Result<Response> {
+    if let Response::Error { message } = &resp {
+        anyhow::bail!("daemon reported an error: {message}");
+    }
+    Ok(resp)
+}
+
+async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
+    let req = Request::Run {
+        host: args.host,
+        command: args.command,
+        session: args.session,
+        timeout_secs: args.timeout,
+        raw: args.raw,
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Run(reply) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Run: {resp:?}");
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+    } else {
+        print_run_human(&reply);
+    }
+    Ok(())
+}
+
+fn print_run_human(reply: &RunReply) {
+    println!("{} @ {} [{}]", reply.host, reply.session, reply.state);
+    if let Some(code) = reply.exit_code {
+        println!("exit code: {code}");
+    }
+    if let Some(reason) = &reply.dead_reason {
+        println!("dead reason: {reason}");
+    }
+    if !reply.spool_path.is_empty() {
+        println!("spool: {}", reply.spool_path);
+    }
+    println!("{}", reply.output);
+    if reply.truncated {
+        println!(
+            "[output truncated in this reply; {} total bytes — see spool file for the rest]",
+            reply.total_bytes
+        );
+    }
+}
+
+async fn cmd_peek(args: PeekArgs) -> anyhow::Result<()> {
+    let req = Request::Peek {
+        host: args.host,
+        session: args.session,
+        tail: args.tail,
+        raw: args.raw,
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Peek(reply) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Peek: {resp:?}");
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+    } else {
+        print_peek_human(&reply);
+    }
+    Ok(())
+}
+
+fn print_peek_human(reply: &PeekReply) {
+    println!("{} @ {} [{}]", reply.host, reply.session, reply.state);
+    if let Some(reason) = &reply.dead_reason {
+        println!("dead reason: {reason}");
+    }
+    println!("{}", reply.output);
+    if reply.truncated {
+        println!(
+            "[output truncated in this reply; {} total bytes]",
+            reply.total_bytes
+        );
+    }
+}
+
+async fn cmd_send(args: SendArgs) -> anyhow::Result<()> {
+    let req = Request::Send {
+        host: args.host,
+        keys: args.keys,
+        session: args.session,
+        newline: args.newline,
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("sent");
+    Ok(())
+}
+
+async fn cmd_interrupt(args: InterruptArgs) -> anyhow::Result<()> {
+    let req = Request::Interrupt {
+        host: args.host,
+        session: args.session,
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("interrupted");
+    Ok(())
+}
+
+async fn cmd_open(args: OpenArgs) -> anyhow::Result<()> {
+    let req = Request::Open {
+        host: args.host,
+        name: args.name,
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Session(summary) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Open: {resp:?}");
+    };
+    print_session_summary_human(&summary);
+    Ok(())
+}
+
+async fn cmd_kill(args: KillArgs) -> anyhow::Result<()> {
+    let req = Request::Kill {
+        host: args.host,
+        session: args.session,
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("killed");
+    Ok(())
+}
+
+async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
+    let req = Request::Ls { host: args.host };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Ls { sessions } = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Ls: {resp:?}");
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+    } else if sessions.is_empty() {
+        println!("no sessions");
+    } else {
+        for s in &sessions {
+            print_session_summary_human(s);
+        }
+    }
+    Ok(())
+}
+
+fn print_session_summary_human(s: &SessionSummary) {
+    let mut line = format!(
+        "{} @ {} [{}] idle {}s",
+        s.name, s.host, s.state, s.idle_secs
+    );
+    if let Some(reason) = &s.dead_reason {
+        line.push_str(&format!(" ({reason})"));
+    }
+    println!("{line}");
 }
