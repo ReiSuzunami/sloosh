@@ -337,24 +337,37 @@ impl SshConfig {
     /// Resolve `alias` against this config, falling back to the DESIGN.md
     /// §2 defaults (literal hostname, local user, port 22) for anything no
     /// matching block sets.
+    ///
+    /// A `user@host` literal is split like an OpenSSH destination: the host
+    /// part is what gets matched against `Host` patterns (and becomes the
+    /// default hostname), and the user part wins over any config `User` —
+    /// the same precedence real `ssh user@host` gives the command line.
+    /// `cfg.alias` keeps the full literal, since leases and sessions are
+    /// keyed by whatever string the caller used.
     pub fn resolve(&self, alias: &str) -> HostConfig {
+        let (user_override, host_key) = match alias.rsplit_once('@') {
+            Some((user, host)) if !user.is_empty() && !host.is_empty() => (Some(user), host),
+            _ => (None, alias),
+        };
         let mut cfg = HostConfig {
             alias: alias.to_string(),
-            hostname: alias.to_string(),
+            hostname: host_key.to_string(),
             port: 22,
-            user: current_user(),
+            user: user_override
+                .map(str::to_string)
+                .unwrap_or_else(current_user),
             identity_files: Vec::new(),
             proxy_jump: None,
             identity_agent: None,
         };
         let mut hostname_set = false;
         let mut port_set = false;
-        let mut user_set = false;
+        let mut user_set = user_override.is_some();
         let mut proxy_jump_set = false;
         let mut identity_agent_set = false;
 
         for block in &self.blocks {
-            if !host_patterns_match(&block.patterns, alias) {
+            if !host_patterns_match(&block.patterns, host_key) {
                 continue;
             }
             if !hostname_set && let Some(h) = &block.hostname {
@@ -1375,6 +1388,30 @@ Host web*
         let resolved = cfg.resolve("plain.example.com");
         assert_eq!(resolved.hostname, "plain.example.com");
         assert_eq!(resolved.port, 22);
+    }
+
+    #[test]
+    fn user_at_host_literal_splits_like_an_openssh_destination() {
+        let cfg = SshConfig::parse("");
+        let resolved = cfg.resolve("deploy@10.0.0.7");
+        assert_eq!(resolved.alias, "deploy@10.0.0.7");
+        assert_eq!(resolved.hostname, "10.0.0.7");
+        assert_eq!(resolved.user, "deploy");
+        assert_eq!(resolved.port, 22);
+    }
+
+    #[test]
+    fn user_at_host_literal_matches_config_blocks_by_host_and_wins_on_user() {
+        let contents = "\
+Host 10.0.0.7
+    Port 2222
+    User ignored-by-explicit-user
+";
+        let cfg = SshConfig::parse(contents);
+        let resolved = cfg.resolve("deploy@10.0.0.7");
+        assert_eq!(resolved.hostname, "10.0.0.7");
+        assert_eq!(resolved.port, 2222);
+        assert_eq!(resolved.user, "deploy");
     }
 
     #[test]
