@@ -130,6 +130,13 @@ plugin marketplace:
 /plugin install sloosh@nerv
 ```
 
+**Codex** — same marketplace, via the Codex CLI:
+
+```
+codex plugin marketplace add ReiSuzunami/nerv
+codex plugin add sloosh@nerv
+```
+
 **Any agent, via the [skills CLI](https://github.com/vercel-labs/skills)**
 (Claude Code, Codex, Cursor, and ~70 others):
 

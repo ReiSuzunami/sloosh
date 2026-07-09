@@ -1,0 +1,14 @@
+{
+  "name": "sloosh",
+  "version": "0.1.0",
+  "description": "Teaches your agent to operate remote hosts with the sloosh CLI: persistent SSH sessions (cwd/env survive between calls) gated behind human-approved leases, so the agent never sees a credential.",
+  "author": {
+    "name": "ReiSuzunami",
+    "url": "https://github.com/ReiSuzunami"
+  },
+  "homepage": "https://github.com/ReiSuzunami/sloosh",
+  "repository": "https://github.com/ReiSuzunami/sloosh",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["ssh", "remote", "devops", "sessions"],
+  "skills": "./skills/"
+}
