@@ -176,6 +176,11 @@ pub enum Request {
         master_password: SecretString,
         #[serde(default)]
         replace: bool,
+        /// Optional jump host alias (DESIGN.md §4), resolvable via the
+        /// vault or `~/.ssh/config`. `#[serde(default)]` so older CLI/daemon
+        /// builds exchanging this message without the field keep working.
+        #[serde(default)]
+        jump: Option<String>,
     },
     /// Remove a credential from the vault.
     RmCred {
@@ -613,11 +618,35 @@ mod tests {
             ssh_password: SecretString::new("sshpw"),
             master_password: SecretString::new("masterpw"),
             replace: false,
+            jump: Some("bastion".to_string()),
         });
         round_trip(Request::RmCred {
             alias: "web".to_string(),
             master_password: SecretString::new("masterpw"),
         });
+    }
+
+    #[test]
+    fn old_add_cred_without_jump_still_parses() {
+        // Backward compat: a client built before the ProxyJump-chain
+        // milestone omits `jump` entirely; `#[serde(default)]` must fill it
+        // in as `None` rather than failing to parse.
+        let json = r#"{"type":"AddCred","alias":"web","hostname":"example.com",
+            "ssh_password":"sshpw","master_password":"masterpw"}"#;
+        let req: Request = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            req,
+            Request::AddCred {
+                alias: "web".to_string(),
+                hostname: "example.com".to_string(),
+                port: None,
+                user: None,
+                ssh_password: SecretString::new("sshpw"),
+                master_password: SecretString::new("masterpw"),
+                replace: false,
+                jump: None,
+            }
+        );
     }
 
     #[test]

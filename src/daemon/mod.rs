@@ -192,13 +192,19 @@ async fn handle_connection(
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
                     Ok(()) => {
+                        let lease_ctx = ssh::LeaseContext {
+                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
+                            lease_token: lease_token.clone(),
+                        };
                         audit::record(
                             "run_started",
                             serde_json::json!({
                                 "host": host, "session": session_hint, "command": command,
                             }),
                         );
-                        match session::run(&host, &command, session, timeout_secs, raw).await {
+                        match session::run(&host, &command, session, timeout_secs, raw, lease_ctx)
+                            .await
+                        {
                             Ok(reply) => {
                                 audit::record(
                                     "run_settled",
@@ -302,12 +308,18 @@ async fn handle_connection(
             } => {
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::open(&host, &name).await {
-                        Ok(summary) => Response::Session(summary),
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
-                    },
+                    Ok(()) => {
+                        let lease_ctx = ssh::LeaseContext {
+                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
+                            lease_token: lease_token.clone(),
+                        };
+                        match session::open(&host, &name, lease_ctx).await {
+                            Ok(summary) => Response::Session(summary),
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
+                        }
+                    }
                 };
                 chan.send(&resp).await?;
             }
@@ -347,12 +359,20 @@ async fn handle_connection(
             } => {
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::put(&host, session, &local_path, &remote_path).await {
-                        Ok(reply) => Response::Transfer(reply),
-                        Err(e) => Response::Error {
-                            message: e.to_string(),
-                        },
-                    },
+                    Ok(()) => {
+                        let lease_ctx = ssh::LeaseContext {
+                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
+                            lease_token: lease_token.clone(),
+                        };
+                        match session::put(&host, session, &local_path, &remote_path, lease_ctx)
+                            .await
+                        {
+                            Ok(reply) => Response::Transfer(reply),
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
+                        }
+                    }
                 };
                 chan.send(&resp).await?;
             }
@@ -367,7 +387,20 @@ async fn handle_connection(
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
                     Ok(()) => {
-                        match session::get(&host, session, &remote_path, &local_path, force).await {
+                        let lease_ctx = ssh::LeaseContext {
+                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
+                            lease_token: lease_token.clone(),
+                        };
+                        match session::get(
+                            &host,
+                            session,
+                            &remote_path,
+                            &local_path,
+                            force,
+                            lease_ctx,
+                        )
+                        .await
+                        {
                             Ok(reply) => Response::Transfer(reply),
                             Err(e) => Response::Error {
                                 message: e.to_string(),
@@ -388,11 +421,15 @@ async fn handle_connection(
                     .await?;
                     continue;
                 };
-                let resp = match lease::request_lease(caller_pid, hosts.clone()).await {
+                // DESIGN.md §4: expand every requested host's ProxyJump
+                // chain so the human approving this request sees (and
+                // grants) coverage for the whole path, not just the target.
+                let expanded_hosts = ssh::expand_lease_hosts(&hosts).await;
+                let resp = match lease::request_lease(caller_pid, expanded_hosts.clone()).await {
                     Ok(outcome) => {
                         audit::record(
                             "lease_requested",
-                            serde_json::json!({"hosts": hosts, "caller_pid": caller_pid}),
+                            serde_json::json!({"hosts": expanded_hosts, "caller_pid": caller_pid}),
                         );
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
@@ -504,6 +541,7 @@ async fn handle_connection(
                 ssh_password,
                 master_password,
                 replace,
+                jump,
             } => {
                 let entry = vault::HostEntry {
                     hostname,
@@ -512,6 +550,7 @@ async fn handle_connection(
                     auth: vault::AuthMethod::Password {
                         password: ssh_password.into_string(),
                     },
+                    jump,
                 };
                 let resp = match vault::add_entry(
                     &alias,

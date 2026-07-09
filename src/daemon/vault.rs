@@ -164,6 +164,14 @@ pub struct HostEntry {
     #[serde(default)]
     pub user: Option<String>,
     pub auth: AuthMethod,
+    /// Optional jump host alias (DESIGN.md §4), resolvable via the vault or
+    /// `~/.ssh/config` — same syntax as an `~/.ssh/config` `ProxyJump` entry
+    /// (`user@host:port`, or a bare alias). `#[serde(default)]` so vault
+    /// files written before this field existed (still version 1 — this is a
+    /// purely additive change) keep decrypting. Not a secret: fine to show
+    /// in `Debug` output.
+    #[serde(default)]
+    pub jump: Option<String>,
 }
 
 impl HostEntry {
@@ -179,6 +187,7 @@ impl fmt::Debug for HostEntry {
             .field("port", &self.port)
             .field("user", &self.user)
             .field("auth", &self.auth)
+            .field("jump", &self.jump)
             .finish()
     }
 }
@@ -647,7 +656,24 @@ mod tests {
             auth: AuthMethod::Password {
                 password: "hunter2".to_string(),
             },
+            jump: None,
         }
+    }
+
+    #[test]
+    fn host_entry_without_jump_field_still_deserializes() {
+        // Simulates a vault entry written before the `jump` field existed —
+        // `#[serde(default)]` must let it decode with `jump: None` rather
+        // than failing, so old (still version 1) vault files keep working.
+        let json = r#"{
+            "hostname": "example.com",
+            "port": 22,
+            "user": "alice",
+            "auth": { "type": "password", "password": "hunter2" }
+        }"#;
+        let entry: HostEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.hostname, "example.com");
+        assert_eq!(entry.jump, None);
     }
 
     #[test]

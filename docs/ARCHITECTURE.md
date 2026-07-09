@@ -150,19 +150,28 @@ call; the cache clears the moment the last lease expires. Passwords are
 output (`SecretString` in `src/proto.rs` enforces this on the wire).
 Planned, without changing the on-disk format: OS-keychain- or
 biometric-gated (Touch ID / Windows Hello) key-wrapping as an alternative
-unlock path.
+unlock path. A `HostEntry` may also carry an optional `jump` field — a jump
+host alias, resolvable via the vault or `~/.ssh/config`, same syntax as an
+`~/.ssh/config` `ProxyJump` entry (`#[serde(default)]`, so older vault files
+without it keep decrypting; not a secret, so it's fine to show in `Debug`
+output).
 
 **Out-of-band authorization flow (device-code style):** (1) the agent runs
 `sloosh request <host>...` — a request must name specific hosts, since a
-blanket "unlock everything" would reduce approval to a rubber stamp; (2)
-the daemon creates a pending request with a generated ID, and the CLI
-prints one copy-pasteable approval command; (3) a human runs that command
-in a **separate terminal**, entering the master password — a pure-terminal
-flow that also works headless, and where first-time host-key fingerprint
-confirmation happens, since a human is already present to judge it; (4)
-the resulting lease auto-expires after an idle period, and `request` for
-an already-covered host returns success immediately (idempotent), so the
-agent never has to track lease state itself.
+blanket "unlock everything" would reduce approval to a rubber stamp; before
+creating the pending request, the daemon expands each named host's
+`ProxyJump` chain (vault `jump` field and/or `~/.ssh/config` `ProxyJump`,
+recursed the same way connection-time resolution does, same 8-hop cap) and
+folds every hop alias into the request's host set, deduplicated, target
+first — so the human approves coverage for the whole path, not just the
+final target; (2) the daemon creates a pending request with a generated ID,
+and the CLI prints one copy-pasteable approval command; (3) a human runs
+that command in a **separate terminal**, entering the master password — a
+pure-terminal flow that also works headless, and where first-time host-key
+fingerprint confirmation happens, since a human is already present to judge
+it; (4) the resulting lease auto-expires after an idle period, and
+`request` for an already-covered host returns success immediately
+(idempotent), so the agent never has to track lease state itself.
 
 **Agent identity anchoring: process ancestry.** The primary mechanism
 (`src/daemon/lease.rs`) binds a lease to a `(PID, process start time)`
@@ -187,7 +196,15 @@ claimed parent's.
 permission is only the outer perimeter. Every host-touching request
 (`Run`/`Peek`/`Send`/`Interrupt`/`Open`/`Kill`) independently requires an
 active lease, checked daemon-side via `lease::check_authorized` — never
-trusted from the client — because the CLI's TTY guards on
+trusted from the client. `ssh.rs` applies the same check a second time,
+per hop, while dialing a `ProxyJump` chain: right before opening the
+`direct-tcpip` tunnel through a given hop, if that hop's credentials come
+from the vault, the requesting process must independently hold a lease for
+*that hop's* alias, not just the final target (a hop resolved purely from
+`~/.ssh/config` uses ambient user credentials and needs no lease). Missing
+coverage fails with a teaching error naming the specific hop and the
+`sloosh request` invocation that covers it. This is enforced because the
+CLI's TTY guards on
 `approve`/`add`/`rm`/`vault init` only protect those specific entry
 points; any other same-user process can write raw NDJSON straight to the
 socket. Concretely, `ApproveLease` never creates the vault (a missing
@@ -238,7 +255,8 @@ src/
   daemon/
     mod.rs       accept loop, request routing
     session.rs   PTY sessions: sentinel framing, ring buffer, cursor, spool
-    ssh.rs       russh connection setup, ~/.ssh/config subset, ProxyJump, known_hosts
+    ssh.rs       russh connection setup, ~/.ssh/config subset, multi-hop ProxyJump,
+                 IdentityAgent, known_hosts
     lease.rs     leases: process-ancestry anchoring, env escape hatch, idle timeout
     vault.rs     argon2id + ChaCha20-Poly1305, zeroize
     audit.rs     audit.jsonl append-only writer

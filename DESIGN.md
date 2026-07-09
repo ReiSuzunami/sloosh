@@ -40,7 +40,7 @@
 | 线协议 | 换行分隔 JSON（serde） | 不需要性能、不需要 schema 编译、不放弃流式；`nc -U` 裸调试能力宝贵 |
 | vault 加密 | argon2id 派生 + ChaCha20-Poly1305（AEAD） | 见 §4 |
 
-- `~/.ssh/config`：支持常用指令子集（`Host` `HostName` `Port` `User` `IdentityFile` `ProxyJump`），未知指令**警告而非静默忽略**。ssh-agent（含 1Password/Bitwarden 的 agent 实现）优先于 vault。
+- `~/.ssh/config`：支持常用指令子集（`Host` `HostName` `Port` `User` `IdentityFile` `ProxyJump` `IdentityAgent`），未知指令**警告而非静默忽略**。ssh-agent（含 1Password/Bitwarden 的 agent 实现）优先于 vault；`IdentityAgent` 可指定该 host 改用哪个 agent socket（或 `none` 关闭该 host 的 agent 认证）。`ProxyJump` 支持逗号分隔的多跳链，且任意一跳可以有自己的 `ProxyJump`（递归展开），总深度上限 8 跳，成环即报错拒绝。
 - socket 路径：Linux `$XDG_RUNTIME_DIR/sloosh.sock`，macOS `~/.sloosh/sloosh.sock`，权限 0600。
 - **平台纪律**：任何平台差异代码不许内联，必须进抽象层（IPC、进程树、文件权限、路径约定）。一期交付 macOS + Linux，Windows 二期填实现不动骨架。
 
@@ -62,13 +62,15 @@
 - 主密码加密文件：argon2id 派生密钥 + ChaCha20-Poly1305。
 - **凭据录入是人类专属交互操作**（`sloosh add`）：Agent 可调用的命令面只有别名引用，不存在接受明文凭据的参数入口——否则凭据经过 Agent 上下文，边界即破。
 - 密码仅在建连瞬间入内存，`zeroize` 用毕即抹；日志与错误信息永不回显。
+- vault 条目可选带 `jump` 字段（`sloosh add <alias> ... --jump <alias>`）：跳板机别名，可解析自 vault 或 `~/.ssh/config`，语法与 `~/.ssh/config` 的 `ProxyJump` 一致。非密钥字段，不参与 zeroize，`Debug` 输出无碍。
 - 后期扩展（不改 vault 格式，只加 key-wrapping 后端）：Touch ID / Windows Hello 门控的解锁路径；OS Keychain。
 
 ### 带外授权流（device-code 式）
-1. Agent：`sloosh request <host>...` —— 请求**必须声明目标主机**（按主机授权；全库解锁使人类批准退化为橡皮图章）；
+1. Agent：`sloosh request <host>...` —— 请求**必须声明目标主机**（按主机授权；全库解锁使人类批准退化为橡皮图章）；daemon 收到请求后，会展开每个目标主机的 `ProxyJump` 链（vault `jump` 字段和/或 `~/.ssh/config` `ProxyJump`，递归展开、同样受 8 跳上限约束），把链上每一跳都并入请求的主机集合（目标在前，跳板依次在后，去重）——人类看到并批准的是整条路径，而不只是最终目标；
 2. daemon 生成请求 ID，CLI 输出一条完整授权命令（含 ID 与主机清单）；
 3. 人类在**另一个终端**（本机新窗口或另开 SSH 登入）粘贴该命令、输入主密码 → 租约生效。全程纯终端，天然支持无头环境；首次连接的 host key 指纹确认也放在这一步（正好有人在场）；
 4. 租约空闲超时自动失效/轮换；`request` 对已有覆盖该主机的有效租约幂等返回成功，Agent 无需自己记状态。
+5. **链上 lease 覆盖**：建连时，每拨一跳前都会检查——若该跳的凭据来自 vault（即 vault 里有这个别名的条目），调用方必须对这一跳也持有有效租约，检查方式与目标主机完全一致；纯粹从 `~/.ssh/config` 解析出来的跳板（走的是环境用户自己的凭据）不需要租约。缺租约时报错是教学式的：`jump host 'bastion' is vault-backed and needs its own lease; run: sloosh request <target> bastion`。
 
 ### Agent 身份锚定
 - **主路径：进程祖先链绑定**。daemon 经 peer credentials 取调用方 PID，向上遍历进程树找到顶层 Agent 进程，租约绑定 **(PID + 进程启动时间)**（防 PID 复用）。该进程的一切后代自动命中租约 → **subagent 零配置继承**；Agent 重启 = 新进程 = 重新授权（合理的安全语义，用户已确认接受）。Agent 上下文中零 token。

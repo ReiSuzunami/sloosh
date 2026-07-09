@@ -172,6 +172,10 @@ pub struct AddArgs {
     /// SSH port (defaults to 22 if omitted).
     #[arg(long)]
     pub port: Option<u16>,
+    /// Jump host alias to reach this host through (resolvable via the vault
+    /// or ~/.ssh/config), same as an ~/.ssh/config `ProxyJump` entry.
+    #[arg(long)]
+    pub jump: Option<String>,
 }
 
 #[derive(Debug, Args)]

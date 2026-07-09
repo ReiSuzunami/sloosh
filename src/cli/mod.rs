@@ -576,6 +576,7 @@ async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
         ssh_password: SecretString::new(ssh_password),
         master_password,
         replace: false,
+        jump: args.jump,
     };
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("added '{}' to the vault", args.alias);

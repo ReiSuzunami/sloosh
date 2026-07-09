@@ -713,7 +713,11 @@ async fn get_existing_session(host: &str, name: &str) -> Result<Arc<SessionInner
 /// shell) if none exists yet. If one exists but is dead, refuses to
 /// reconnect automatically (DESIGN.md §3) and instead returns a
 /// self-teaching error telling the caller to `kill` it first.
-async fn get_or_create_session(host: &str, name: &str) -> Result<Arc<SessionInner>, SessionError> {
+async fn get_or_create_session(
+    host: &str,
+    name: &str,
+    lease_ctx: &ssh::LeaseContext,
+) -> Result<Arc<SessionInner>, SessionError> {
     {
         let reg = registry().lock().await;
         if let Some(existing) = reg.get(&(host.to_string(), name.to_string())) {
@@ -729,11 +733,15 @@ async fn get_or_create_session(host: &str, name: &str) -> Result<Arc<SessionInne
             return Ok(existing.clone());
         }
     }
-    create_session(host, name).await
+    create_session(host, name, lease_ctx).await
 }
 
-async fn create_session(host: &str, name: &str) -> Result<Arc<SessionInner>, SessionError> {
-    let conn = ssh::connect(host).await?;
+async fn create_session(
+    host: &str,
+    name: &str,
+    lease_ctx: &ssh::LeaseContext,
+) -> Result<Arc<SessionInner>, SessionError> {
+    let conn = ssh::connect(host, lease_ctx).await?;
     let channel = conn
         .handle
         .channel_open_session()
@@ -1031,9 +1039,10 @@ pub async fn run(
     session: Option<String>,
     timeout_secs: u64,
     raw: bool,
+    lease_ctx: ssh::LeaseContext,
 ) -> Result<RunReply, SessionError> {
     let name = default_session_name(session);
-    let inner = get_or_create_session(host, &name).await?;
+    let inner = get_or_create_session(host, &name, &lease_ctx).await?;
     let mut wake_rx = inner.wake_tx.subscribe();
 
     let sentinel = make_sentinel();
@@ -1294,8 +1303,12 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
 
 /// `open <host> <name>` — explicit create-or-reuse of a named session
 /// (DESIGN.md §6). Unlike `run`, never implicitly targets "default".
-pub async fn open(host: &str, name: &str) -> Result<SessionSummary, SessionError> {
-    let inner = get_or_create_session(host, name).await?;
+pub async fn open(
+    host: &str,
+    name: &str,
+    lease_ctx: ssh::LeaseContext,
+) -> Result<SessionSummary, SessionError> {
+    let inner = get_or_create_session(host, name, &lease_ctx).await?;
     let state = inner.state.lock().await;
     Ok(summarize(host, name, &state))
 }
@@ -1354,9 +1367,10 @@ pub async fn list_summaries() -> Vec<SessionSummary> {
 async fn sftp_session(
     host: &str,
     session: Option<String>,
+    lease_ctx: ssh::LeaseContext,
 ) -> Result<(String, SftpSession), SessionError> {
     let name = default_session_name(session);
-    let inner = get_or_create_session(host, &name).await?;
+    let inner = get_or_create_session(host, &name, &lease_ctx).await?;
     let channel = inner
         ._connection
         .handle
@@ -1413,6 +1427,7 @@ pub async fn put(
     session: Option<String>,
     local_path: &str,
     remote_path: &str,
+    lease_ctx: ssh::LeaseContext,
 ) -> Result<TransferReply, SessionError> {
     let mut local_file = tokio::fs::File::open(local_path).await.map_err(|source| {
         SessionError::LocalFileMissing {
@@ -1421,7 +1436,7 @@ pub async fn put(
         }
     })?;
 
-    let (session_name, sftp) = sftp_session(host, session).await?;
+    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
 
     let mut remote_file = sftp
         .open_with_flags(
@@ -1475,6 +1490,7 @@ pub async fn get(
     remote_path: &str,
     local_path: &str,
     force: bool,
+    lease_ctx: ssh::LeaseContext,
 ) -> Result<TransferReply, SessionError> {
     if !force && tokio::fs::try_exists(local_path).await.unwrap_or(false) {
         return Err(SessionError::LocalDestinationExists {
@@ -1482,7 +1498,7 @@ pub async fn get(
         });
     }
 
-    let (session_name, sftp) = sftp_session(host, session).await?;
+    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
 
     let mut remote_file = sftp
         .open(remote_path)

@@ -1,16 +1,29 @@
 //! SSH connection establishment via `russh`, `~/.ssh/config` subset parsing
-//! (`Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`), and
-//! `known_hosts` handling (DESIGN.md §2, §3).
+//! (`Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`,
+//! `IdentityAgent`), and `known_hosts` handling (DESIGN.md §2, §3).
 //!
-//! Authorization gate (DESIGN.md §4): lease enforcement happens one layer up
-//! in `daemon/mod.rs`, before any of this module's connection logic runs —
-//! by the time `connect`/`connect_resolved` are reached, the caller has
-//! already proven a human approved access to this host. What lives here is
-//! purely mechanical: resolve connection parameters (vault entries take
-//! precedence over `~/.ssh/config` for a given alias — DESIGN.md §4),
-//! verify the host key, and authenticate (ssh-agent, then unencrypted
-//! `IdentityFile` keys, then — only while the vault's derived key is cached,
-//! i.e. at least one lease is active — the vault's stored password).
+//! Authorization gate (DESIGN.md §4): lease enforcement for the *target* host
+//! happens one layer up in `daemon/mod.rs`, before any of this module's
+//! connection logic runs — by the time `connect`/`connect_resolved` are
+//! reached, the caller has already proven a human approved access to the
+//! target. What lives here is purely mechanical: resolve connection
+//! parameters (vault entries take precedence over `~/.ssh/config` for a
+//! given alias — DESIGN.md §4), verify the host key, and authenticate
+//! (ssh-agent, then unencrypted `IdentityFile` keys, then — only while the
+//! vault's derived key is cached, i.e. at least one lease is active — the
+//! vault's stored password).
+//!
+//! **ProxyJump chains** (DESIGN.md §2, §4): a `ProxyJump` spec may name
+//! several comma-separated hops, and any hop may itself have its own
+//! `ProxyJump` (vault `jump` field or `~/.ssh/config` directive), expanded
+//! recursively up to [`MAX_PROXY_JUMP_HOPS`] hops with cycle detection by
+//! resolved alias. Each hop is dialed in turn over a `direct-tcpip` channel
+//! opened on the previous hop's connection, exactly like the single-hop case.
+//! Unlike the target, a jump hop's own lease is checked *here*, right before
+//! it's dialed (`ensure_hop_leased`) — but only if the hop's credentials
+//! actually come from the vault; a hop resolved purely from
+//! `~/.ssh/config` uses ambient user credentials and needs no lease, same as
+//! today.
 
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
@@ -24,8 +37,16 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 use zeroize::Zeroize;
 
+use crate::daemon::lease;
 use crate::daemon::vault;
 use crate::transport::unix::sloosh_home;
+
+/// Hard cap on ProxyJump chain length (DESIGN.md §2, §4), counting every hop
+/// pulled in transitively by a jump host's own `ProxyJump` (vault `jump`
+/// field or `~/.ssh/config` directive). Matches OpenSSH's own default
+/// `MAX_PROXY_JUMP` bound in spirit — deep chains are almost always a
+/// misconfigured loop, not a real topology.
+const MAX_PROXY_JUMP_HOPS: usize = 8;
 
 /// Everything that can go wrong establishing an SSH connection. Variants
 /// carry self-teaching messages (DESIGN.md §7): the human reading a CLI
@@ -136,10 +157,25 @@ pub enum SshError {
     AuthFailed { host: String },
 
     #[error(
-        "ProxyJump chains (more than one hop) are not yet supported; sloosh only supports a single \
-         jump host. Simplify the `ProxyJump` entry for this host to one hop."
+        "the ProxyJump chain for this host is too deep ({limit} hops max, including hops pulled \
+         in by a jump host's own ProxyJump) — sloosh refuses to dial an unbounded chain. Simplify \
+         the `ProxyJump` entries involved, or connect through fewer nested jump hosts."
     )]
-    ProxyJumpChainUnsupported,
+    ProxyJumpTooDeep { limit: usize },
+
+    #[error(
+        "the ProxyJump chain for this host revisits '{alias}' — that's a cycle (a jump host, \
+         directly or through its own ProxyJump, eventually points back at an alias already in the \
+         chain), so there is no finite path to dial. Check `~/.ssh/config` (and any vault `jump` \
+         fields) for a ProxyJump loop involving '{alias}'."
+    )]
+    ProxyJumpCycle { alias: String },
+
+    #[error(
+        "jump host '{hop}' is vault-backed and needs its own lease; run: sloosh request {target} \
+         {hop}"
+    )]
+    JumpHostLeaseRequired { hop: String, target: String },
 
     /// Catch-all for `russh` protocol errors on an already-established
     /// connection (channel opens, PTY/shell requests, writes). Never let
@@ -157,6 +193,15 @@ pub enum SshError {
 // `~/.ssh/config` subset parser
 // ---------------------------------------------------------------------------
 
+/// A resolved `IdentityAgent` directive value (ssh_config(5)): either a
+/// specific agent socket path to connect to instead of `$SSH_AUTH_SOCK`, or
+/// an explicit `none` to disable agent auth entirely for the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityAgentValue {
+    Path(PathBuf),
+    Disabled,
+}
+
 /// One `Host` block from `~/.ssh/config`, holding only the directives
 /// DESIGN.md §2 promises to understand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,6 +214,7 @@ struct HostBlock {
     user: Option<String>,
     identity_files: Vec<PathBuf>,
     proxy_jump: Option<String>,
+    identity_agent: Option<IdentityAgentValue>,
 }
 
 /// A parsed `~/.ssh/config` subset: an ordered list of `Host` blocks. Order
@@ -191,6 +237,7 @@ pub struct HostConfig {
     pub user: String,
     pub identity_files: Vec<PathBuf>,
     pub proxy_jump: Option<String>,
+    pub identity_agent: Option<IdentityAgentValue>,
 }
 
 /// Warn once per unknown directive name for the lifetime of the process
@@ -210,7 +257,8 @@ fn warn_unknown_directive_once(directive: &str) {
         warn!(
             directive,
             "unrecognized ~/.ssh/config directive; sloosh only understands Host/HostName/Port/User/\
-             IdentityFile/ProxyJump — ignoring this line rather than guessing what it means"
+             IdentityFile/ProxyJump/IdentityAgent — ignoring this line rather than guessing what it \
+             means"
         );
     }
 }
@@ -258,6 +306,9 @@ impl SshConfig {
                         b.proxy_jump = Some(rest.to_string());
                     }
                 }),
+                "identityagent" => with_current(&mut current, |b| {
+                    b.identity_agent = Some(parse_identity_agent_value(rest));
+                }),
                 other => warn_unknown_directive_once(other),
             }
         }
@@ -292,11 +343,13 @@ impl SshConfig {
             user: current_user(),
             identity_files: Vec::new(),
             proxy_jump: None,
+            identity_agent: None,
         };
         let mut hostname_set = false;
         let mut port_set = false;
         let mut user_set = false;
         let mut proxy_jump_set = false;
+        let mut identity_agent_set = false;
 
         for block in &self.blocks {
             if !host_patterns_match(&block.patterns, alias) {
@@ -318,11 +371,37 @@ impl SshConfig {
                 cfg.proxy_jump = Some(pj.clone());
                 proxy_jump_set = true;
             }
+            if !identity_agent_set && let Some(ia) = &block.identity_agent {
+                cfg.identity_agent = Some(ia.clone());
+                identity_agent_set = true;
+            }
             // IdentityFile is cumulative across matching blocks, like real ssh_config.
             cfg.identity_files
                 .extend(block.identity_files.iter().cloned());
         }
         cfg
+    }
+}
+
+/// Parse an `IdentityAgent` value: `none` (disable agent auth), or a path
+/// (optionally double-quoted, tilde-expanded like `IdentityFile`).
+fn parse_identity_agent_value(raw: &str) -> IdentityAgentValue {
+    let unquoted = unquote(raw);
+    if unquoted.eq_ignore_ascii_case("none") {
+        IdentityAgentValue::Disabled
+    } else {
+        IdentityAgentValue::Path(expand_tilde(&unquoted))
+    }
+}
+
+/// Strip one layer of surrounding double quotes, if present — ssh_config(5)
+/// allows quoting any directive value that contains whitespace.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -453,9 +532,21 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
 pub struct Connection {
     pub handle: russh::client::Handle<Handler>,
     pub resolved: HostConfig,
-    /// Kept alive only to hold the `ProxyJump` hop's connection open for as
-    /// long as `handle`'s tunneled channel needs it; never read directly.
-    _jump: Option<Box<russh::client::Handle<Handler>>>,
+    /// Kept alive only to hold each `ProxyJump` hop's connection open for as
+    /// long as `handle`'s tunneled channel needs it; ordered first-dialed to
+    /// last-dialed; never read directly.
+    _jumps: Vec<russh::client::Handle<Handler>>,
+}
+
+/// Identity of the caller a connection attempt is being made on behalf of,
+/// threaded down from `daemon/mod.rs` (where lease enforcement for the
+/// *target* host already happened) so that `connect_via_proxy_jump` can
+/// apply the same lease check to any vault-backed jump hop along the way
+/// (DESIGN.md §4).
+#[derive(Debug, Clone)]
+pub struct LeaseContext {
+    pub caller_pid: u32,
+    pub lease_token: Option<String>,
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
@@ -598,14 +689,17 @@ pub async fn resolve_endpoint(alias: &str) -> (String, u16) {
     (host_cfg.hostname, host_cfg.port)
 }
 
-/// Connect to `alias`, resolving it through `~/.ssh/config`, handling a
-/// single `ProxyJump` hop if configured, verifying the host key, and
-/// authenticating via ssh-agent then unencrypted `IdentityFile` keys
-/// (DESIGN.md §2, §3).
-pub async fn connect(alias: &str) -> Result<Connection, SshError> {
+/// Connect to `alias`, resolving it through `~/.ssh/config`, dialing the full
+/// `ProxyJump` chain if configured (checking a lease for each vault-backed
+/// hop along the way), verifying the host key, and authenticating via
+/// ssh-agent then unencrypted `IdentityFile` keys (DESIGN.md §2, §3, §4).
+/// `lease_ctx` identifies the caller a lease for the *target* host has
+/// already been confirmed for one layer up (`daemon/mod.rs`); it's reused
+/// here only to check jump hops, never the target itself.
+pub async fn connect(alias: &str, lease_ctx: &LeaseContext) -> Result<Connection, SshError> {
     let config = SshConfig::load_default();
     let host_cfg = resolve_host_config(&config, alias).await;
-    connect_resolved(&config, host_cfg).await
+    connect_resolved(&config, host_cfg, lease_ctx).await
 }
 
 /// Resolve `alias`, preferring a vault entry over `~/.ssh/config` (DESIGN.md
@@ -621,12 +715,13 @@ async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
             hostname: entry.hostname,
             port: entry.port.unwrap_or(22),
             user: entry.user.unwrap_or_else(current_user),
-            // Vault entries don't carry key-based identities or a jump host
-            // (DESIGN.md §4 only specifies password auth for vault entries);
-            // a vault-backed host that also needs one of those should keep
+            // Vault entries don't carry key-based identities (DESIGN.md §4
+            // only specifies password auth for vault entries); a
+            // vault-backed host that also needs one of those should keep
             // using ~/.ssh/config instead.
             identity_files: Vec::new(),
-            proxy_jump: None,
+            proxy_jump: entry.jump,
+            identity_agent: None,
         };
     }
     config.resolve(alias)
@@ -635,9 +730,10 @@ async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
 async fn connect_resolved(
     config: &SshConfig,
     host_cfg: HostConfig,
+    lease_ctx: &LeaseContext,
 ) -> Result<Connection, SshError> {
     if let Some(jump_spec) = host_cfg.proxy_jump.clone() {
-        return connect_via_proxy_jump(config, &jump_spec, host_cfg).await;
+        return connect_via_proxy_jump(config, &jump_spec, host_cfg, lease_ctx).await;
     }
 
     let tcp = open_tcp(&host_cfg.hostname, host_cfg.port).await?;
@@ -645,30 +741,73 @@ async fn connect_resolved(
     Ok(Connection {
         handle,
         resolved: host_cfg,
-        _jump: None,
+        _jumps: Vec::new(),
     })
 }
 
+/// Dial the full `ProxyJump` chain for `target_cfg`, then the target itself.
+/// The chain is resolved up front (`expand_proxy_jump_spec`) so depth-cap and
+/// cycle errors surface before any network activity, then dialed hop by hop:
+/// TCP to the first hop, every later hop (and finally the target) over a
+/// `direct-tcpip` channel opened on the previous hop's connection. Every
+/// vault-backed hop must have its own active lease (DESIGN.md §4) — checked
+/// right before dialing it, via `ensure_hop_leased`.
 async fn connect_via_proxy_jump(
     config: &SshConfig,
     jump_spec: &str,
     target_cfg: HostConfig,
+    lease_ctx: &LeaseContext,
 ) -> Result<Connection, SshError> {
-    if jump_spec.contains(',') {
-        return Err(SshError::ProxyJumpChainUnsupported);
-    }
-    let mut jump_cfg = resolve_host_config(config, parse_proxy_jump_alias(jump_spec)).await;
-    apply_proxy_jump_overrides(jump_spec, &mut jump_cfg);
-    if jump_cfg.proxy_jump.is_some() {
-        // A jump host that itself needs a jump host would be a two-hop
-        // chain; refuse rather than silently doing the wrong thing.
-        return Err(SshError::ProxyJumpChainUnsupported);
+    let mut seen = HashSet::new();
+    seen.insert(target_cfg.alias.clone());
+    let mut chain = Vec::new();
+    expand_proxy_jump_spec(config, jump_spec, &mut chain, &mut seen).await?;
+
+    if chain.is_empty() {
+        // Every hop the spec named resolved to the target itself or was
+        // otherwise elided — fall back to a direct connection rather than
+        // erroring on what amounts to a no-op ProxyJump.
+        let tcp = open_tcp(&target_cfg.hostname, target_cfg.port).await?;
+        let handle = connect_over_stream(tcp, &target_cfg).await?;
+        return Ok(Connection {
+            handle,
+            resolved: target_cfg,
+            _jumps: Vec::new(),
+        });
     }
 
-    let jump_tcp = open_tcp(&jump_cfg.hostname, jump_cfg.port).await?;
-    let jump_handle = connect_over_stream(jump_tcp, &jump_cfg).await?;
+    let mut handles: Vec<russh::client::Handle<Handler>> = Vec::with_capacity(chain.len());
+    for (i, hop_cfg) in chain.iter().enumerate() {
+        ensure_hop_leased(hop_cfg, &target_cfg.alias, lease_ctx).await?;
+        if i == 0 {
+            let tcp = open_tcp(&hop_cfg.hostname, hop_cfg.port).await?;
+            let handle = connect_over_stream(tcp, hop_cfg).await?;
+            handles.push(handle);
+        } else {
+            let prev = handles
+                .last()
+                .expect("first hop pushed before this branch runs");
+            let channel = prev
+                .channel_open_direct_tcpip(
+                    hop_cfg.hostname.clone(),
+                    hop_cfg.port as u32,
+                    "127.0.0.1",
+                    0,
+                )
+                .await
+                .map_err(|source| SshError::ProxyTunnel {
+                    host: hop_cfg.hostname.clone(),
+                    port: hop_cfg.port,
+                    source,
+                })?;
+            let stream = channel.into_stream();
+            let handle = connect_over_stream(stream, hop_cfg).await?;
+            handles.push(handle);
+        }
+    }
 
-    let channel = jump_handle
+    let last = handles.last().expect("chain is non-empty in this branch");
+    let channel = last
         .channel_open_direct_tcpip(
             target_cfg.hostname.clone(),
             target_cfg.port as u32,
@@ -687,8 +826,125 @@ async fn connect_via_proxy_jump(
     Ok(Connection {
         handle,
         resolved: target_cfg,
-        _jump: Some(Box::new(jump_handle)),
+        _jumps: handles,
     })
+}
+
+/// Recursively expand a `ProxyJump` spec (comma-separated hops, OpenSSH
+/// semantics: the first entry is connected to first) into a flat, dial-ordered
+/// chain of resolved hop configs. Each hop's own `ProxyJump` (vault `jump`
+/// field or `~/.ssh/config` directive) is expanded too, and its hops are
+/// inserted *before* the hop that depends on them, since they must be reached
+/// first. `seen` starts out containing the ultimate target's alias so a chain
+/// that loops back to the target is also caught. Enforces
+/// [`MAX_PROXY_JUMP_HOPS`] and rejects revisiting any alias already in `seen`.
+async fn expand_proxy_jump_spec(
+    config: &SshConfig,
+    spec: &str,
+    chain: &mut Vec<HostConfig>,
+    seen: &mut HashSet<String>,
+) -> Result<(), SshError> {
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let alias = parse_proxy_jump_alias(entry).to_string();
+        if chain.len() >= MAX_PROXY_JUMP_HOPS {
+            return Err(SshError::ProxyJumpTooDeep {
+                limit: MAX_PROXY_JUMP_HOPS,
+            });
+        }
+        if !seen.insert(alias.clone()) {
+            return Err(SshError::ProxyJumpCycle { alias });
+        }
+
+        let mut hop_cfg = resolve_host_config(config, &alias).await;
+        apply_proxy_jump_overrides(entry, &mut hop_cfg);
+        let nested_jump = hop_cfg.proxy_jump.take();
+
+        if let Some(nested_spec) = nested_jump {
+            Box::pin(expand_proxy_jump_spec(config, &nested_spec, chain, seen)).await?;
+        }
+        chain.push(hop_cfg);
+    }
+    Ok(())
+}
+
+/// Enforce DESIGN.md §4's chain lease invariant for a single hop: if `hop`'s
+/// credentials come from the vault, the requesting process needs its own
+/// active lease for it, same as the target host gets one layer up. A hop
+/// resolved purely from `~/.ssh/config` uses ambient user credentials and
+/// needs no lease.
+async fn ensure_hop_leased(
+    hop_cfg: &HostConfig,
+    target: &str,
+    lease_ctx: &LeaseContext,
+) -> Result<(), SshError> {
+    if vault::get_entry(&hop_cfg.alias).await.is_none() {
+        return Ok(());
+    }
+    let authorized = lease::check_authorized(
+        lease_ctx.caller_pid,
+        &hop_cfg.alias,
+        lease_ctx.lease_token.as_deref(),
+    )
+    .await;
+    if authorized {
+        Ok(())
+    } else {
+        Err(SshError::JumpHostLeaseRequired {
+            hop: hop_cfg.alias.clone(),
+            target: target.to_string(),
+        })
+    }
+}
+
+/// Expand `hosts` (as requested via `Request::RequestLease`) to also include
+/// every alias in each host's `ProxyJump` chain (DESIGN.md §4), so the human
+/// approving the request sees — and grants — coverage for the whole path,
+/// not just the final target. Order is preserved: each requested host first,
+/// then its jump hops, deduplicated overall. Resolution failures for a given
+/// host's chain (e.g. a cycle) are logged and skipped rather than failing
+/// the whole request — `RequestLease` should never become unusable because
+/// of a misconfigured jump host the caller didn't even ask to touch directly.
+pub async fn expand_lease_hosts(hosts: &[String]) -> Vec<String> {
+    let config = SshConfig::load_default();
+    let mut seen = HashSet::new();
+    let mut expanded = Vec::new();
+
+    for host in hosts {
+        if seen.insert(host.clone()) {
+            expanded.push(host.clone());
+        }
+    }
+    for host in hosts {
+        match jump_chain_aliases(&config, host).await {
+            Ok(aliases) => {
+                for alias in aliases {
+                    if seen.insert(alias.clone()) {
+                        expanded.push(alias);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(host, error = %e, "could not expand ProxyJump chain for lease request; \
+                       requesting only the host itself");
+            }
+        }
+    }
+    expanded
+}
+
+/// The alias chain of `alias`'s `ProxyJump` (if any), in dial order — reuses
+/// `expand_proxy_jump_spec` so lease-request-time expansion and
+/// connect-time dialing agree on exactly what "the chain" means.
+async fn jump_chain_aliases(config: &SshConfig, alias: &str) -> Result<Vec<String>, SshError> {
+    let host_cfg = resolve_host_config(config, alias).await;
+    let Some(jump_spec) = host_cfg.proxy_jump else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    seen.insert(alias.to_string());
+    let mut chain = Vec::new();
+    expand_proxy_jump_spec(config, &jump_spec, &mut chain, &mut seen).await?;
+    Ok(chain.into_iter().map(|c| c.alias).collect())
 }
 
 /// `user@host:port` (all but the host part optional) as accepted by
@@ -870,14 +1126,26 @@ async fn authenticate(
 /// `Ok(false)` if the agent is unreachable/empty or rejected everything
 /// (not a hard error — DESIGN.md §2 says agent auth is tried first, not
 /// that it's required), and `Err` only for a genuine signing failure that
-/// should stop the auth attempt.
+/// should stop the auth attempt. Connects to the host's `IdentityAgent`
+/// socket if configured (`none` disables agent auth for the host entirely),
+/// otherwise falls back to the default `$SSH_AUTH_SOCK` agent.
 async fn try_agent_auth(
     handle: &mut russh::client::Handle<Handler>,
     host_cfg: &HostConfig,
     hash_alg: Option<HashAlg>,
 ) -> Result<bool, SshError> {
-    let Ok(mut agent) = russh::keys::agent::client::AgentClient::connect_env().await else {
-        return Ok(false);
+    let mut agent = match &host_cfg.identity_agent {
+        Some(IdentityAgentValue::Disabled) => return Ok(false),
+        Some(IdentityAgentValue::Path(path)) => {
+            match russh::keys::agent::client::AgentClient::connect_uds(path).await {
+                Ok(agent) => agent,
+                Err(_) => return Ok(false),
+            }
+        }
+        None => match russh::keys::agent::client::AgentClient::connect_env().await {
+            Ok(agent) => agent,
+            Err(_) => return Ok(false),
+        },
     };
     let Ok(identities) = agent.request_identities().await else {
         return Ok(false);
@@ -1020,14 +1288,13 @@ Host inner
     }
 
     #[test]
-    fn proxy_jump_chain_is_rejected() {
+    fn proxy_jump_chain_directive_is_captured_verbatim() {
         let contents = "Host inner\n    ProxyJump hop1,hop2\n";
         let cfg = SshConfig::parse(contents);
         let resolved = cfg.resolve("inner");
         assert_eq!(resolved.proxy_jump.as_deref(), Some("hop1,hop2"));
-        // The actual rejection happens in connect_via_proxy_jump, which
-        // needs a live connection to exercise end-to-end (see the
-        // SLOOSH_TEST_SSH_HOST-gated integration test).
+        // Expansion into a dial-ordered chain happens in
+        // expand_proxy_jump_spec, exercised by the tests below.
     }
 
     #[test]
@@ -1035,6 +1302,132 @@ Host inner
         assert_eq!(parse_proxy_jump_alias("bastion"), "bastion");
         assert_eq!(parse_proxy_jump_alias("user@bastion"), "bastion");
         assert_eq!(parse_proxy_jump_alias("user@bastion:2200"), "bastion");
+    }
+
+    #[tokio::test]
+    async fn expand_proxy_jump_spec_splits_comma_chain_in_order() {
+        let config = SshConfig::default();
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert("target".to_string());
+        expand_proxy_jump_spec(&config, "hop1,hop2", &mut chain, &mut seen)
+            .await
+            .unwrap();
+        let aliases: Vec<&str> = chain.iter().map(|c| c.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["hop1", "hop2"]);
+    }
+
+    #[tokio::test]
+    async fn expand_proxy_jump_spec_recurses_into_nested_jump_before_the_hop() {
+        let contents = "\
+Host hop2
+    ProxyJump hop1
+";
+        let config = SshConfig::parse(contents);
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert("target".to_string());
+        expand_proxy_jump_spec(&config, "hop2", &mut chain, &mut seen)
+            .await
+            .unwrap();
+        // hop1 (hop2's own jump host) must be dialed before hop2.
+        let aliases: Vec<&str> = chain.iter().map(|c| c.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["hop1", "hop2"]);
+    }
+
+    #[tokio::test]
+    async fn expand_proxy_jump_spec_rejects_chains_deeper_than_the_cap() {
+        let config = SshConfig::default();
+        let long_spec: Vec<String> = (0..MAX_PROXY_JUMP_HOPS + 1)
+            .map(|i| format!("hop{i}"))
+            .collect();
+        let spec = long_spec.join(",");
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert("target".to_string());
+        let err = expand_proxy_jump_spec(&config, &spec, &mut chain, &mut seen)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SshError::ProxyJumpTooDeep { limit } if limit == MAX_PROXY_JUMP_HOPS)
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_proxy_jump_spec_detects_direct_cycle() {
+        let contents = "\
+Host hopA
+    ProxyJump hopB
+Host hopB
+    ProxyJump hopA
+";
+        let config = SshConfig::parse(contents);
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert("target".to_string());
+        let err = expand_proxy_jump_spec(&config, "hopA", &mut chain, &mut seen)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SshError::ProxyJumpCycle { alias } if alias == "hopA"));
+    }
+
+    #[tokio::test]
+    async fn expand_proxy_jump_spec_detects_cycle_back_to_target() {
+        let contents = "\
+Host bastion
+    ProxyJump target
+";
+        let config = SshConfig::parse(contents);
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        seen.insert("target".to_string());
+        let err = expand_proxy_jump_spec(&config, "bastion", &mut chain, &mut seen)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SshError::ProxyJumpCycle { alias } if alias == "target"));
+    }
+
+    #[test]
+    fn identity_agent_directive_parses_path_and_expands_tilde() {
+        let contents = "\
+Host myhost
+    IdentityAgent ~/.1password/agent.sock
+";
+        let cfg = SshConfig::parse(contents);
+        let resolved = cfg.resolve("myhost");
+        match resolved.identity_agent {
+            Some(IdentityAgentValue::Path(p)) => {
+                assert!(p.ends_with(".1password/agent.sock"), "{p:?}");
+            }
+            other => panic!("expected Path variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identity_agent_none_disables_agent_auth() {
+        let contents = "\
+Host myhost
+    IdentityAgent none
+";
+        let cfg = SshConfig::parse(contents);
+        let resolved = cfg.resolve("myhost");
+        assert_eq!(resolved.identity_agent, Some(IdentityAgentValue::Disabled));
+    }
+
+    #[test]
+    fn identity_agent_accepts_quoted_path() {
+        let contents = "\
+Host myhost
+    IdentityAgent \"/tmp/some agent.sock\"
+";
+        let cfg = SshConfig::parse(contents);
+        let resolved = cfg.resolve("myhost");
+        assert_eq!(
+            resolved.identity_agent,
+            Some(IdentityAgentValue::Path(PathBuf::from(
+                "/tmp/some agent.sock"
+            )))
+        );
     }
 
     // -- error Display formatting: every agent-facing message must say what
