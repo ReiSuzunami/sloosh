@@ -4,18 +4,23 @@
 //! run`), not a separate crate — see DESIGN.md §1 "single binary". It owns
 //! the Unix domain socket and answers the phase-1/phase-2 command surface:
 //! `Status`/`Shutdown`, SSH session management (`Run`/`Peek`/`Send`/
-//! `Interrupt`/`Open`/`Ls`/`Kill`), and the vault/lease authorization flow
+//! `Interrupt`/`Open`/`Ls`/`Kill`), port forwarding (`Forward`/`ForwardLs`/
+//! `ForwardStop`), and the vault/lease authorization flow
 //! (`RequestLease`/`DescribeLeaseRequest`/`ApproveLease`/`VaultExists`/
 //! `InitVault`/`AddCred`/`RmCred`).
 //!
 //! **Trust posture (DESIGN.md §4):** the Unix socket is still mode 0600
 //! same-user-only (see `transport::unix`) — that's the outer perimeter. On
 //! top of it, every host-touching request (`Run`/`Peek`/`Send`/`Interrupt`/
-//! `Open`/`Kill`) additionally requires an active lease for that host,
-//! checked via `lease::check_authorized` against the calling process's
-//! ancestry (or its `SLOOSH_LEASE` escape-hatch token). `Status`/`Ls`/
-//! `Daemon *` remain open to any same-user caller, matching the "these are
-//! read-only/management, not host access" carve-out.
+//! `Open`/`Kill`/`Forward`) additionally requires an active lease for that
+//! host, checked via `lease::check_authorized` against the calling
+//! process's ancestry (or its `SLOOSH_LEASE` escape-hatch token).
+//! `Status`/`Ls`/`ForwardLs`/`ForwardStop`/`Daemon *` remain open to any
+//! same-user caller: they're read-only, or (for `ForwardStop`) only ever
+//! *reduce* access, matching the "these aren't host access" carve-out.
+//! A forward's lease isn't just checked at creation, either — it dies the
+//! moment its lease expires or is revoked, even though a shell session
+//! survives that (`daemon::forward`'s module doc explains why).
 //!
 //! CLI-side TTY guards (`approve`/`add`/`rm`/`vault init`) only protect
 //! those entry points: any same-user process can write raw NDJSON straight
@@ -31,6 +36,7 @@
 //! biometric-gated key storage), noted as future work.
 
 pub mod audit;
+pub mod forward;
 pub mod lease;
 pub mod session;
 pub mod ssh;
@@ -109,6 +115,8 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     // sessions (a no-op in a real daemon process; see `reset_registry`).
     session::reset_registry().await;
     session::spawn_idle_reaper();
+    forward::reset_registry().await;
+    forward::spawn_reaper();
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -407,6 +415,55 @@ async fn handle_connection(
                             },
                         }
                     }
+                };
+                chan.send(&resp).await?;
+            }
+            Request::Forward {
+                host,
+                direction,
+                lease_token,
+            } => {
+                let resp = match require_lease(peer, &host, &lease_token).await {
+                    Err(denied) => denied,
+                    Ok(()) => {
+                        let lease_ctx = ssh::LeaseContext {
+                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
+                            lease_token: lease_token.clone(),
+                        };
+                        let opened = match direction {
+                            proto::ForwardDirection::Local { spec } => {
+                                forward::create_local(&host, &spec, lease_ctx).await
+                            }
+                            proto::ForwardDirection::Remote { spec } => {
+                                forward::create_remote(&host, &spec, lease_ctx).await
+                            }
+                        };
+                        match opened {
+                            Ok(o) => Response::Forward(proto::ForwardOpened {
+                                id: o.id,
+                                host: o.host,
+                                direction: o.direction,
+                                spec: o.spec,
+                                listen_addr: o.listen_addr,
+                            }),
+                            Err(e) => Response::Error {
+                                message: e.to_string(),
+                            },
+                        }
+                    }
+                };
+                chan.send(&resp).await?;
+            }
+            Request::ForwardLs => {
+                let forwards = forward::ls().await;
+                chan.send(&Response::ForwardLs { forwards }).await?;
+            }
+            Request::ForwardStop { id } => {
+                let resp = match forward::stop(&id).await {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 };
                 chan.send(&resp).await?;
             }

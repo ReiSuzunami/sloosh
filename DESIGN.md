@@ -71,6 +71,7 @@
 3. 人类在**另一个终端**（本机新窗口或另开 SSH 登入）粘贴该命令、输入主密码 → 租约生效。全程纯终端，天然支持无头环境；首次连接的 host key 指纹确认也放在这一步（正好有人在场）；
 4. 租约空闲超时自动失效/轮换；`request` 对已有覆盖该主机的有效租约幂等返回成功，Agent 无需自己记状态。
 5. **链上 lease 覆盖**：建连时，每拨一跳前都会检查——若该跳的凭据来自 vault（即 vault 里有这个别名的条目），调用方必须对这一跳也持有有效租约，检查方式与目标主机完全一致；纯粹从 `~/.ssh/config` 解析出来的跳板（走的是环境用户自己的凭据）不需要租约。缺租约时报错是教学式的：`jump host 'bastion' is vault-backed and needs its own lease; run: sloosh request <target> bastion`。
+6. **端口转发的租约语义与会话不同**：§3 说的"租约过期不杀会话"只适用于持久 shell——会话是状态，过期后原样接回即可。端口转发（`forward`，见 §6）是**持续开放的网络访问**，性质更接近租约本身：创建时校验一次不够，daemon 有一个后台任务定期复检每个存活转发的租约（同一个 `check_authorized` 调用，复用它对空闲计时器的副作用，不在 lease.rs 里另开一条推送通知路径），一旦该租约过期或被撤销，转发立即关闭——停止监听/取消远端转发、断开已有隧道连接——不会静默续期，也不会自动重连。
 
 ### Agent 身份锚定
 - **主路径：进程祖先链绑定**。daemon 经 peer credentials 取调用方 PID，向上遍历进程树找到顶层 Agent 进程，租约绑定 **(PID + 进程启动时间)**（防 PID 复用）。该进程的一切后代自动命中租约 → **subagent 零配置继承**；Agent 重启 = 新进程 = 重新授权（合理的安全语义，用户已确认接受）。Agent 上下文中零 token。
@@ -102,9 +103,10 @@
 | 鉴权 | `request`（Agent 侧） `approve`（人类侧） |
 | 凭据 | `add` `rm`（人类专属，交互式） |
 | 传输 | `put` `get` |
+| 转发 | `forward <host> -L/-R <spec>`（开转发，daemon 后台常驻） `forward ls` `forward stop <id>` |
 | 运维 | `status`（daemon/租约/会话总览，Agent 迷茫时的锚点） `daemon start/stop/run/status` `log` |
 
-**二期（按序）**：`forward` 端口转发（需求大，一期完成后立即推进）→ Windows 支持 → `--resilient`（远端 tmux 锚定）→ MCP 薄皮 → 生物识别解锁 / OS Keychain / 1Password·Bitwarden agent 兼容性验证。
+**二期（按序）**：Windows 支持 → `--resilient`（远端 tmux 锚定）→ MCP 薄皮 → 生物识别解锁 / OS Keychain / 1Password·Bitwarden agent 兼容性验证。
 
 ## 7. Skill 策略
 
@@ -125,6 +127,7 @@ src/
     mod.rs           # accept loop、请求路由
     session.rs       # PTY 会话：sentinel 切分、环形缓冲、游标、spool
     ssh.rs           # russh 连接建立、ssh_config 子集解析、ProxyJump、known_hosts
+    forward.rs       # -L/-R 端口转发：注册表、租约到期轮询回收、forwarded-tcpip 路由
     lease.rs         # 租约：进程祖先链锚定、env 逃生舱、空闲超时
     vault.rs         # argon2id + ChaCha20-Poly1305、zeroize
     audit.rs         # audit.jsonl 追加写

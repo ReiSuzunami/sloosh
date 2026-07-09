@@ -491,20 +491,38 @@ pub async fn check_authorized(caller_pid: u32, host: &str, lease_token: Option<&
     // The token check never needs the ancestry walk, but doing the walk
     // unconditionally keeps this simple; it's cheap (a handful of sysctls /
     // /proc reads).
-    check_authorized_for_chain(
+    authorized_for_chain(
         &procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
         host,
         lease_token,
+        true,
     )
     .await
 }
 
-/// Core of [`check_authorized`], taking the caller's already-walked ancestry
-/// chain — the seam unit tests use with synthetic chains.
-async fn check_authorized_for_chain(
+/// [`check_authorized`] minus the `last_used` side effect: answers "is this
+/// lease still alive?" without keeping it alive. Periodic sweeps (e.g.
+/// `forward.rs`'s expiry reaper) MUST use this — polling through the
+/// touching variant would refresh the idle clock forever and no lease
+/// backing a forward could ever idle out.
+pub async fn peek_authorized(caller_pid: u32, host: &str, lease_token: Option<&str>) -> bool {
+    authorized_for_chain(
+        &procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
+        host,
+        lease_token,
+        false,
+    )
+    .await
+}
+
+/// Core of [`check_authorized`]/[`peek_authorized`], taking the caller's
+/// already-walked ancestry chain — the seam unit tests use with synthetic
+/// chains. `touch` decides whether a hit refreshes the lease's idle clock.
+async fn authorized_for_chain(
     chain: &[AncestorInfo],
     host: &str,
     lease_token: Option<&str>,
+    touch: bool,
 ) -> bool {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
@@ -515,7 +533,9 @@ async fn check_authorized_for_chain(
             .iter_mut()
             .find(|l| l.token == token && l.hosts.contains(host))
     {
-        l.last_used = Instant::now();
+        if touch {
+            l.last_used = Instant::now();
+        }
         return true;
     }
 
@@ -524,7 +544,9 @@ async fn check_authorized_for_chain(
         .iter_mut()
         .find(|l| l.hosts.contains(host) && chain_contains_anchor(&l.anchor, chain))
     {
-        l.last_used = Instant::now();
+        if touch {
+            l.last_used = Instant::now();
+        }
         return true;
     }
     false
@@ -653,6 +675,17 @@ mod tests {
     //    `procs::ancestry_chain` walk, which `procs::tests` already covers
     //    in isolation). ----------------------------------------------------
 
+    /// The touching variant under its historical test-facing name: most
+    /// lease-level tests below only care about the yes/no answer, and the
+    /// production callers they model all touch.
+    async fn check_authorized_for_chain(
+        chain: &[AncestorInfo],
+        host: &str,
+        lease_token: Option<&str>,
+    ) -> bool {
+        authorized_for_chain(chain, host, lease_token, true).await
+    }
+
     /// An approver ancestry chain guaranteed disjoint from every anchor used
     /// in these tests — the synthetic equivalent of the human running
     /// `sloosh approve` in a genuinely separate terminal.
@@ -764,6 +797,38 @@ mod tests {
             ancestor(99, 100, Some("claude")),
         ];
         assert!(check_authorized_for_chain(&descendant_chain, "web", None).await);
+
+        reset_state().await;
+    }
+
+    /// The forward-expiry reaper polls leases periodically; if that poll
+    /// touched `last_used`, no lease backing a forward could ever idle out.
+    #[tokio::test]
+    async fn peek_answers_without_refreshing_the_idle_clock() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(300, 310, Some("sloosh")),
+            ancestor(299, 300, Some("claude")),
+        ];
+        let outcome = request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+            .await
+            .unwrap();
+        let RequestOutcome::Pending(info) = outcome else {
+            panic!("expected a pending request");
+        };
+        create_test_vault(b"a fresh master password");
+        approve_lease_for_chain(&approver_chain(), &info.id, b"a fresh master password")
+            .await
+            .unwrap();
+
+        let before = state().lock().await.active[0].last_used;
+        assert!(authorized_for_chain(&chain, "web", None, false).await);
+        assert_eq!(state().lock().await.active[0].last_used, before);
+
+        assert!(authorized_for_chain(&chain, "web", None, true).await);
+        assert!(state().lock().await.active[0].last_used >= before);
 
         reset_state().await;
     }

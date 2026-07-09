@@ -220,6 +220,39 @@ pub enum Request {
         #[serde(default)]
         lease_token: Option<String>,
     },
+    /// Open a `-L` (local) or `-R` (remote/reverse) port forward through
+    /// `host` (DESIGN.md §6). `direction` carries the raw OpenSSH-style spec
+    /// string exactly as typed (`[bind_addr:]port:host:port` shape); the
+    /// daemon owns parsing it (`daemon::forward::parse_local_spec` /
+    /// `parse_remote_spec`) so the error message stays daemon-side "teaching
+    /// material" (DESIGN.md §7) rather than duplicated in the CLI. Gated by
+    /// the same lease as `Run`/`Open` (DESIGN.md §4) — creating a forward is
+    /// live network access to `host`.
+    Forward {
+        host: String,
+        direction: ForwardDirection,
+        #[serde(default)]
+        lease_token: Option<String>,
+    },
+    /// List active forwards (DESIGN.md §6). Not gated by a lease, same as
+    /// `Ls`/`Status` — read-only.
+    ForwardLs,
+    /// Stop an active forward (DESIGN.md §6). Not gated by a lease:
+    /// stopping only ever *reduces* access, never grants it.
+    ForwardStop { id: String },
+}
+
+/// Which side of a forward is doing the listening, carrying the raw spec
+/// string for that direction (DESIGN.md §6). A newtype-per-variant rather
+/// than a shared `spec: String` + separate `is_remote: bool` field, so a
+/// malformed wire message can never claim both/neither direction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ForwardDirection {
+    /// `-L [bind_addr:]local_port:remote_host:remote_port`.
+    Local { spec: String },
+    /// `-R [bind_addr:]remote_port:local_host:local_port`.
+    Remote { spec: String },
 }
 
 fn default_run_timeout_secs() -> u64 {
@@ -258,6 +291,11 @@ pub enum Response {
     LeaseActivated(LeaseActivatedInfo),
     /// Reply to `Request::Put`/`Request::Get`.
     Transfer(TransferReply),
+    /// Reply to `Request::Forward`: the daemon prints this and the CLI
+    /// exits — the forward itself keeps running in the daemon.
+    Forward(ForwardOpened),
+    /// Reply to `Request::ForwardLs`.
+    ForwardLs { forwards: Vec<ForwardSummary> },
 }
 
 /// Reply to `Request::Run`.
@@ -393,6 +431,38 @@ pub struct TransferReply {
     pub local_path: String,
     pub remote_path: String,
     pub bytes_transferred: u64,
+}
+
+/// Reply to `Request::Forward` once the daemon has bound the local listener
+/// (`-L`) or registered the remote listen request (`-R`) and the tunnel is
+/// live (DESIGN.md §6).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForwardOpened {
+    /// Short `fwd-`-prefixed id (`daemon::forward`), used by `forward stop`.
+    pub id: String,
+    pub host: String,
+    /// `"L"` or `"R"`.
+    pub direction: String,
+    /// The raw spec as given on the command line.
+    pub spec: String,
+    /// Where traffic actually enters the tunnel: the local bind address for
+    /// `-L`, or `bind_addr:remote_port` on `host` for `-R`. Reported instead
+    /// of echoing the requested port because `local_port`/`remote_port` `0`
+    /// asks for an OS-assigned port (DESIGN.md §6).
+    pub listen_addr: String,
+}
+
+/// One-line summary of an active forward, for `forward ls`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForwardSummary {
+    pub id: String,
+    pub host: String,
+    /// `"L"` or `"R"`.
+    pub direction: String,
+    pub spec: String,
+    /// Number of currently-open tunneled connections (not cumulative).
+    pub tunnel_count: usize,
+    pub age_secs: u64,
 }
 
 /// One granted host that still needs its host key fetched, shown to the
@@ -606,6 +676,63 @@ mod tests {
         round_trip(Request::InitVault {
             master_password: SecretString::new("hunter2"),
         });
+    }
+
+    #[test]
+    fn forward_requests_and_responses_round_trip() {
+        round_trip(Request::Forward {
+            host: "box".to_string(),
+            direction: ForwardDirection::Local {
+                spec: "8080:127.0.0.1:80".to_string(),
+            },
+            lease_token: None,
+        });
+        round_trip(Request::Forward {
+            host: "box".to_string(),
+            direction: ForwardDirection::Remote {
+                spec: "9000:127.0.0.1:3000".to_string(),
+            },
+            lease_token: Some("deadbeef".to_string()),
+        });
+        round_trip(Request::ForwardLs);
+        round_trip(Request::ForwardStop {
+            id: "fwd-abc123".to_string(),
+        });
+        round_trip(Response::Forward(ForwardOpened {
+            id: "fwd-abc123".to_string(),
+            host: "box".to_string(),
+            direction: "L".to_string(),
+            spec: "8080:127.0.0.1:80".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
+        }));
+        round_trip(Response::ForwardLs {
+            forwards: vec![ForwardSummary {
+                id: "fwd-abc123".to_string(),
+                host: "box".to_string(),
+                direction: "L".to_string(),
+                spec: "8080:127.0.0.1:80".to_string(),
+                tunnel_count: 2,
+                age_secs: 30,
+            }],
+        });
+    }
+
+    #[test]
+    fn old_forward_request_without_lease_token_still_parses() {
+        // Backward compat, same discipline as the other requests: a client
+        // built before `lease_token` existed on this request must still parse.
+        let json = r#"{"type":"Forward","host":"box","direction":{"type":"Local","spec":"8080:127.0.0.1:80"}}"#;
+        let req: Request = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            req,
+            Request::Forward {
+                host: "box".to_string(),
+                direction: ForwardDirection::Local {
+                    spec: "8080:127.0.0.1:80".to_string(),
+                },
+                lease_token: None,
+            }
+        );
     }
 
     #[test]

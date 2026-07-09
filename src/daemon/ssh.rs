@@ -28,12 +28,14 @@
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use russh::Pty;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use zeroize::Zeroize;
 
@@ -549,13 +551,46 @@ pub struct LeaseContext {
     pub lease_token: Option<String>,
 }
 
+/// Where to dial locally when the remote end pushes a `forwarded-tcpip`
+/// channel back to us — the `-R` (remote/reverse) forward case (DESIGN.md
+/// §6). Only ever set on the one [`Connection`] a remote forward owns
+/// (`daemon::forward`); a plain session/`-L`-forward connection's [`Handler`]
+/// has `route: None`, so [`Handler::server_channel_open_forwarded_tcpip`]
+/// falls back to rejecting rather than silently accepting and hanging.
+///
+/// Deliberately holds only plain, `Clone`-cheap data (no callback/trait
+/// object) so `ssh.rs` never needs to depend on `daemon::forward`'s types —
+/// `forward.rs` builds one of these and hands it to [`connect_with_route`];
+/// `ssh.rs` never looks inside `forward.rs` to construct or interpret it.
+#[derive(Clone)]
+pub struct ForwardRoute {
+    /// Local host/port to dial for each incoming forwarded connection.
+    pub local_host: String,
+    pub local_port: u16,
+    /// Caller identity to re-check on every forwarded connection, so a
+    /// lease that expired *after* the forward was created still gets
+    /// enforced per DESIGN.md §4 (idle-refresh doubles as re-validation:
+    /// see `lease::check_authorized`).
+    pub caller_pid: u32,
+    pub lease_host: String,
+    pub lease_token: Option<String>,
+    /// Live tunnel count, shared with the forward's registry entry, for
+    /// `forward ls`'s connection-count column.
+    pub tunnel_count: Arc<AtomicUsize>,
+    /// Flips to `true` when the forward is stopped (requested, lease
+    /// expiry, or connection loss), so an in-flight tunnel copy loop can
+    /// race it and end promptly instead of lingering after teardown.
+    pub closed: watch::Receiver<bool>,
+}
+
 /// `russh::client::Handler` doing strict host-key verification against
-/// `~/.ssh/known_hosts` (DESIGN.md §2 "known_hosts hash 条目支持"). No other
-/// callback is overridden — defaults are fine for a plain interactive shell
-/// client.
+/// `~/.ssh/known_hosts` (DESIGN.md §2 "known_hosts hash 条目支持"), plus
+/// (only when `route` is set) routing server-initiated `forwarded-tcpip`
+/// channels to a local target for `-R` forwards (DESIGN.md §6).
 pub struct Handler {
     host: String,
     port: u16,
+    route: Option<ForwardRoute>,
 }
 
 impl russh::client::Handler for Handler {
@@ -599,6 +634,85 @@ impl russh::client::Handler for Handler {
             Err(e) => Err(SshError::KnownHosts(e)),
         }
     }
+
+    /// Handle a `-R` forward's incoming connection (DESIGN.md §6): only ever
+    /// invoked on the one connection a remote forward owns (`route.is_some()`
+    /// — every other connection, including `ProxyJump` hops, rejects this
+    /// outright rather than accepting a channel nothing will service). Dials
+    /// the configured local target *before* accepting, so a refused local
+    /// port becomes a clean channel-open failure instead of an accepted
+    /// channel nobody pumps bytes through — then hands the accepted channel
+    /// and TCP stream off to a spawned task so this callback (invoked
+    /// in-line from the connection's own message-processing loop) returns
+    /// immediately.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), SshError> {
+        let Some(route) = self.route.clone() else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        if !lease::check_authorized(
+            route.caller_pid,
+            &route.lease_host,
+            route.lease_token.as_deref(),
+        )
+        .await
+        {
+            warn!(
+                host = %route.lease_host,
+                "remote forward: lease no longer covers this host, refusing forwarded connection"
+            );
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        match TcpStream::connect((route.local_host.as_str(), route.local_port)).await {
+            Ok(tcp) => {
+                reply.accept().await;
+                tokio::spawn(pump_forwarded_tcpip(channel, tcp, route));
+            }
+            Err(e) => {
+                warn!(
+                    local_host = %route.local_host, local_port = route.local_port, error = %e,
+                    "remote forward: local target refused connection"
+                );
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Pump bytes between a `-R` forward's accepted `forwarded-tcpip` channel and
+/// the local TCP target already dialed for it, until either side is done or
+/// the owning forward is stopped (DESIGN.md §4: a live tunnel dies with its
+/// lease, even though it doesn't get a per-byte idle refresh — see
+/// `daemon::forward`'s module doc for why per-connection granularity is
+/// enough).
+async fn pump_forwarded_tcpip(channel: Channel, mut tcp: TcpStream, route: ForwardRoute) {
+    route
+        .tunnel_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut remote = channel.into_stream();
+    let mut closed = route.closed.clone();
+    tokio::select! {
+        _ = tokio::io::copy_bidirectional(&mut tcp, &mut remote) => {}
+        _ = closed.changed() => {}
+    }
+    route
+        .tunnel_count
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A `Handler` that accepts whatever host key is presented and just records
@@ -697,9 +811,22 @@ pub async fn resolve_endpoint(alias: &str) -> (String, u16) {
 /// already been confirmed for one layer up (`daemon/mod.rs`); it's reused
 /// here only to check jump hops, never the target itself.
 pub async fn connect(alias: &str, lease_ctx: &LeaseContext) -> Result<Connection, SshError> {
+    connect_with_route(alias, lease_ctx, None).await
+}
+
+/// Same as [`connect`], but for a `-R` remote-forward connection
+/// (`daemon::forward`): `route`, if given, is attached to the *target*
+/// host's [`Handler`] only (never an intermediate `ProxyJump` hop's), so
+/// `server_channel_open_forwarded_tcpip` can route the target's
+/// `forwarded-tcpip` channels to the forward's local destination.
+pub async fn connect_with_route(
+    alias: &str,
+    lease_ctx: &LeaseContext,
+    route: Option<ForwardRoute>,
+) -> Result<Connection, SshError> {
     let config = SshConfig::load_default();
     let host_cfg = resolve_host_config(&config, alias).await;
-    connect_resolved(&config, host_cfg, lease_ctx).await
+    connect_resolved(&config, host_cfg, lease_ctx, route).await
 }
 
 /// Resolve `alias`, preferring a vault entry over `~/.ssh/config` (DESIGN.md
@@ -731,13 +858,14 @@ async fn connect_resolved(
     config: &SshConfig,
     host_cfg: HostConfig,
     lease_ctx: &LeaseContext,
+    route: Option<ForwardRoute>,
 ) -> Result<Connection, SshError> {
     if let Some(jump_spec) = host_cfg.proxy_jump.clone() {
-        return connect_via_proxy_jump(config, &jump_spec, host_cfg, lease_ctx).await;
+        return connect_via_proxy_jump(config, &jump_spec, host_cfg, lease_ctx, route).await;
     }
 
     let tcp = open_tcp(&host_cfg.hostname, host_cfg.port).await?;
-    let handle = connect_over_stream(tcp, &host_cfg).await?;
+    let handle = connect_over_stream(tcp, &host_cfg, route).await?;
     Ok(Connection {
         handle,
         resolved: host_cfg,
@@ -757,6 +885,7 @@ async fn connect_via_proxy_jump(
     jump_spec: &str,
     target_cfg: HostConfig,
     lease_ctx: &LeaseContext,
+    route: Option<ForwardRoute>,
 ) -> Result<Connection, SshError> {
     let mut seen = HashSet::new();
     seen.insert(target_cfg.alias.clone());
@@ -768,7 +897,7 @@ async fn connect_via_proxy_jump(
         // otherwise elided — fall back to a direct connection rather than
         // erroring on what amounts to a no-op ProxyJump.
         let tcp = open_tcp(&target_cfg.hostname, target_cfg.port).await?;
-        let handle = connect_over_stream(tcp, &target_cfg).await?;
+        let handle = connect_over_stream(tcp, &target_cfg, route).await?;
         return Ok(Connection {
             handle,
             resolved: target_cfg,
@@ -781,7 +910,9 @@ async fn connect_via_proxy_jump(
         ensure_hop_leased(hop_cfg, &target_cfg.alias, lease_ctx).await?;
         if i == 0 {
             let tcp = open_tcp(&hop_cfg.hostname, hop_cfg.port).await?;
-            let handle = connect_over_stream(tcp, hop_cfg).await?;
+            // Intermediate hops never route forwarded-tcpip channels: only
+            // the final target's `Handler` gets `route`.
+            let handle = connect_over_stream(tcp, hop_cfg, None).await?;
             handles.push(handle);
         } else {
             let prev = handles
@@ -801,7 +932,7 @@ async fn connect_via_proxy_jump(
                     source,
                 })?;
             let stream = channel.into_stream();
-            let handle = connect_over_stream(stream, hop_cfg).await?;
+            let handle = connect_over_stream(stream, hop_cfg, None).await?;
             handles.push(handle);
         }
     }
@@ -821,7 +952,7 @@ async fn connect_via_proxy_jump(
             source,
         })?;
     let stream = channel.into_stream();
-    let handle = connect_over_stream(stream, &target_cfg).await?;
+    let handle = connect_over_stream(stream, &target_cfg, route).await?;
 
     Ok(Connection {
         handle,
@@ -1032,6 +1163,7 @@ fn add_handshake_context(err: SshError, host: &str, port: u16) -> SshError {
 async fn connect_over_stream<S>(
     stream: S,
     host_cfg: &HostConfig,
+    route: Option<ForwardRoute>,
 ) -> Result<russh::client::Handle<Handler>, SshError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1040,6 +1172,7 @@ where
     let handler = Handler {
         host: host_cfg.hostname.clone(),
         port: host_cfg.port,
+        route,
     };
     let mut handle = russh::client::connect_stream(config, stream, handler)
         .await

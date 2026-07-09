@@ -4,7 +4,7 @@
 //! the shapes here are the intended phase-1 surface so `--help` is useful
 //! today and wiring them up later doesn't change the CLI contract.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,6 +50,8 @@ pub enum Command {
     Put(PutArgs),
     /// Download a remote file from a host over SFTP.
     Get(GetArgs),
+    /// Open a `-L`/`-R` port forward through a host, or manage active ones (`ls`/`stop`).
+    Forward(ForwardArgs),
     /// Show daemon/session/lease status — the anchor command when unsure what's going on.
     Status(StatusArgs),
     /// Manage the sloosh daemon process directly (normally auto-started on demand).
@@ -235,6 +237,67 @@ pub struct GetArgs {
     /// Overwrite an existing local file at the destination path.
     #[arg(long)]
     pub force: bool,
+}
+
+/// `forward` doesn't have a fixed keyword for its "open a tunnel" form
+/// (`sloosh forward <host> -L ...`, mirroring `ssh -L`'s own syntax) — only
+/// `ls`/`stop` are real subcommand keywords. Anything else is treated as
+/// `<host> -L/-R spec`, re-parsed by [`ForwardOpenArgs`] via clap's
+/// `external_subcommand` escape hatch (see `Command::Forward`'s dispatch in
+/// `cli::mod`).
+#[derive(Debug, Args)]
+pub struct ForwardArgs {
+    #[command(subcommand)]
+    pub action: ForwardAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ForwardAction {
+    /// List active forwards.
+    Ls(ForwardLsArgs),
+    /// Stop an active forward.
+    Stop(ForwardStopArgs),
+    /// `<host> -L ...` / `<host> -R ...` (see `ForwardOpenArgs`) — not a real
+    /// keyword; clap hands us the raw tokens and `cli::mod` re-parses them.
+    #[command(external_subcommand)]
+    Open(Vec<String>),
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "sloosh forward",
+    no_binary_name = true,
+    group(ArgGroup::new("direction").args(["local", "remote"]).required(true))
+)]
+pub struct ForwardOpenArgs {
+    /// Host to forward through (as configured via `sloosh add` / `~/.ssh/config`).
+    pub host: String,
+    /// Local forward: listen locally, tunnel to remote_host:remote_port via `host`.
+    /// `[bind_addr:]local_port:remote_host:remote_port` (bind_addr defaults to
+    /// 127.0.0.1; local_port 0 asks the OS to pick a port).
+    #[arg(short = 'L', long = "local", value_name = "SPEC")]
+    pub local: Option<String>,
+    /// Remote (reverse) forward: `host` listens and tunnels back to
+    /// local_host:local_port on this machine.
+    /// `[bind_addr:]remote_port:local_host:local_port`.
+    #[arg(short = 'R', long = "remote", value_name = "SPEC")]
+    pub remote: Option<String>,
+    /// Print machine-readable JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForwardLsArgs {
+    /// Print machine-readable JSON instead of a human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ForwardStopArgs {
+    /// Forward id printed by `sloosh forward <host> -L/-R ...` (also shown by `forward ls`).
+    pub id: String,
 }
 
 #[derive(Debug, Args)]

@@ -6,18 +6,20 @@ mod client;
 
 pub use args::Cli;
 use args::{
-    AddArgs, ApproveArgs, Command, DaemonAction, GetArgs, InterruptArgs, KillArgs, LogArgs, LsArgs,
-    OpenArgs, PeekArgs, PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
+    AddArgs, ApproveArgs, Command, DaemonAction, ForwardAction, ForwardLsArgs, ForwardOpenArgs,
+    ForwardStopArgs, GetArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs, PeekArgs,
+    PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
 };
 
 use crate::daemon::audit;
 use crate::daemon::ssh;
 use crate::proto::{
-    self, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response, RunReply,
-    SecretString, SessionSummary, StatusReply,
+    self, ForwardDirection, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response,
+    RunReply, SecretString, SessionSummary, StatusReply,
 };
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
+use clap::Parser as _;
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 
@@ -44,6 +46,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Put(args) => cmd_put(args).await,
         Command::Get(args) => cmd_get(args).await,
+        Command::Forward(args) => cmd_forward(args.action).await,
         Command::Log(args) => cmd_log(args).await,
     }
 }
@@ -660,6 +663,94 @@ async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
         "get: {}:{} -> {} ({} bytes)",
         reply.host, reply.remote_path, reply.local_path, reply.bytes_transferred
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Port forwarding (DESIGN.md §6).
+// ---------------------------------------------------------------------
+
+async fn cmd_forward(action: ForwardAction) -> anyhow::Result<()> {
+    match action {
+        ForwardAction::Ls(args) => cmd_forward_ls(args).await,
+        ForwardAction::Stop(args) => cmd_forward_stop(args).await,
+        // `ls`/`stop` are the only real subcommand keywords (see
+        // `ForwardAction`'s doc comment); everything else is `<host>
+        // -L/-R spec`, captured raw and re-parsed here as `ForwardOpenArgs`.
+        ForwardAction::Open(raw_args) => cmd_forward_open(raw_args).await,
+    }
+}
+
+async fn cmd_forward_open(raw_args: Vec<String>) -> anyhow::Result<()> {
+    let ForwardOpenArgs {
+        host,
+        local,
+        remote,
+        json,
+    } = ForwardOpenArgs::try_parse_from(&raw_args).unwrap_or_else(|e| e.exit());
+    let direction = match (local, remote) {
+        (Some(spec), None) => ForwardDirection::Local { spec },
+        (None, Some(spec)) => ForwardDirection::Remote { spec },
+        _ => unreachable!("ForwardOpenArgs's ArgGroup enforces exactly one of -L/-R"),
+    };
+    let req = Request::Forward {
+        host,
+        direction,
+        lease_token: lease_token_from_env(),
+    };
+    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
+    let Response::Forward(opened) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to Forward: {resp:?}");
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&opened)?);
+    } else {
+        print_forward_opened_human(&opened);
+    }
+    Ok(())
+}
+
+fn print_forward_opened_human(o: &proto::ForwardOpened) {
+    println!(
+        "{}  {} -{} {}  listening on {}",
+        o.id, o.host, o.direction, o.spec, o.listen_addr
+    );
+    println!(
+        "(the daemon keeps this forward alive in the background; `sloosh forward stop {}` to end it)",
+        o.id
+    );
+}
+
+async fn cmd_forward_ls(args: ForwardLsArgs) -> anyhow::Result<()> {
+    let resp = bail_on_error_or_unexpected(send_request(&Request::ForwardLs).await?)?;
+    let Response::ForwardLs { forwards } = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to ForwardLs: {resp:?}");
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&forwards)?);
+    } else if forwards.is_empty() {
+        println!("no active forwards");
+    } else {
+        for f in &forwards {
+            print_forward_summary_human(f);
+        }
+    }
+    Ok(())
+}
+
+fn print_forward_summary_human(f: &proto::ForwardSummary) {
+    println!(
+        "{}  {} -{} {}  {} open tunnel(s)  age {}s",
+        f.id, f.host, f.direction, f.spec, f.tunnel_count, f.age_secs
+    );
+}
+
+async fn cmd_forward_stop(args: ForwardStopArgs) -> anyhow::Result<()> {
+    let req = Request::ForwardStop {
+        id: args.id.clone(),
+    };
+    bail_on_error_or_unexpected(send_request(&req).await?)?;
+    println!("stopped {}", args.id);
     Ok(())
 }
 

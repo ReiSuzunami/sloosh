@@ -107,7 +107,10 @@ cannot offer (DESIGN.md §3).
 - **Session lifecycle is independent of lease lifecycle.** A lease
   expiring doesn't kill the session or its processes; it reattaches
   cleanly once re-approved. Sessions are reaped independently on their own
-  idle timeout (8h of no activity).
+  idle timeout (8h of no activity). Port forwards (`src/daemon/forward.rs`,
+  §6) don't get this leniency: a forward *is* live network access, so a
+  lease expiring or being revoked tears it down immediately rather than
+  leaving it attached-but-dormant — see §4's authorization model for why.
 
 ### Output handling (DESIGN.md §5)
 
@@ -194,16 +197,24 @@ claimed parent's.
 
 **Trust posture and residual risk.** The `0600` same-user socket
 permission is only the outer perimeter. Every host-touching request
-(`Run`/`Peek`/`Send`/`Interrupt`/`Open`/`Kill`) independently requires an
-active lease, checked daemon-side via `lease::check_authorized` — never
-trusted from the client. `ssh.rs` applies the same check a second time,
+(`Run`/`Peek`/`Send`/`Interrupt`/`Open`/`Kill`/`Forward`) independently
+requires an active lease, checked daemon-side via `lease::check_authorized`
+— never trusted from the client (`ForwardLs`/`ForwardStop` don't touch a
+host directly and so aren't lease-gated: listing is read-only, and stopping
+only *reduces* access). `ssh.rs` applies the same check a second time,
 per hop, while dialing a `ProxyJump` chain: right before opening the
 `direct-tcpip` tunnel through a given hop, if that hop's credentials come
 from the vault, the requesting process must independently hold a lease for
 *that hop's* alias, not just the final target (a hop resolved purely from
 `~/.ssh/config` uses ambient user credentials and needs no lease). Missing
 coverage fails with a teaching error naming the specific hop and the
-`sloosh request` invocation that covers it. This is enforced because the
+`sloosh request` invocation that covers it. A live forward needs this same
+guarantee to keep holding, not just at creation time: `forward.rs` doesn't
+wait for `lease.rs` to push a notification (that would mean `lease.rs`
+depending on `forward.rs`, an edge the module graph avoids the same way it
+avoids one for vault-cache clearing) — instead it runs its own periodic
+sweep that re-checks `lease::check_authorized` for every live forward and
+tears down anything whose coverage has lapsed. This is enforced because the
 CLI's TTY guards on
 `approve`/`add`/`rm`/`vault init` only protect those specific entry
 points; any other same-user process can write raw NDJSON straight to the
@@ -257,6 +268,8 @@ src/
     session.rs   PTY sessions: sentinel framing, ring buffer, cursor, spool
     ssh.rs       russh connection setup, ~/.ssh/config subset, multi-hop ProxyJump,
                  IdentityAgent, known_hosts
+    forward.rs   -L/-R port forwarding: forward registry, lease-expiry reaper,
+                 forwarded-tcpip routing for reverse forwards
     lease.rs     leases: process-ancestry anchoring, env escape hatch, idle timeout
     vault.rs     argon2id + ChaCha20-Poly1305, zeroize
     audit.rs     audit.jsonl append-only writer
