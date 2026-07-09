@@ -2,6 +2,13 @@
 name = "sloosh"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "SSH-in-the-loop: persistent remote shells + human-approved credential access for coding agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ReiSuzunami/sloosh"
+readme = "README.md"
+keywords = ["ssh", "agent", "cli", "daemon", "remote"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.103"

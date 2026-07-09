@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting and lints only, on the cheapest runner. Kept separate from
+  # `test` so a fmt/clippy nit doesn't block seeing the (much slower) test
+  # results, and vice versa.
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Unit + non-live integration tests (`cargo test` skips anything gated
+  # behind SLOOSH_TEST_SSH_HOST, see the `live-ssh` job below) on both
+  # platforms sloosh targets.
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: cargo test
+        run: cargo test
+
+  # Exercises tests/ssh_session.rs and tests/sftp_transfer.rs against a real
+  # sshd, since they're skipped entirely by the `test` job above whenever
+  # SLOOSH_TEST_SSH_HOST is unset. Runs sshd on the runner itself (no Docker
+  # needed) and points sloosh at it via an ~/.ssh/config alias, the same way
+  # a developer would point it at any other host.
+  live-ssh:
+    name: Live SSH integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure openssh-server is installed and running
+        run: |
+          if ! command -v sshd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y openssh-server
+          fi
+          # Ubuntu 24.04 ships sshd behind systemd socket activation
+          # (ssh.socket), whose trigger rate limit can refuse bursts of
+          # short-lived connections — exactly what these tests produce.
+          # Run the classic always-on daemon instead.
+          sudo systemctl disable --now ssh.socket || true
+          sudo systemctl enable --now ssh.service
+          # Fail fast here rather than deep inside a cargo test failure if
+          # the service didn't actually come up.
+          sudo systemctl is-active --quiet ssh
+
+      - name: Generate a passphrase-less ed25519 keypair for the runner user
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -N "" -f ~/.ssh/sloosh_citest_key -C sloosh-ci
+          cat ~/.ssh/sloosh_citest_key.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: Add a "citest" alias pointing at the runner's own sshd
+        run: |
+          {
+            echo "Host citest"
+            echo "  HostName localhost"
+            echo "  User runner"
+            echo "  IdentityFile ~/.ssh/sloosh_citest_key"
+          } >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Trust the runner's own host key
+        # sloosh verifies strictly against ~/.ssh/known_hosts (and
+        # $SLOOSH_HOME/known_hosts), so the real host key must be recorded
+        # before any sloosh-side connection attempt, not just before the
+        # plain `ssh` sanity check below.
+        run: ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+
+      - name: Sanity-check plain SSH connectivity
+        run: ssh -o BatchMode=yes citest true
+
+      - name: Run live SSH session integration tests
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test ssh_session -- --test-threads=1
+
+      - name: Run live SFTP transfer integration tests
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test sftp_transfer -- --test-threads=1

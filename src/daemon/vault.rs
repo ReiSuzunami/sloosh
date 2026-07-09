@@ -85,7 +85,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VaultError> {
         }
     }
     let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() % 2 != 0 {
         return Err(VaultError::TamperedOrCorrupt);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -612,6 +612,20 @@ async fn refresh_cache_if_present(data: &VaultData, password: &[u8]) {
     }
 }
 
+/// Serializes tests that read/write the process-global vault cache
+/// (`cache()`) above. Shared between this module's own cache test and
+/// `daemon::lease::tests`, which also drives the cache indirectly via
+/// `approve_lease`/`is_cached`/`clear_cache` — without a shared lock, two
+/// independent test threads race on the *contents* of the same global
+/// (not just its locking), which is exactly what made
+/// `cache_lifecycle_and_password_reverification` flaky under `cargo test`'s
+/// default parallelism.
+#[cfg(test)]
+pub(crate) fn cache_test_lock() -> &'static AsyncMutex<()> {
+    static LOCK: std::sync::OnceLock<AsyncMutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +785,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_lifecycle_and_password_reverification() {
+        let _guard = cache_test_lock().lock().await;
         let path = temp_vault_path("cache");
         let _ = std::fs::remove_file(&path);
         let data = VaultData::default();

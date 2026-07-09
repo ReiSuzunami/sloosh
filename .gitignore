@@ -1,1 +1,21 @@
 /target
+
+# macOS Finder metadata
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# Local env overrides — never commit secrets/credentials
+.env
+.env.*
+.envrc
+
+# Repo-local gh CLI config — holds the GitHub OAuth token
+.gh-config/
+
+# Backup files some editors leave behind
+*~
+*.bak

@@ -674,10 +674,16 @@ mod tests {
     /// share the one process-wide `state()` mutex — so these tests run
     /// serially against each other via a dedicated lock to avoid
     /// cross-contamination (there's no per-test daemon instance to isolate
-    /// against, unlike `vault.rs`'s file-path-parameterized tests).
+    /// against, unlike `vault.rs`'s file-path-parameterized tests). This
+    /// reuses `vault::cache_test_lock()` rather than a lock private to this
+    /// module: these tests also drive the process-global vault cache
+    /// (`approve_lease` → `vault::unlock_for_lease`, plus the direct
+    /// `vault::is_cached`/`clear_cache` calls below), which `vault.rs`'s own
+    /// `cache_lifecycle_and_password_reverification` test exercises too —
+    /// they all need to serialize against each other, not just within this
+    /// module.
     fn test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        vault::cache_test_lock()
     }
 
     /// These tests exercise `approve_lease`, which goes through the real

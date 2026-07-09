@@ -105,6 +105,9 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     };
 
     info!(pid, path = %socket_path.display(), version = env!("CARGO_PKG_VERSION"), "sloosh daemon listening");
+    // Cleared only after winning the bind: this daemon starts with no
+    // sessions (a no-op in a real daemon process; see `reset_registry`).
+    session::reset_registry().await;
     session::spawn_idle_reaper();
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);

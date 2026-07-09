@@ -225,18 +225,23 @@ async fn get_refuses_to_overwrite_existing_local_file_without_force() {
     let (mut chan, _socket) = start_daemon("get-no-overwrite", &host).await;
 
     let remote_path = format!("/tmp/sloosh-sftp-itest-noforce-{}.txt", std::process::id());
+    // Bound to a variable: an unbound temporary would be dropped (deleting
+    // the file) at the end of the `send` statement, before the daemon task
+    // gets around to reading it.
+    let local_src = LocalTempFile::new("noforce-src", b"remote content");
     chan.send(&Request::Put {
         host: host.clone(),
-        local_path: LocalTempFile::new("noforce-src", b"remote content").path_str(),
+        local_path: local_src.path_str(),
         remote_path: remote_path.clone(),
         session: None,
         lease_token: None,
     })
     .await
     .expect("send Put");
-    let Some(Response::Transfer(_)) = chan.recv::<Response>().await.expect("recv") else {
+    let resp = chan.recv::<Response>().await.expect("recv");
+    let Some(Response::Transfer(_)) = resp else {
         remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Transfer for Put");
+        panic!("expected Response::Transfer for Put, got {resp:?}");
     };
 
     // The local destination already has content before the Get.

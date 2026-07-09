@@ -659,6 +659,16 @@ fn registry() -> &'static AsyncMutex<HashMap<SessionKey, Arc<SessionInner>>> {
     REGISTRY.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
+/// Drop every session from the process-global registry. A freshly started
+/// daemon owns no sessions, so in a normal daemon process the registry is
+/// already empty and this is a no-op — but in-process test harnesses start
+/// several daemons (each on its own short-lived tokio runtime) inside one
+/// test binary, and a session whose I/O tasks died with a previous test's
+/// runtime must not be found by name from the next daemon.
+pub async fn reset_registry() {
+    registry().lock().await.clear();
+}
+
 fn default_session_name(session: Option<String>) -> String {
     session.unwrap_or_else(|| "default".to_string())
 }
