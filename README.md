@@ -47,6 +47,10 @@ See `sloosh <command> --help` for the full flag reference on any subcommand.
   aliases.
 - Access is granted per-host via a **lease**, not a blanket unlock —
   requesting one host never authorizes another.
+- Bastion paths are first-class: `ProxyJump` chains (multi-hop) and
+  vault-level jump hosts are followed automatically, a lease request
+  expands to cover every hop on the path, and each vault-backed hop is
+  re-checked right before it's dialed.
 - Leases are approved out of band, by a human, in a separate terminal —
   the agent cannot approve its own request.
 - A lease is bound to the requesting process's ancestry (PID + start
@@ -54,7 +58,8 @@ See `sloosh <command> --help` for the full flag reference on any subcommand.
   automatically, with zero extra configuration.
 - Leases expire on idle timeout; expiry revokes host access but never
   kills the underlying shell session, which reconnects cleanly once
-  access is re-approved.
+  access is re-approved. Port forwards are the one exception: a tunnel is
+  live network access, so it's torn down the moment its lease goes away.
 
 ## How it works
 
@@ -109,6 +114,7 @@ reference on any of them.
 | `vault` | Manage the credential vault itself (e.g. first-time initialization). |
 | `put` | Upload a local file to a host over SFTP. |
 | `get` | Download a remote file from a host over SFTP. |
+| `forward` | Open a lease-gated `-L`/`-R` port forward through a host; `forward ls` and `forward stop` manage them. |
 | `status` | Show daemon/session/lease status — the anchor command when unsure what's going on. |
 | `daemon` | Manage the sloosh daemon process directly (normally auto-started on demand). |
 | `log` | Show the audit log. |
@@ -164,12 +170,19 @@ All three gates (tests, clippy, fmt) must pass cleanly; they're what CI
 runs on every PR.
 
 Most of the test suite runs without any external dependency. The
-integration tests in `tests/ssh_session.rs` exercise a real SSH session
-end-to-end and are gated behind an environment variable so they don't run
-(or hang) in CI/sandboxes by default:
+integration tests in `tests/ssh_session.rs`, `tests/forward.rs`, and
+`tests/proxy_jump.rs` exercise a real SSH host end-to-end (sessions,
+tunnels, and vault-backed jump chains respectively) and are gated behind
+environment variables so they don't run (or hang) in CI/sandboxes by
+default:
 
 ```
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
+# proxy_jump additionally needs the host's SSH password (it builds a
+# throwaway vault to exercise password auth through the chain):
+SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
+  cargo test --test proxy_jump -- --test-threads=1
 ```
 
 `myhost` can be an alias resolvable via `~/.ssh/config` or a literal
@@ -192,14 +205,15 @@ planned — see Roadmap below.
 
 Phase 2, roughly in order:
 
-- `forward` — SSH port forwarding.
 - Windows support (Named Pipe transport).
 - `--resilient` sessions anchored to a remote `tmux`, so a dropped SSH
   connection doesn't kill the session.
-- OS keychain / Touch ID / Windows Hello-gated vault unlock, as an
-  alternative to the master password.
+- Touch ID / Windows Hello-gated approvals, so re-approving doesn't mean
+  re-typing the master password (the vault's own encryption stays
+  self-contained — no OS keychain involved).
 - Verified compatibility with 1Password/Bitwarden `ssh-agent`
-  implementations.
+  implementations (the ssh_config `IdentityAgent` directive is already
+  honored).
 
 ## License
 
