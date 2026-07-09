@@ -127,5 +127,6 @@ src/
     vault.rs         # argon2id + ChaCha20-Poly1305、zeroize
     audit.rs         # audit.jsonl 追加写
   procs/             # 进程树遍历抽象；macos.rs (sysctl)；linux.rs (/proc)
-skill/               # Claude Code Skill（SKILL.md）
+skills/sloosh/       # Agent Skill（SKILL.md，agentskills.io 标准，兼容 Claude Code / Codex 等；
+                     # 经 ReiSuzunami/nerv 插件市场与 npx skills 分发）
 ```

@@ -113,16 +113,35 @@ reference on any of them.
 | `daemon` | Manage the sloosh daemon process directly (normally auto-started on demand). |
 | `log` | Show the audit log. |
 
-## Using with Claude Code
+## Using with coding agents
 
-`skill/` contains a ready-made [Claude Code Skill](https://docs.claude.com/en/docs/claude-code/skills)
+`skills/sloosh/` is a ready-made [Agent Skill](https://agentskills.io)
 that teaches an agent `sloosh`'s mental model (sessions are persistent
 shells; every host needs a human-approved lease; run `sloosh status` when
-lost) without duplicating the `--help` flag reference. Install it by
-copying the directory into your skills folder:
+lost) without duplicating the `--help` flag reference. The same skill
+works in every agent that speaks the SKILL.md standard — install it
+whichever way fits your setup:
+
+**Claude Code** — via the [nerv](https://github.com/ReiSuzunami/nerv)
+plugin marketplace:
 
 ```
-cp -r skill ~/.claude/skills/sloosh
+/plugin marketplace add ReiSuzunami/nerv
+/plugin install sloosh@nerv
+```
+
+**Any agent, via the [skills CLI](https://github.com/vercel-labs/skills)**
+(Claude Code, Codex, Cursor, and ~70 others):
+
+```
+npx skills add ReiSuzunami/sloosh
+```
+
+**Manually** — copy the skill directory into your agent's skills folder:
+
+```
+cp -r skills/sloosh ~/.claude/skills/sloosh   # Claude Code
+cp -r skills/sloosh ~/.agents/skills/sloosh   # Codex (and other .agents/skills readers)
 ```
 
 ## Development

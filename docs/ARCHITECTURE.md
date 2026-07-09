@@ -243,7 +243,8 @@ src/
     vault.rs     argon2id + ChaCha20-Poly1305, zeroize
     audit.rs     audit.jsonl append-only writer
   procs/         process-tree walking abstraction; macos.rs (sysctl); linux.rs (/proc)
-skill/           Claude Code skill (SKILL.md)
+skills/sloosh/   agent skill (SKILL.md, agentskills.io format; distributed
+                 via the ReiSuzunami/nerv plugin marketplace and `npx skills`)
 ```
 
 (DESIGN.md §8)
