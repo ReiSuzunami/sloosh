@@ -550,7 +550,7 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
             }
         })
         .collect();
-    out.sort_by(|a, b| a.anchor_pid.cmp(&b.anchor_pid));
+    out.sort_by_key(|a| a.anchor_pid);
     out
 }
 

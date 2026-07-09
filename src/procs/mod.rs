@@ -131,10 +131,7 @@ pub fn ancestry_chain<P: ProcessInfo>(pid: u32) -> Vec<AncestorInfo> {
         argv0_basename: P::argv0_basename(current_pid),
     });
 
-    loop {
-        let Some(parent_pid) = P::parent_pid(current_pid) else {
-            break;
-        };
+    while let Some(parent_pid) = P::parent_pid(current_pid) {
         if parent_pid == 0 || parent_pid == current_pid {
             break;
         }
