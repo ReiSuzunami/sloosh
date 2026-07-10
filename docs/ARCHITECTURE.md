@@ -1,281 +1,363 @@
 # Architecture
 
-This is an English overview of `sloosh`'s design. The authoritative,
-more detailed design document is [`DESIGN.md`](../DESIGN.md) (written in
-Chinese); section references below (`§N`) point back to it. This document
-favors accuracy over completeness — where something isn't implemented yet,
-it says so.
+This document describes the code as implemented. See
+[`../DESIGN.md`](../DESIGN.md) for the Chinese design/status document,
+[`../SECURITY.md`](../SECURITY.md) for the threat model, and
+[`PROTOCOL.md`](PROTOCOL.md) for the exact local wire framing.
 
-## 1. Components
+## 1. Component and data ownership
 
+```text
+Agent process                         Human terminal
+     |                                     |
+     +---------------+---------------------+
+                     v
+          +------------------------+
+          | sloosh CLI             |
+          |                        |
+          | - argument/TTY policy  |
+          | - protocol handshake   |
+          | - local file access    |
+          | - approval preview     |
+          | - routed key probes    |
+          +-----------+------------+
+                      |
+                      | Unix domain socket
+                      | control: NDJSON <= 1 MiB
+                      | data: length-prefixed raw frames
+                      v
+          +------------------------+
+          | sloosh daemon          |
+          |                        |
+          | - peer PID + leases    |
+          | - vault writer/cache   |
+          | - SSH connections      |
+          | - PTY sessions/spool   |
+          | - remote SFTP handles  |
+          | - local forwards       |
+          | - audit writer         |
+          +-----------+------------+
+                      |
+                      | SSH / SFTP
+                      v
+               Remote hosts
 ```
-Coding Agent --spawn--> sloosh (CLI) ---- UDS, NDJSON protocol ----+
-                                                                    v
-Human (separate   --approve-->  sloosh          ------------> sloosh daemon
- terminal)                      approve/add                    - SSH connection pool (russh)
-                                                                 - persistent PTY sessions
-                                                                 - vault (master-password encrypted)
-                                                                 - lease manager
-                                                                 - audit log
+
+The CLI and daemon are subcommands of one binary. The daemon is persistent
+because PTY shells, forwards, pending approvals, and active leases must outlive
+one short CLI invocation. If no daemon is reachable, ordinary CLI commands
+spawn `sloosh daemon run` detached; bind atomicity decides concurrent startup
+races.
+
+Ownership is deliberate:
+
+- The CLI owns every local filesystem operation for SFTP. It opens an upload
+  source or a download temp file under its own cwd/sandbox. A `local_path` sent
+  to the daemon is an audit/display label only.
+- The daemon owns the remote SFTP handle and moves bytes between raw UDS frames
+  and that handle. It never opens the caller-supplied local path.
+- The daemon is the normal vault writer and owns the long-lived unlocked cache.
+  During `approve`, the human CLI temporarily unlocks its own read cache so it
+  can preview vault-only ProxyJump entries and run routed host-key probes. That
+  CLI cache is cleared when approval processing ends.
+- The daemon owns all long-lived SSH connections, PTYs, spool writers,
+  forwards, leases, and audit appends. Restarting it loses all in-memory state
+  and terminates active sessions and forwards.
+
+## 2. Local transport and protocol boundary
+
+`src/transport/` defines the `Channel` interface. The current implementation is
+Unix domain sockets in `src/transport/unix.rs` for macOS and Linux. Windows
+Named Pipes are not implemented.
+
+Socket locations are:
+
+- Linux: `$XDG_RUNTIME_DIR/sloosh.sock`, or
+  `/tmp/sloosh-<euid>/sloosh.sock` when no runtime directory is available.
+- macOS: `$SLOOSH_HOME/sloosh.sock`, normally `~/.sloosh/sloosh.sock`.
+- `$SLOOSH_SOCKET` overrides either path.
+
+The parent directory is repaired to mode `0700` and the socket to `0600`.
+Before sending a request, `UnixChannel::connect` checks that the server peer has
+the current effective UID and the same canonical executable path as the current
+`sloosh` process. This is useful daemon authentication, but it is not a defense
+against hostile code already running as the same user; see `SECURITY.md`.
+
+The daemon obtains the client PID from kernel peer credentials:
+
+- Linux: `SO_PEERCRED`.
+- macOS: `LOCAL_PEERPID`, with `getpeereid` available to the transport.
+
+The daemon uses the PID for lease ancestry and self-approval checks. It does
+not require clients to be the `sloosh` executable. A same-UID process can open
+the socket, but must complete the protocol 2 `Hello` gate before ordinary
+requests and remains subject to daemon-side capability checks.
+
+### Protocol 2
+
+Protocol 2 is mixed framing, not pure NDJSON:
+
+```text
+ordinary request:  NDJSON request -> NDJSON response
+
+Put/Get request:   NDJSON request -> NDJSON TransferReady
+                    raw frames ... -> zero-length raw frame
+                    NDJSON Transfer or Error
 ```
 
-(DESIGN.md §1)
+Each control line, including its newline, is limited to 1 MiB. Each raw frame
+has a 4-byte big-endian unsigned length and at most 1 MiB of payload. Length 0
+means stream EOF. A stream can contain any number of frames, so SFTP transfers
+have no application total-size cap.
 
-- **CLI** (`src/cli/`) — entry point for both the agent and the human.
-  Parses arguments with `clap` (`src/cli/args.rs` is the source of truth
-  for the full subcommand surface — see the README's command table), talks
-  to the daemon over the local transport, and auto-spawns the daemon on
-  first use if its socket isn't reachable.
-- **Daemon** (`src/daemon/mod.rs`) — a plain subcommand of the same binary
-  (`sloosh daemon run`), not a separate crate, so distribution stays a
-  single binary and the CLI can bootstrap it transparently. It owns the
-  Unix domain socket, runs the accept loop, and routes every request
-  (`Status`/`Shutdown`, session management, vault/lease authorization) to
-  the relevant module.
-- **Why a persistent daemon, not a stdio MCP-style server**: a daemon that
-  outlives any single agent process means an agent crash/restart doesn't
-  lose SSH session state, and multiple agent processes can share the same
-  underlying connections — a server tied to one agent process's stdio
-  offers neither (DESIGN.md §1).
+Protocol 2 uses a bidirectional gate. The CLI first sends `Status` and requires
+an exact `wire_protocol` match, then sends `Hello { wire_protocol: 2 }`. The
+daemon replies `ProtocolReady { wire_protocol: 2 }` and marks that connection
+negotiated. Before this exchange, the daemon allows only `Status`, `Hello`, and
+`Shutdown`. Every ordinary request is rejected before request-specific side
+effects. A wrong-version `Hello` leaves the gate closed.
 
-## 2. Transport: UDS with kernel peer credentials
+`sloosh daemon stop` intentionally uses the pre-negotiation `Shutdown` path so
+an old daemon can be stopped during upgrade. A raw client cannot skip the
+server gate for ordinary requests.
 
-`src/transport/` defines a `Channel` trait abstracting local IPC so
-platform-specific bits never leak into caller code. The only implementation
-today is `src/transport/unix.rs` (Unix domain sockets, macOS + Linux); a
-Windows Named Pipe implementation is planned for phase 2 (DESIGN.md §2,
-§8) but does not exist yet.
+NDJSON remains readable, but `nc -U` is not a complete or supported client: it
+does not authenticate the daemon executable or automatically implement the
+`Status`/`Hello` exchange, raw transfer framing, and sequencing.
 
-The authorization model (§4) depends on knowing, with kernel-level
-certainty, which OS process is on the other end of a connection — not a
-PID the caller merely *claims*. That's why the transport is a Unix domain
-socket rather than TCP loopback: UDS exposes peer credentials via
-`SO_PEERCRED` (Linux) or `LOCAL_PEERPID` (macOS), and every `Channel`
-implementation must provide `peer_pid()`. TCP `localhost` has no
-equivalent trusted mechanism (DESIGN.md §2).
+## 3. Authorization and stable grants
 
-The socket path is `$XDG_RUNTIME_DIR/sloosh.sock` on Linux and
-`~/.sloosh/sloosh.sock` on macOS, mode `0600` (same-user only) — the outer
-perimeter of the trust model; see §4 for what's layered on top of it.
+### Process ancestry lease
 
-Messages are newline-delimited JSON (NDJSON), one object per line,
-internally tagged by a `"type"` field (`src/proto.rs`) — chosen over a
-binary/schema-compiled protocol because performance isn't a constraint
-here, and NDJSON stays debuggable with plain tools like `nc -U`. Secrets
-that legitimately cross the socket (e.g. a master password typed during
-`approve`) are wrapped in `SecretString`, whose `Debug` impl always prints
-a redacted placeholder, so they can't leak into the trace-level
-`debug!(?req, ...)` logging every inbound message goes through.
+`src/daemon/lease.rs` stores pending requests and active leases in memory. A
+request is anchored to a process instance identified by PID plus start time.
+Later callers inherit authorization when that exact anchor appears in their
+current ancestry. `SLOOSH_LEASE` is a bearer-token escape hatch for detached
+process trees.
 
-## 3. Session model: persistent PTY, sentinel framing, spool
+An active lease grants a set of host aliases. It expires after either:
 
-The core value proposition: each session keeps a long-lived PTY shell open
-on the remote host (`src/daemon/session.rs`), so `cwd`, environment
-variables, venv activation, and background jobs survive across separate
-`sloosh run` calls — something a fresh `ssh host cmd` subprocess per call
-cannot offer (DESIGN.md §3).
+- 2 hours without a matching operation, or
+- 8 hours absolute lifetime.
 
-- **Implicit addressing.** `sloosh run <host> "cmd"` creates or reuses that
-  host's default session; `--session <name>` (or `sloosh open <host>
-  <name>`) opens a second, parallel shell on the same host.
-- **Sentinel-based framing.** Each command is followed by a generated
-  marker line shaped `__sloosh_<32 lowercase hex>__` (`SENTINEL_PREFIX`/
-  `SENTINEL_HEX_LEN`/`SENTINEL_SUFFIX` in `session.rs`), printed via
-  `printf` so the daemon can locate a command's exit code and output
-  boundary within one raw PTY byte stream.
-- **`FrameScrubber`** sits between the raw PTY stream and the ring
-  buffer/spool: it strips sentinel lines by shape (not by matching a list
-  of currently-armed sentinels, so a stale sentinel can't leak through),
-  guaranteeing no `__sloosh_*__` line ever reaches agent-visible output.
-  It also holds back any byte sequence that might be a not-yet-complete
-  marker, so a marker split across reads can't leak half of itself.
-- **Execution modes:** `run` blocks by default until the sentinel resolves
-  or a timeout elapses — hitting the timeout does *not* kill the command,
-  it returns `running` plus output-so-far; `peek` is cursor-based, by
-  default returning only output since the caller's last peek (mirroring
-  Claude Code's `BashOutput`, to avoid re-sending/re-billing tokens for
-  output already seen), with `--tail N` for an explicit re-read; `send`
-  writes raw keystrokes (for interactive prompts); `interrupt` sends
-  Ctrl-C. Every `run`/`peek` reply carries an explicit status: `done`,
-  `running`, or `dead`.
-- **Disconnection semantics: report death, don't silently resurrect.** If
-  the SSH connection drops, the daemon reports the session `dead` with the
-  reason and last output, rather than silently opening a fresh shell in a
-  `cwd` the agent doesn't expect. A remote-tmux-anchored `--resilient` mode
-  is planned; the `dead`/`running`/`done` vocabulary already reserves room
-  for it (DESIGN.md §3).
-- **Session lifecycle is independent of lease lifecycle.** A lease
-  expiring doesn't kill the session or its processes; it reattaches
-  cleanly once re-approved. Sessions are reaped independently on their own
-  idle timeout (8h of no activity). Port forwards (`src/daemon/forward.rs`,
-  §6) don't get this leniency: a forward *is* live network access, so a
-  lease expiring or being revoked tears it down immediately rather than
-  leaving it attached-but-dormant — see §4's authorization model for why.
+API entry points prune before use, and a 60-second background reaper clears
+otherwise-idle expired leases and the vault cache after the last lease is gone.
+Pending requests expire after 15 minutes.
 
-### Output handling (DESIGN.md §5)
+### Stable `LeaseGrant`
 
-- The shell is initialized with `NO_COLOR=1 TERM=dumb`; the daemon also
-  strips ANSI by default (`--raw` opts back into unprocessed output).
-- A reply's `output` field is capped (`MAX_OUTPUT_CHARS` = 30,000 chars,
-  sized similarly to Claude Code's `BASH_MAX_OUTPUT_LENGTH`), truncated
-  from the front with a marker and total byte count.
-- The **full, untruncated** output is always spooled to disk
-  (`~/.sloosh/spool/<host>--<session>/<seq>.log`; the reply includes the
-  path) so
-  the agent can `grep`/`tail` large output locally without it crossing the
-  socket or entering context. Capped at `MAX_SPOOL_DIR_BYTES` (64 MiB) per
-  session, oldest files deleted first.
-- A 256 KiB in-memory ring buffer per session (`RING_CAPACITY`) backs
-  `peek`'s cursor reads.
-- `put`/`get` reuse the session's existing SSH connection over SFTP
-  (`russh-sftp`); file bytes never cross the local UDS socket — the CLI
-  sends only the path, and the daemon (same OS user) reads/writes the file
-  directly.
+A CLI PID is short-lived and cannot identify a background forward. At forward
+creation, `lease::resolve_grant` converts current ancestry/token authorization
+to an opaque `LeaseGrant` scoped to one host and one active lease. The forward
+stores this stable grant, not the creator CLI PID.
 
-## 4. Authorization model
+Real accepted forward traffic calls `check_grant`, which revalidates the lease
+and refreshes its idle clock. The 15-second forward reaper calls `peek_grant`,
+which revalidates without refreshing. Once the lease expires, the registry
+removes the forward and the owner task closes the listener and existing
+tunnels.
 
-The project's core design contribution: an agent can drive a real SSH
-session without ever holding, seeing, or exfiltrating a credential
-(DESIGN.md §4).
+PTY sessions intentionally differ: lease expiry blocks access but does not
+kill the remote shell. A later lease can reconnect to the still-live session.
 
-**Vault** (`src/daemon/vault.rs`) stores credentials at `~/.sloosh/vault`
-as a versioned JSON envelope: Argon2id KDF parameters + nonce + AEAD
-ciphertext, sealing a map from host alias to `HostEntry`. The master
-password is run through Argon2id to derive a 32-byte ChaCha20-Poly1305
-key; there's no separate verifier — successful AEAD decryption *is* the
-password check, and every save writes a fresh nonce. Credential enrollment
-(`sloosh add`) is human-only and interactive: no flag or code path accepts
-a plaintext secret as an argument, since that would put the credential
-through the agent's own context/argv. While at least one lease is active,
-the derived key is cached in memory so SSH auth doesn't re-prompt on every
-call; the cache clears the moment the last lease expires. Passwords are
-`zeroize`d once unneeded, and never appear in logs, errors, or `Debug`
-output (`SecretString` in `src/proto.rs` enforces this on the wire).
-Planned, without changing the on-disk format: OS-keychain- or
-biometric-gated (Touch ID / Windows Hello) key-wrapping as an alternative
-unlock path. A `HostEntry` may also carry an optional `jump` field — a jump
-host alias, resolvable via the vault or `~/.ssh/config`, same syntax as an
-`~/.ssh/config` `ProxyJump` entry (`#[serde(default)]`, so older vault files
-without it keep decrypting; not a secret, so it's fine to show in `Debug`
-output).
+An SFTP transfer is one operation authorized before `TransferReady`. Once its
+remote handle is open and the stream starts, it retains that start-time grant.
+Idle or absolute expiry blocks later transfers but does not abort the current
+one. This prevents the 8-hour absolute lease lifetime from becoming a NAS
+transfer duration or file-size limit.
 
-**Out-of-band authorization flow (device-code style):** (1) the agent runs
-`sloosh request <host>...` — a request must name specific hosts, since a
-blanket "unlock everything" would reduce approval to a rubber stamp; before
-creating the pending request, the daemon expands each named host's
-`ProxyJump` chain (vault `jump` field and/or `~/.ssh/config` `ProxyJump`,
-recursed the same way connection-time resolution does, same 8-hop cap) and
-folds every hop alias into the request's host set, deduplicated, target
-first — so the human approves coverage for the whole path, not just the
-final target; (2) the daemon creates a pending request with a generated ID,
-and the CLI prints one copy-pasteable approval command; (3) a human runs
-that command in a **separate terminal**, entering the master password — a
-pure-terminal flow that also works headless, and where first-time host-key
-fingerprint confirmation happens, since a human is already present to judge
-it; (4) the resulting lease auto-expires after an idle period, and
-`request` for an already-covered host returns success immediately
-(idempotent), so the agent never has to track lease state itself.
+## 4. Approval, ProxyJump, and host keys
 
-**Agent identity anchoring: process ancestry.** The primary mechanism
-(`src/daemon/lease.rs`) binds a lease to a `(PID, process start time)`
-pair — not a credential or token — identifying a process in the approving
-caller's ancestry, guarding against PID reuse. *Anchor selection* happens
-once, at `request` time: the daemon walks up the caller's process tree
-(`src/procs/`, `sysctl` on macOS / `/proc` on Linux) to the human-meaningful
-top-level agent process, skipping the `sloosh` CLI itself and intermediate
-shells. *Anchor matching* — whether a later call is covered by an active
-lease — never re-runs selection; it just checks whether the stored
-`(pid, start_time)` appears anywhere in the current caller's ancestry, so
-subagents spawned under an authorized process inherit the lease
-automatically, while a genuine agent restart correctly requires
-re-approval. The escape hatch is the `SLOOSH_LEASE` environment variable,
-for cases where process-tree ancestry is broken (e.g. a detached process);
-env vars inherit to children the same way ancestry does. Windows note (not
-yet implemented): a dead parent's PID can be recycled, so a future Windows
-port also needs to check that a child's creation time postdates its
-claimed parent's.
+The approval path resolves host scope twice because a request may be created
+while the vault is locked:
 
-**Trust posture and residual risk.** The `0600` same-user socket
-permission is only the outer perimeter. Every host-touching request
-(`Run`/`Peek`/`Send`/`Interrupt`/`Open`/`Kill`/`Forward`) independently
-requires an active lease, checked daemon-side via `lease::check_authorized`
-— never trusted from the client (`ForwardLs`/`ForwardStop` don't touch a
-host directly and so aren't lease-gated: listing is read-only, and stopping
-only *reduces* access). `ssh.rs` applies the same check a second time,
-per hop, while dialing a `ProxyJump` chain: right before opening the
-`direct-tcpip` tunnel through a given hop, if that hop's credentials come
-from the vault, the requesting process must independently hold a lease for
-*that hop's* alias, not just the final target (a hop resolved purely from
-`~/.ssh/config` uses ambient user credentials and needs no lease). Missing
-coverage fails with a teaching error naming the specific hop and the
-`sloosh request` invocation that covers it. A live forward needs this same
-guarantee to keep holding, not just at creation time: `forward.rs` doesn't
-wait for `lease.rs` to push a notification (that would mean `lease.rs`
-depending on `forward.rs`, an edge the module graph avoids the same way it
-avoids one for vault-cache clearing) — instead it runs its own periodic
-sweep that re-checks `lease::check_authorized` for every live forward and
-tears down anything whose coverage has lapsed. This is enforced because the
-CLI's TTY guards on
-`approve`/`add`/`rm`/`vault init` only protect those specific entry
-points; any other same-user process can write raw NDJSON straight to the
-socket. Concretely, `ApproveLease` never creates the vault (a missing
-vault is a hard error pointing at `sloosh vault init`) and rejects an
-approver whose own ancestry contains the pending request's anchor
-(self-approval). **Accepted residual risk** (documented in
-`src/daemon/mod.rs`): a malicious same-user process that deletes
-`~/.sloosh/vault` outright could race a fresh `vault init` with its own
-password and self-serve future approvals — defending against a hostile
-process running as the same OS user is outside what a same-user daemon can
-do alone; true isolation needs OS help (keychain/biometric-gated key
-storage), tracked as future work rather than claimed as solved.
-
-**Audit log** (`src/daemon/audit.rs`) appends one NDJSON line per event to
-`~/.sloosh/audit.jsonl` (`0600`, same posture as the socket/vault); the
-daemon is the sole writer, and `sloosh log` reads the file directly (no
-daemon round-trip). Recorded: authorization events (request/approve/
-expiry, with agent identity and host scope), connection events
-(established/disconnected, with cause), and operation events (each `run`'s
-full command text, session, timestamp, exit code; `put`/`get` paths).
-Command *output* is deliberately never logged — that's the spool's job.
-Every call site funnels through one `record()` function, so "never log a
-credential or output" only has one place to get right. Writing is
-best-effort: a failure is `tracing::warn`-reported and swallowed rather
-than blocking the operation — the log is a diagnostic aid under this
-same-user threat model, not a security control that must never miss an
-entry.
-
-## 5. Platform support
-
-Platform-specific code (IPC transport, process-tree walking, file
-permissions, path conventions) must live behind an abstraction boundary —
-`src/transport/`, `src/procs/` — rather than inline `cfg` branches
-scattered through shared logic (DESIGN.md §2). Today that boundary has one
-implementation each: macOS (`src/procs/macos.rs`, `sysctl`-based) and
-Linux (`src/procs/linux.rs`, `/proc`-based), both on the Unix domain
-socket transport. Windows support (a Named Pipe transport, plus the
-PID-reuse-aware ancestry check from §4) is planned but not implemented.
-
-## 6. Module layout
-
+```text
+agent CLI             daemon             human CLI
+    |                    |                    |
+    | RequestLease       |                    |
+    +------------------->|                    |
+    | pending host list  |                    |
+    |<-------------------+                    |
+    |                    | DescribeRequest    |
+    |                    |<-------------------+
+    |                    |------------------->| prompt + details
+    |                    |                    | unlock local vault cache
+    |                    |                    | expand ProxyJump list
+    |                    |                    | human confirms exact list
+    |                    | ApproveLease(password, approved_hosts)
+    |                    |<-------------------+
+    |                    | unlock daemon cache
+    |                    | independently re-expand
+    |                    | exact list compare
+    |                    |                    |
+    |                    | LeaseActivated or Error
+    |                    |------------------->|
 ```
+
+The list comparison includes order and fails closed. A stale or omitted
+`approved_hosts` list does not activate a lease, and the pending request remains
+available for a corrected approval. Connection-time dialing also checks every
+vault-backed jump alias independently.
+
+After activation, the human CLI confirms missing host keys in dependency order.
+`ssh::host_key_confirmation_order` produces each jump before targets that need
+it. A target probe follows the same resolved ProxyJump route as a real
+connection:
+
+- Intermediate hops use normal strict host-key verification and normal
+  authentication.
+- The final unknown target accepts a key only inside a capture handler, stops
+  after key exchange, and is not authenticated.
+- The human confirms the displayed SHA256 fingerprint before the CLI records
+  it in `~/.sloosh/known_hosts`.
+- Probe failure or rejection records nothing. Real connections continue to
+  reject an unknown or mismatched key.
+
+This is routed bootstrap, not blind trust. Fingerprints still need an
+independent source when route compromise is a concern.
+
+## 5. SSH sessions and output
+
+`src/daemon/session.rs` keeps one PTY shell for each `(host, session)` pair.
+Commands are framed with random sentinels in the shared PTY byte stream. A
+stateful scrubber removes complete, split, stale, and interrupt-resync markers
+before bytes enter user-visible output.
+
+The session state includes:
+
+- a 256 KiB ring for cursor-based `peek`;
+- one active run and its sentinel/resync state;
+- connection/dead state and last activity;
+- one bounded spool writer for the active run.
+
+`run` returns `done`, `running`, or `dead`. Timeout reports `running` without
+killing the command. Disconnects report `dead` and never silently recreate a
+shell with different state. An 8-hour idle threshold is checked by a 5-minute
+session reaper.
+
+Reply output keeps roughly the final 30,000 characters. Spool is bounded
+retention, not a complete archive:
+
+- one run file retains at most 64 MiB of raw output and appends a visible limit
+  marker when persistence stops;
+- one session directory has a 64 MiB retention budget, with oldest files
+  removed on best-effort cleanup;
+- the spool root has a 1 GiB hard application budget across every host and
+  session;
+- each active run reserves its full 64 MiB allowance up front, allowing at
+  most 16 concurrent reservations;
+- root cleanup protects active paths and deletes the oldest inactive files by
+  modification time across session directories;
+- file creation, reservation publication, and root cleanup share one registry
+  critical section, preventing cleanup from deleting a newly active spool;
+- command processing and the memory ring continue after the disk cap;
+- encoded host/session components prevent path traversal;
+- directories are `0700`, and spool files are `0600` with `O_NOFOLLOW`.
+
+These limits apply only to PTY command-output spool. They do not cap SFTP
+transfer bytes or duration.
+
+## 6. SFTP stream ownership
+
+Both transfers open a new SFTP subsystem channel on an existing authenticated
+SSH connection. The client config replaces `russh-sftp`'s default 10-second
+per-request timeout with the pinned Tokio release's far-future deadline
+(roughly 30 years). That is operationally unbounded for slow NAS work, while
+SSH, server, filesystem, and network failures still surface normally.
+
+### Put
+
+1. CLI resolves and opens a local regular file.
+2. CLI sends `Put` with `local_path` as a label.
+3. Daemon checks the lease, opens remote `CREATE | TRUNCATE | WRITE`, and returns
+   `TransferReady`.
+4. CLI streams raw frames; daemon writes them under the start-time grant until
+   raw EOF or a transfer error.
+5. Zero-length frame ends the stream; daemon shuts down the remote handle and
+   returns `Transfer` or `Error`.
+
+An interrupted upload can leave a truncated or partial remote file. There is no
+resume or remote atomic-replace layer.
+
+### Get
+
+1. CLI creates a mode-`0600` temp file in the destination directory.
+2. Daemon checks the lease, opens the remote file, and returns `TransferReady`.
+3. Daemon reads remote SFTP data into bounded frames; CLI writes the temp file.
+4. Daemon sends raw EOF, then `Transfer` or `Error`.
+5. Only after `Transfer` does the CLI sync and atomically commit the temp file.
+
+Without `--force`, a hard link creates the destination only if absent. With
+`--force`, same-directory rename replaces it. A normal error leaves an existing
+destination untouched and removes the temp file; abrupt process termination can
+leave an orphan temp file.
+
+For both directions, the grant is fixed before `TransferReady`. Lease expiry
+during the stream does not interrupt it; only a later transfer needs a new live
+lease. Total bytes remain unlimited while each raw frame remains at most 1 MiB.
+
+## 7. Forwarding
+
+`src/daemon/forward.rs` currently implements local forwarding only:
+
+- `-L` binds only loopback IP addresses. Omitted bind address is
+  `127.0.0.1`; non-loopback literals fail before network access.
+- Each forward has a dedicated SSH connection and stable `LeaseGrant`.
+- Connection loss, explicit stop, or lease expiry closes the forward.
+- `forward ls` is read-only and `forward stop` only reduces access, so neither
+  requires a lease.
+
+Remote `-R` specifications are parsed for accurate validation, but creation is
+always rejected. Both `-R` and non-loopback `-L` require a future
+capability-specific approval model; a general host lease is not sufficient.
+
+## 8. Vault mutation and cache lifecycle
+
+`src/daemon/vault.rs` stores a versioned JSON envelope containing Argon2id
+parameters, a nonce, and ChaCha20-Poly1305 ciphertext. There is no separate
+password verifier; successful AEAD decryption verifies the password.
+
+Mutation and lease unlock use two serialization layers:
+
+- a process-wide writer mutex covers each disk read-modify-write transaction;
+- one async mutation mutex is shared by add/remove, cache refresh, and
+  `unlock_for_lease` publication.
+
+This prevents concurrent add/remove operations from losing an entry on disk or
+allowing an older unlock/cache refresh to overwrite newer state. Lease unlock
+reads one `VaultFile` envelope, derives the key from that envelope's KDF data,
+decrypts that same envelope's nonce/ciphertext, and publishes all cache material
+together. It never combines material from two disk snapshots. Saves use a fresh
+salt and nonce, a random `create_new` mode-`0600` temp file, and atomic rename.
+
+The daemon cache contains decrypted entries, KDF metadata, and a zeroizing
+derived key. Approval populates it; add/remove refresh it only if already
+present; the last lease expiry clears it. Password buffers, plaintext buffers,
+keys, and vault entry passwords use zeroization where their Rust ownership
+permits it.
+
+## 9. Module map
+
+```text
 src/
-  main.rs        entry point: CLI parsing, daemon subcommand dispatch
-  cli/           clap command definitions, client-side logic, daemon auto-spawn
-  proto.rs       NDJSON request/response/event types (serde)
-  transport/     IPC abstraction trait; unix.rs (UDS); windows.rs (phase 2)
+  main.rs            process entry and command dispatch
+  cli/
+    args.rs          clap surface
+    client.rs        daemon connect/spawn, peer and protocol checks
+    mod.rs           CLI behavior, local SFTP files, approval UI
+  proto.rs           protocol 2 request/response types and NDJSON limit
+  transport/
+    mod.rs           Channel and raw-frame contract
+    unix.rs          UDS, peer credentials, paths and permissions
   daemon/
-    mod.rs       accept loop, request routing
-    session.rs   PTY sessions: sentinel framing, ring buffer, cursor, spool
-    ssh.rs       russh connection setup, ~/.ssh/config subset, multi-hop ProxyJump,
-                 IdentityAgent, known_hosts
-    forward.rs   -L/-R port forwarding: forward registry, lease-expiry reaper,
-                 forwarded-tcpip routing for reverse forwards
-    lease.rs     leases: process-ancestry anchoring, env escape hatch, idle timeout
-    vault.rs     argon2id + ChaCha20-Poly1305, zeroize
-    audit.rs     audit.jsonl append-only writer
-  procs/         process-tree walking abstraction; macos.rs (sysctl); linux.rs (/proc)
-skills/sloosh/   agent skill (SKILL.md, agentskills.io format; distributed
-                 via the ReiSuzunami/nerv plugin marketplace and `npx skills`)
+    mod.rs           accept loop and request routing
+    lease.rs         pending requests, active leases, stable LeaseGrant
+    vault.rs         encrypted vault, serialized mutation, cache
+    ssh.rs           config resolution, ProxyJump, host-key verification
+    session.rs       PTY state, sentinel framing, spool, SFTP handles
+    forward.rs       loopback-only -L and forward lifetime
+    audit.rs         best-effort audit append/read helpers
+  procs/
+    macos.rs         process ancestry via macOS APIs
+    linux.rs         process ancestry via /proc
 ```
-
-(DESIGN.md §8)

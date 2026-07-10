@@ -22,7 +22,7 @@
 //! versa) and assert nothing.
 
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{Request, Response};
+use sloosh::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
@@ -90,15 +90,35 @@ async fn grant_lease(hosts: &[&str]) {
 }
 
 async fn start_daemon(tag: &str) -> UnixChannel {
-    let socket_path =
-        std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}.sock", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    let socket_path = dir.join("sloosh.sock");
     let daemon_socket = socket_path.clone();
     tokio::spawn(async move {
         let _ = sloosh::daemon::run(daemon_socket).await;
     });
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(&socket_path).await {
+        if let Ok(mut chan) = UnixChannel::connect(&socket_path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;

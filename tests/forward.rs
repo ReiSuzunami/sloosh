@@ -11,7 +11,7 @@
 //! it through the tunnel without needing any other service to exist.
 
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{ForwardDirection, Request, Response};
+use sloosh::proto::{ForwardDirection, Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 use tokio::io::AsyncReadExt;
@@ -23,12 +23,25 @@ fn test_host() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "sloosh-fwd-itest-{tag}-{}-{}.sock",
+    let dir = std::env::temp_dir().join(format!(
+        "sloosh-fwd-itest-{tag}-{}-{}",
         std::process::id(),
         tag.len()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    dir.join("sloosh.sock")
 }
 
 /// Point `$SLOOSH_HOME` at a private temp directory for the rest of this
@@ -76,7 +89,20 @@ async fn grant_lease_for_test(host: &str) {
 async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(path).await {
+        if let Ok(mut chan) = UnixChannel::connect(path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;
@@ -98,7 +124,31 @@ async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf
 }
 
 #[tokio::test]
+async fn remote_forward_is_rejected_before_any_ssh_connection() {
+    let _guard = test_lock().lock().await;
+    let host = "remote-forward-must-not-connect.invalid";
+    let (mut chan, _socket) = start_daemon("remote-disabled", host).await;
+
+    chan.send(&Request::Forward {
+        host: host.to_string(),
+        direction: ForwardDirection::Remote {
+            spec: "9000:127.0.0.1:3000".to_string(),
+        },
+        lease_token: None,
+    })
+    .await
+    .expect("send remote Forward");
+
+    let Some(Response::Error { message }) = chan.recv::<Response>().await.expect("recv") else {
+        panic!("expected remote forwarding to be rejected");
+    };
+    assert!(message.contains("temporarily disabled"), "{message}");
+    assert!(message.contains("capability-specific"), "{message}");
+}
+
+#[tokio::test]
 async fn local_forward_tunnels_to_remote_sshd_and_stops_cleanly() {
+    let _guard = test_lock().lock().await;
     let Some(host) = test_host() else {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;

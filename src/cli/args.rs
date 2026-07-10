@@ -1,8 +1,5 @@
-//! Clap argument definitions for every phase-1 subcommand (DESIGN.md §6).
-//!
-//! Most of these commands aren't implemented yet (see `cli::dispatch`) —
-//! the shapes here are the intended phase-1 surface so `--help` is useful
-//! today and wiring them up later doesn't change the CLI contract.
+//! Clap argument definitions for the implemented command surface
+//! (DESIGN.md §6). Keep this help aligned with enforced security limits.
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
@@ -50,7 +47,7 @@ pub enum Command {
     Put(PutArgs),
     /// Download a remote file from a host over SFTP.
     Get(GetArgs),
-    /// Open a `-L`/`-R` port forward through a host, or manage active ones (`ls`/`stop`).
+    /// Open a loopback-only `-L` forward, or manage active ones (`ls`/`stop`).
     Forward(ForwardArgs),
     /// Show daemon/session/lease status — the anchor command when unsure what's going on.
     Status(StatusArgs),
@@ -203,7 +200,8 @@ pub enum VaultAction {
 #[command(
     long_about = "Upload a local file to a host over SFTP, reusing the session's existing SSH \
 connection (no redial, no reauth). An existing file at the remote path is always overwritten: \
-the remote host is the disposable workspace, so `put` doesn't ask."
+the remote host is the disposable workspace, so `put` doesn't ask. The transfer is streamed in \
+bounded chunks and has no total file-size limit."
 )]
 pub struct PutArgs {
     /// Destination host.
@@ -222,7 +220,8 @@ pub struct PutArgs {
     long_about = "Download a remote file from a host over SFTP, reusing the session's existing \
 SSH connection (no redial, no reauth). Unlike `put`, an existing file at the local destination \
 is left alone unless you pass --force: the remote host is a disposable workspace, but your local \
-machine is not, so `get` refuses to clobber it by default."
+machine is not, so `get` refuses to clobber it by default. The download is streamed to a private \
+temporary file and atomically committed only after success; total file size is not capped."
 )]
 pub struct GetArgs {
     /// Source host.
@@ -244,7 +243,8 @@ pub struct GetArgs {
 /// `ls`/`stop` are real subcommand keywords. Anything else is treated as
 /// `<host> -L/-R spec`, re-parsed by [`ForwardOpenArgs`] via clap's
 /// `external_subcommand` escape hatch (see `Command::Forward`'s dispatch in
-/// `cli::mod`).
+/// `cli::mod`). `-R` is still parsed so it can return a precise disabled
+/// message while capability-specific approval is being designed.
 #[derive(Debug, Args)]
 pub struct ForwardArgs {
     #[command(subcommand)]
@@ -257,8 +257,8 @@ pub enum ForwardAction {
     Ls(ForwardLsArgs),
     /// Stop an active forward.
     Stop(ForwardStopArgs),
-    /// `<host> -L ...` / `<host> -R ...` (see `ForwardOpenArgs`) — not a real
-    /// keyword; clap hands us the raw tokens and `cli::mod` re-parses them.
+    /// `<host> -L ...` (or parsed-but-disabled `-R`) — not a real keyword;
+    /// clap hands us the raw tokens and `cli::mod` re-parses them.
     #[command(external_subcommand)]
     Open(Vec<String>),
 }
@@ -272,14 +272,14 @@ pub enum ForwardAction {
 pub struct ForwardOpenArgs {
     /// Host to forward through (as configured via `sloosh add` / `~/.ssh/config`).
     pub host: String,
-    /// Local forward: listen locally, tunnel to remote_host:remote_port via `host`.
-    /// `[bind_addr:]local_port:remote_host:remote_port` (bind_addr defaults to
-    /// 127.0.0.1; local_port 0 asks the OS to pick a port).
+    /// Local forward: listen on a loopback address and tunnel to
+    /// remote_host:remote_port via `host`. `[bind_addr:]local_port:remote_host:remote_port`
+    /// (bind_addr defaults to 127.0.0.1 and must be loopback; local_port 0 asks the OS
+    /// to pick a port).
     #[arg(short = 'L', long = "local", value_name = "SPEC")]
     pub local: Option<String>,
-    /// Remote (reverse) forward: `host` listens and tunnels back to
-    /// local_host:local_port on this machine.
-    /// `[bind_addr:]remote_port:local_host:local_port`.
+    /// Remote (reverse) forward syntax. Currently rejected because exposing
+    /// a remote listener needs capability-specific human approval.
     #[arg(short = 'R', long = "remote", value_name = "SPEC")]
     pub remote: Option<String>,
     /// Print machine-readable JSON instead of a human summary.
@@ -296,7 +296,7 @@ pub struct ForwardLsArgs {
 
 #[derive(Debug, Args)]
 pub struct ForwardStopArgs {
-    /// Forward id printed by `sloosh forward <host> -L/-R ...` (also shown by `forward ls`).
+    /// Forward id printed by `sloosh forward <host> -L ...` (also shown by `forward ls`).
     pub id: String,
 }
 

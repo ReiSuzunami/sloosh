@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
 use chacha20poly1305::aead::Aead;
@@ -43,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::transport::unix::sloosh_home;
+use crate::transport::unix::{ensure_private_dir, sloosh_home};
 
 /// Argon2id memory cost in KiB (64 MiB). DESIGN.md §4 asks for "m=64MiB
 /// t=3 p=4" as a reasonable starting point for a locally-run daemon.
@@ -85,7 +86,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VaultError> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(VaultError::TamperedOrCorrupt);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -364,21 +365,56 @@ fn read_vault_file(path: &Path) -> Result<VaultFile, VaultError> {
     })
 }
 
+/// Process-wide writer lock for vault disk mutations. All production vault
+/// writes are routed through the daemon, so serializing create/add/remove here
+/// makes each read-modify-write transaction indivisible and prevents lost
+/// updates between concurrent client connections.
+fn vault_writer_guard() -> MutexGuard<'static, ()> {
+    static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+    WRITER
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Serializes each async read-modify-write through its cache refresh. The
+/// disk writer lock alone is insufficient: without this outer lock, an older
+/// writer can refresh the in-memory cache after a newer writer and make the
+/// daemon temporarily forget the newer entry even though disk is correct.
+fn vault_mutation_lock() -> &'static AsyncMutex<()> {
+    static MUTATION: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    MUTATION.get_or_init(|| AsyncMutex::new(()))
+}
+
 fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| VaultError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        // Only harden sloosh's dedicated state directory. Explicit test paths
+        // can live directly under /tmp; changing permissions there would be
+        // unsafe. Validate ownership and reject symlinks before creating a
+        // file containing secrets.
+        if parent == sloosh_home() {
+            ensure_private_dir(parent).map_err(|source| VaultError::Write {
+                path: parent.to_path_buf(),
+                source: io::Error::other(source),
+            })?;
+        } else {
+            std::fs::create_dir_all(parent).map_err(|source| VaultError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
     }
-    let tmp_path = path.with_extension("tmp");
+    let mut suffix = [0u8; 8];
+    rand::rng().fill_bytes(&mut suffix);
+    let tmp_path = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        hex_encode(&suffix)
+    ));
     let json = serde_json::to_vec_pretty(file).expect("VaultFile always serializes");
-    // Clear any stale temp file left behind by an interrupted earlier write,
-    // so `create_new` below can't spuriously fail on it.
-    let _ = std::fs::remove_file(&tmp_path);
     // Created 0600 *at open time* (not chmod'd afterwards), so there is no
     // window — however brief — in which another same-machine user could open
     // the temp file under a permissive default umask.
@@ -391,16 +427,21 @@ fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultErr
             path: tmp_path.clone(),
             source,
         })?;
-    tmp.write_all(&json).map_err(|source| VaultError::Write {
+    let result = tmp.write_all(&json).map_err(|source| VaultError::Write {
         path: tmp_path.clone(),
         source,
-    })?;
+    });
     drop(tmp);
-    std::fs::rename(&tmp_path, path).map_err(|source| VaultError::Write {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(())
+    let result = result.and_then(|()| {
+        std::fs::rename(&tmp_path, path).map_err(|source| VaultError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 /// Encrypt `data` under `password` using fresh KDF params (new salt) and
@@ -427,15 +468,29 @@ fn save_new_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), Vau
 
 /// Open the vault at `path` with `password`, verifying the password by
 /// virtue of successful AEAD decryption (there is no separate verifier).
+fn unlock_material_at(
+    path: &Path,
+    password: &[u8],
+) -> Result<(VaultData, KdfParamsFile, Zeroizing<[u8; 32]>), VaultError> {
+    let VaultFile {
+        kdf,
+        nonce,
+        ciphertext,
+        ..
+    } = read_vault_file(path)?;
+    let key = derive_key(password, &kdf)?;
+    let nonce = hex_decode(&nonce)?;
+    let ciphertext = hex_decode(&ciphertext)?;
+    let data = decrypt_data(&ciphertext, &nonce, &key, path)?;
+    Ok((data, kdf, key))
+}
+
 fn unlock_at(path: &Path, password: &[u8]) -> Result<VaultData, VaultError> {
-    let file = read_vault_file(path)?;
-    let key = derive_key(password, &file.kdf)?;
-    let nonce = hex_decode(&file.nonce)?;
-    let ciphertext = hex_decode(&file.ciphertext)?;
-    decrypt_data(&ciphertext, &nonce, &key, path)
+    unlock_material_at(path, password).map(|(data, _, _)| data)
 }
 
 fn create_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), VaultError> {
+    let _writer = vault_writer_guard();
     if path.exists() {
         return Err(VaultError::AlreadyExists(path.to_path_buf()));
     }
@@ -449,27 +504,37 @@ async fn add_entry_at(
     password: &[u8],
     replace: bool,
 ) -> Result<(), VaultError> {
-    let mut data = if path.exists() {
-        unlock_at(path, password)?
-    } else {
-        VaultData::default()
+    let _mutation = vault_mutation_lock().lock().await;
+    let data = {
+        let _writer = vault_writer_guard();
+        let mut data = if path.exists() {
+            unlock_at(path, password)?
+        } else {
+            VaultData::default()
+        };
+        if !replace && data.hosts.contains_key(alias) {
+            return Err(VaultError::HostExists(alias.to_string()));
+        }
+        data.hosts.insert(alias.to_string(), entry);
+        save_new_at(path, &data, password)?;
+        data
     };
-    if !replace && data.hosts.contains_key(alias) {
-        return Err(VaultError::HostExists(alias.to_string()));
-    }
-    data.hosts.insert(alias.to_string(), entry);
-    save_new_at(path, &data, password)?;
-    refresh_cache_if_present(&data, password).await;
+    refresh_cache_if_present(path, &data, password).await;
     Ok(())
 }
 
 async fn rm_entry_at(path: &Path, alias: &str, password: &[u8]) -> Result<(), VaultError> {
-    let mut data = unlock_at(path, password)?;
-    if data.hosts.remove(alias).is_none() {
-        return Err(VaultError::NoSuchHost(alias.to_string()));
-    }
-    save_new_at(path, &data, password)?;
-    refresh_cache_if_present(&data, password).await;
+    let _mutation = vault_mutation_lock().lock().await;
+    let data = {
+        let _writer = vault_writer_guard();
+        let mut data = unlock_at(path, password)?;
+        if data.hosts.remove(alias).is_none() {
+            return Err(VaultError::NoSuchHost(alias.to_string()));
+        }
+        save_new_at(path, &data, password)?;
+        data
+    };
+    refresh_cache_if_present(path, &data, password).await;
     Ok(())
 }
 
@@ -539,16 +604,14 @@ fn cache() -> &'static AsyncMutex<Option<UnlockedVault>> {
 /// Unlock the vault (verifying `password`) and populate the cache, for use
 /// by `approve` when activating a new lease.
 pub async fn unlock_for_lease(password: &[u8]) -> Result<(), VaultError> {
-    let path = vault_path();
-    let data = unlock_at(&path, password)?;
-    let file = read_vault_file(&path)?;
-    let key = derive_key(password, &file.kdf)?;
+    unlock_for_lease_at(&vault_path(), password).await
+}
+
+async fn unlock_for_lease_at(path: &Path, password: &[u8]) -> Result<(), VaultError> {
+    let _mutation = vault_mutation_lock().lock().await;
+    let (data, kdf, key) = unlock_material_at(path, password)?;
     let mut guard = cache().lock().await;
-    *guard = Some(UnlockedVault {
-        data,
-        kdf: file.kdf,
-        key,
-    });
+    *guard = Some(UnlockedVault { data, kdf, key });
     Ok(())
 }
 
@@ -598,15 +661,14 @@ pub async fn verify_password(password: &[u8]) -> Result<bool, VaultError> {
     Ok(key.as_slice() == cached.key.as_slice())
 }
 
-async fn refresh_cache_if_present(data: &VaultData, password: &[u8]) {
+async fn refresh_cache_if_present(path: &Path, data: &VaultData, password: &[u8]) {
     let mut guard = cache().lock().await;
     if guard.is_some() {
         // Best effort: if this fails (e.g. we lost a race with a concurrent
         // password change) just drop the stale cache entirely rather than
         // leave something inconsistent cached; the next `approve` will
         // re-populate it correctly.
-        let path = vault_path();
-        match read_vault_file(&path).and_then(|f| derive_key(password, &f.kdf).map(|k| (f, k))) {
+        match read_vault_file(path).and_then(|f| derive_key(password, &f.kdf).map(|k| (f, k))) {
             Ok((file, key)) => {
                 *guard = Some(UnlockedVault {
                     data: data.clone(),
@@ -784,6 +846,8 @@ mod tests {
 
     #[tokio::test]
     async fn add_and_remove_entry_round_trip() {
+        let _cache_guard = cache_test_lock().lock().await;
+        clear_cache().await;
         let path = temp_vault_path("addrm");
         let _ = std::fs::remove_file(&path);
 
@@ -806,6 +870,90 @@ mod tests {
         let err = rm_entry_at(&path, "web", b"pw").await.unwrap_err();
         assert!(matches!(err, VaultError::NoSuchHost(_)));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_adds_preserve_every_entry() {
+        use std::sync::Arc;
+
+        let _cache_guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        const WRITERS: usize = 2;
+        let path = temp_vault_path("concurrent-add");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+        let file = read_vault_file(&path).unwrap();
+        let key = derive_key(b"pw", &file.kdf).unwrap();
+        *cache().lock().await = Some(UnlockedVault {
+            data: VaultData::default(),
+            kdf: file.kdf,
+            key,
+        });
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let mut tasks = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let alias = format!("host-{i}");
+                let mut entry = sample_entry();
+                entry.hostname = format!("host-{i}.example.com");
+                add_entry_at(&path, &alias, entry, b"pw", false).await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let data = unlock_at(&path, b"pw").unwrap();
+        assert_eq!(data.hosts.len(), WRITERS);
+        for i in 0..WRITERS {
+            assert!(data.hosts.contains_key(&format!("host-{i}")));
+            assert!(
+                get_entry(&format!("host-{i}")).await.is_some(),
+                "cache must retain every serialized mutation"
+            );
+        }
+
+        clear_cache().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_unlock_and_remove_never_recaches_removed_entry() {
+        use std::sync::Arc;
+
+        let _cache_guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("concurrent-unlock-remove");
+        let _ = std::fs::remove_file(&path);
+        let mut data = VaultData::default();
+        data.hosts.insert("web".to_string(), sample_entry());
+        create_at(&path, &data, b"pw").unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let unlock_path = path.clone();
+        let unlock_barrier = Arc::clone(&barrier);
+        let unlock = tokio::spawn(async move {
+            unlock_barrier.wait().await;
+            unlock_for_lease_at(&unlock_path, b"pw").await
+        });
+        let remove_path = path.clone();
+        let remove_barrier = Arc::clone(&barrier);
+        let remove = tokio::spawn(async move {
+            remove_barrier.wait().await;
+            rm_entry_at(&remove_path, "web", b"pw").await
+        });
+
+        unlock.await.unwrap().unwrap();
+        remove.await.unwrap().unwrap();
+        assert!(get_entry("web").await.is_none());
+        assert!(!unlock_at(&path, b"pw").unwrap().hosts.contains_key("web"));
+
+        clear_cache().await;
         let _ = std::fs::remove_file(&path);
     }
 

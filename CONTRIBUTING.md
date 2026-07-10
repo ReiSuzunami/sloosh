@@ -1,16 +1,18 @@
 # Contributing to sloosh
 
-Thanks for taking a look. This is a small, security-sensitive tool, so the
-bar for changes near the trust boundary (vault, lease, transport) is
-intentionally higher than everywhere else — see below.
+Thanks for taking a look. This is a small, security-sensitive tool, so changes
+near a trust boundary need explicit reasoning and focused tests.
 
 ## Dev setup
 
-You need a recent stable Rust toolchain (edition 2024, so `rustc >= 1.85`).
+The minimum supported Rust version (MSRV) is 1.88. Normal development uses a
+current stable toolchain; CI separately verifies that the code still checks
+with Rust 1.88.
 
 ```
 git clone https://github.com/ReiSuzunami/sloosh
 cd sloosh
+rustup toolchain install stable 1.88.0
 cargo build
 ```
 
@@ -23,26 +25,44 @@ network or your real `~/.sloosh`.
 These are the same checks CI runs; please run them locally first:
 
 ```
-cargo test
-cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test
+cargo +1.88.0 check --all-targets --all-features --locked
 ```
 
-All three must pass cleanly. If `cargo fmt` reports a diff, run
+All four must pass cleanly. If `cargo fmt` reports a diff, run
 `cargo fmt --all` and commit the result rather than hand-formatting.
+
+CI maps these checks as follows:
+
+| Job | Platform/toolchain | Coverage |
+|---|---|---|
+| `lint` | Ubuntu, stable | `cargo fmt --all --check` and strict clippy |
+| `test` | Ubuntu + macOS, stable | Unit tests and non-live integration tests |
+| `msrv` | Ubuntu, Rust 1.88 | `cargo check --all-targets --locked` |
+| `live-ssh` | Ubuntu, stable | Live session, SFTP, and local-forward tests against a local sshd |
 
 ## Running the live SSH tests
 
-Most of the test suite (including `tests/daemon_status.rs`) runs without
-any external dependency. The integration tests in `tests/ssh_session.rs`
-(real SSH sessions: `run`/`peek`/`send`/`interrupt`/`open`/`ls`/`kill`) and
-`tests/sftp_transfer.rs` (`put`/`get` over SFTP) need an actual reachable
-host, so they're gated behind an environment variable and skipped
-otherwise:
+Most tests, including `tests/daemon_status.rs`, run without a network or the
+real `~/.sloosh`. Live suites skip when their environment variables are not
+set:
+
+| Test | Exercises | Required environment | Hosted CI |
+|---|---|---|---|
+| `ssh_session` | Persistent PTY operations and session lifecycle | `SLOOSH_TEST_SSH_HOST` | Yes |
+| `sftp_transfer` | Streaming `put`/`get`, >32 MiB no-total-cap, in-flight lease expiry, and PTY-reaper survival | `SLOOSH_TEST_SSH_HOST` | Yes |
+| `forward` | Loopback-only local forwarding and lease teardown | `SLOOSH_TEST_SSH_HOST` | Yes |
+| `proxy_jump` | Vault-backed jump, tunneled handshake, per-hop lease | `SLOOSH_TEST_SSH_HOST`, `SLOOSH_TEST_SSH_PASSWORD` | Manual |
 
 ```
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test sftp_transfer -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
+  --test sftp_transfer -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
+  cargo test --test proxy_jump -- --test-threads=1
 ```
 
 `myhost` can be an alias resolvable via `~/.ssh/config` or a literal
@@ -53,18 +73,58 @@ time. If `SLOOSH_TEST_SSH_HOST` is unset, these tests compile and pass
 trivially by skipping — they never fail or hang waiting for network access
 nobody granted, so it's safe to leave it unset in normal development.
 
+The live ProxyJump suite needs password authentication and is intentionally
+not enabled against the hosted runner's system sshd. Run it manually against
+an isolated test host.
+
 ## Security-sensitive areas get extra scrutiny
 
 Changes touching any of the following will be held to a higher review bar,
 and PRs there should explain their reasoning in more depth than usual:
 
-- `src/daemon/vault.rs` — credential encryption at rest (argon2id +
-  ChaCha20-Poly1305), zeroization, the vault's on-disk format.
-- `src/daemon/lease.rs` — the authorization model: process-ancestry
-  anchoring, the `SLOOSH_LEASE` escape hatch, approval/self-approval
-  checks.
-- `src/transport/` — the Unix domain socket transport and kernel
-  peer-credential lookups that lease anchoring depends on.
+- `src/proto.rs`, `src/transport/`, and `src/cli/client.rs` — wire protocol 2,
+  control-message limits, raw transfer framing, peer identity, daemon version
+  checks, and private socket/log paths.
+- `src/daemon/lease.rs` and `src/daemon/forward.rs` — process-ancestry
+  anchoring, the `SLOOSH_LEASE` escape hatch, approval checks, stable grants,
+  and teardown of live network access.
+- `src/daemon/vault.rs`, `src/daemon/ssh.rs`, and `src/daemon/audit.rs` —
+  encrypted credentials, serialized/atomic mutation, ProxyJump, host-key
+  verification, zeroization, and secret-safe logging.
+- `src/daemon/session.rs` and the transfer code in `src/cli/mod.rs` — PTY
+  framing, spool retention, local filesystem authority, SFTP streaming, and
+  atomic local downloads.
+
+Keep these contracts intact unless the change explicitly revises them:
+
+- Protocol 2 control messages are bounded NDJSON. SFTP data uses raw frames
+  capped at 1 MiB each, with no total transfer-size cap.
+- Connection setup is bidirectional: the CLI validates `Status`, then sends
+  `Hello` and waits for `ProtocolReady`. The daemon rejects ordinary requests
+  before a successful handshake, without performing their side effects.
+- The CLI is the only process that opens a `put`/`get` local path. The daemon
+  treats that path as an audit/display label and owns only the remote SFTP
+  handle.
+- A transfer is lease-authorized once before `TransferReady`, with no per-frame
+  re-check. A finite transfer already in flight may finish after the two-hour
+  idle or eight-hour absolute lease expiry; expiry blocks new operations, not
+  bytes in that stream.
+- SFTP replaces `russh-sftp`'s 10-second request default with the pinned
+  Tokio far-future deadline (roughly 30 years); do not restore the short
+  default, which breaks slow NAS operations.
+- `get` commits through a mode-`0600` temporary file and does not clobber by
+  default. `put` truncates the remote destination and is not atomic remotely.
+- Local forwards bind only loopback addresses. Remote (`-R`) forwarding stays
+  disabled until capability-specific approval exists.
+- Command-output spool persistence is bounded at 64 MiB per run, 64 MiB per
+  session directory, and 1 GiB globally across active-run reservations and
+  retained files. It is separate from SFTP and must not be described as an
+  SFTP cap or an unlimited/complete command-output archive.
+
+Any incompatible request, response, framing, or sequencing change must bump
+`WIRE_PROTOCOL_VERSION`, update both client and daemon handling, and add a
+mismatch/upgrade test. User-visible behavior changes must update README,
+command help, and the agent skill where relevant.
 
 If you're proposing a change in one of these areas, please open an issue or
 draft PR early so the design can be discussed before you invest in a full

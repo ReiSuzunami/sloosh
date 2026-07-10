@@ -15,6 +15,8 @@ out-of-band lease so the agent never sees a credential.
 
 ## Install
 
+Building from source requires Rust 1.88 or newer.
+
 ```
 cargo build --release
 # binary at target/release/sloosh — put it on your PATH
@@ -42,32 +44,49 @@ See `sloosh <command> --help` for the full flag reference on any subcommand.
 
 ## Security model
 
-- The daemon holds SSH credentials (in an encrypted vault); the agent
-  process never sees a password, key, or vault content — only host
-  aliases.
+- Agent-facing commands never receive an SSH password, private key, or vault
+  contents. The daemon uses the encrypted vault for SSH authentication; the
+  human-only `approve` command temporarily unlocks it in the approving CLI so
+  the human can inspect the complete grant before it is sent to the daemon.
 - Access is granted per-host via a **lease**, not a blanket unlock —
   requesting one host never authorizes another.
 - Bastion paths are first-class: `ProxyJump` chains (multi-hop) and
-  vault-level jump hosts are followed automatically, a lease request
-  expands to cover every hop on the path, and each vault-backed hop is
-  re-checked right before it's dialed.
+  vault-level jump hosts are followed automatically. During approval, the CLI
+  shows the fully-expanded host list and the daemon independently recomputes
+  it; a mismatch fails closed. Each vault-backed hop is re-checked before it
+  is dialed.
 - Leases are approved out of band, by a human, in a separate terminal —
   the agent cannot approve its own request.
 - A lease is bound to the requesting process's ancestry (PID + start
   time), so subagents spawned under an authorized agent inherit access
   automatically, with zero extra configuration.
-- Leases expire on idle timeout; expiry revokes host access but never
-  kills the underlying shell session, which reconnects cleanly once
-  access is re-approved. Port forwards are the one exception: a tunnel is
-  live network access, so it's torn down the moment its lease goes away.
+- Pending requests expire after 15 minutes and are dropped after five wrong
+  master-password attempts. Active leases expire after two idle hours or an
+  absolute eight hours, whichever comes first.
+- Lease expiry revokes access but does not kill an underlying shell session;
+  re-approval can attach to that session again. Port forwards are different:
+  they are live network access and are closed when their lease ends.
+- Vault mutations are serialized and replace the encrypted file atomically.
+  The sloosh state directory is mode `0700`; sockets, vault, logs, and spool
+  files are kept private with mode `0600` where applicable.
 
 ## How it works
 
 `sloosh` is a single binary that runs as both the CLI you invoke and a
 long-lived background daemon (`sloosh daemon run`), auto-started on first
-use. The CLI and daemon talk over a Unix domain socket (mode `0600`,
-same-user only) using a newline-delimited JSON protocol, so the exchange
-stays debuggable with plain tools like `nc -U`.
+use. The CLI and daemon communicate through a Unix domain socket inside a
+private directory. The daemon obtains the caller PID from kernel peer
+credentials; the CLI checks that the daemon peer has the same effective UID
+and resolves to the current sloosh executable. It then requires wire protocol
+version 2 before sending normal requests. The client checks `Status`, sends a
+versioned `Hello`, and waits for `ProtocolReady`; the daemon rejects ordinary
+requests until that handshake succeeds, before request side effects begin.
+
+Protocol 2 uses bounded newline-delimited JSON for control messages and
+switches to bounded, length-prefixed raw frames for SFTP bytes. These checks
+protect against another OS user and an obvious wrong-daemon socket. They do
+not defend against hostile code already running as the same UID, and the
+executable-path check is not code signing.
 
 The daemon keeps one persistent PTY shell per host session alive on the
 remote end — `cd`, exported environment variables, and background jobs
@@ -81,12 +100,40 @@ those markers (and ANSI noise) before anything reaches you.
 Access to a host is never implicit. An agent calls `sloosh request <host>`,
 which prints an approval command; a human runs that command in a
 *separate* terminal and enters the vault's master password to grant a
-time-limited lease. The daemon uses kernel-level peer credentials
-(`SO_PEERCRED`/`LOCAL_PEERPID`) to identify the calling process's ancestry
-and binds the lease to it, so subagents spawned by an already-authorized
-agent inherit access automatically — with zero extra configuration — while
-credentials themselves never leave the vault or cross into agent-visible
-output.
+time-limited lease. Approval displays the final `ProxyJump`-expanded host
+list before activation. First-use host-key confirmation follows the configured
+`ProxyJump` route and prompts in dependency order, so each bastion is trusted
+before it is used to reach a later target.
+
+### File transfer and output limits
+
+`put` and `get` open an SFTP channel on the session's existing authenticated
+SSH connection. The CLI, not the daemon, owns local filesystem access. File
+bytes cross the local socket in raw frames of at most 1 MiB, but a transfer
+may contain any number of frames: there is no total file-size limit.
+
+The daemon authorizes a transfer once during setup, before `TransferReady`, and
+does not re-check the lease per frame. After `TransferReady`, a finite transfer
+is allowed to finish even if its lease later reaches the two-hour idle or
+eight-hour absolute expiry; expiry still blocks every new operation. This
+prevents lease duration from becoming an implicit NAS file-size limit.
+Sloosh replaces `russh-sftp`'s default 10-second per-request timeout with
+Tokio's far-future deadline (roughly 30 years in the pinned release). This is
+operationally unbounded for NAS reads, writes, opens, and closes, while SSH,
+server, filesystem, and network failures still end the transfer.
+
+- `put` creates or truncates the remote destination before streaming. It is
+  not an atomic remote replacement; a failed transfer can leave a partial
+  remote file.
+- `get` writes a mode-`0600` temporary file beside the destination and commits
+  it only after the full transfer succeeds. It refuses to replace an existing
+  local file unless `--force` is given.
+- A command reply returns at most about 30,000 characters. Raw command output
+  is retained in a spool file up to 64 MiB per run, with a 64 MiB retention
+  budget per session directory and a 1 GiB global budget shared by active-run
+  reservations and retained files; a marker records when per-run persistence
+  hits its limit, and older retained files are removed first. These spool
+  limits apply only to command output, not SFTP transfers.
 
 For the full design (wire protocol, session/output model, audit log, vault
 crypto), see [`DESIGN.md`](./DESIGN.md) (the authoritative design document,
@@ -112,9 +159,9 @@ reference on any of them.
 | `add` | Add a credential to the vault. Interactive and human-only: there is no flag to pass a secret. |
 | `rm` | Remove a credential from the vault. |
 | `vault` | Manage the credential vault itself (e.g. first-time initialization). |
-| `put` | Upload a local file to a host over SFTP. |
-| `get` | Download a remote file from a host over SFTP. |
-| `forward` | Open a lease-gated `-L`/`-R` port forward through a host; `forward ls` and `forward stop` manage them. |
+| `put` | Stream a local file to a remote path over SFTP; the remote destination is truncated first. |
+| `get` | Stream a remote file to an atomic local download; refuses to overwrite unless `--force` is used. |
+| `forward` | Open a lease-gated, loopback-only `-L` forward; `-R` is currently disabled. `forward ls` and `forward stop` manage live forwards. |
 | `status` | Show daemon/session/lease status — the anchor command when unsure what's going on. |
 | `daemon` | Manage the sloosh daemon process directly (normally auto-started on demand). |
 | `log` | Show the audit log. |
@@ -160,27 +207,23 @@ cp -r skills/sloosh ~/.agents/skills/sloosh   # Codex (and other .agents/skills 
 ## Development
 
 ```
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo +1.88.0 check --all-targets --locked
 ```
 
-All three gates (tests, clippy, fmt) must pass cleanly; they're what CI
-runs on every PR.
+All four gates must pass cleanly. CI runs formatting and clippy on stable
+Rust, non-live tests on Linux and macOS, an explicit Rust 1.88 MSRV check,
+and live session/SFTP/forward tests against a local Linux sshd.
 
 Most of the test suite runs without any external dependency. The
-integration tests in `tests/ssh_session.rs`, `tests/forward.rs`, and
-`tests/proxy_jump.rs` exercise a real SSH host end-to-end (sessions,
-tunnels, and vault-backed jump chains respectively) and are gated behind
-environment variables so they don't run (or hang) in CI/sandboxes by
-default:
+live integration tests are gated behind environment variables:
 
 ```
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --test sftp_transfer -- --test-threads=1
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
-# proxy_jump additionally needs the host's SSH password (it builds a
-# throwaway vault to exercise password auth through the chain):
 SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
   cargo test --test proxy_jump -- --test-threads=1
 ```
@@ -189,8 +232,9 @@ SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
 `user@host`/`host`. Single-threaded is required — each test points
 `$SLOOSH_HOME` at its own temp directory, and that isolation (which keeps
 the run from ever touching your real `~/.sloosh/vault`) only holds with one
-test running at a time. See the module doc comment in
-[`tests/ssh_session.rs`](./tests/ssh_session.rs) for details.
+test running at a time. Hosted CI runs the first three live suites. The
+password-authenticated `proxy_jump` suite remains manual because enabling
+password authentication on a shared runner's system sshd would be too broad.
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full contribution flow,
 including which areas of the codebase get extra review scrutiny.

@@ -15,6 +15,11 @@ use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::io;
 
+/// Maximum payload in one raw stream frame. Streams may contain any number
+/// of frames, so this bounds per-allocation memory without limiting total
+/// transfer size.
+pub const MAX_RAW_FRAME_BYTES: usize = 1024 * 1024;
+
 /// A connected local IPC channel, client or server side.
 ///
 /// Lease anchoring (DESIGN.md §4) depends on knowing which process is on the
@@ -36,6 +41,16 @@ pub trait Channel: Send {
     fn recv<T>(&mut self) -> impl Future<Output = io::Result<Option<T>>> + Send
     where
         T: DeserializeOwned;
+
+    /// Write one raw stream frame after an NDJSON message. Wire format is a
+    /// four-byte big-endian unsigned length followed by that many bytes. A
+    /// zero-length frame marks end-of-stream.
+    fn send_raw_frame(&mut self, frame: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Read one raw stream frame from the same buffered reader used by
+    /// [`Channel::recv`]. `Ok(None)` is the zero-length end-of-stream frame;
+    /// transport EOF remains an error.
+    fn recv_raw_frame(&mut self) -> impl Future<Output = io::Result<Option<Vec<u8>>>> + Send;
 }
 
 /// Outcome of trying to bind the well-known socket path.

@@ -29,7 +29,24 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  # Keep Cargo.toml's rust-version honest. Stable-only CI cannot catch use
+  # of language or standard-library features newer than the declared MSRV.
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+
+      - name: cargo check --all-targets --all-features
+        run: cargo check --all-targets --all-features --locked
 
   # Unit + non-live integration tests (`cargo test` skips anything gated
   # behind SLOOSH_TEST_SSH_HOST, see the `live-ssh` job below) on both
@@ -53,11 +70,12 @@ jobs:
       - name: cargo test
         run: cargo test
 
-  # Exercises tests/ssh_session.rs and tests/sftp_transfer.rs against a real
-  # sshd, since they're skipped entirely by the `test` job above whenever
-  # SLOOSH_TEST_SSH_HOST is unset. Runs sshd on the runner itself (no Docker
-  # needed) and points sloosh at it via an ~/.ssh/config alias, the same way
-  # a developer would point it at any other host.
+  # Exercises tests/ssh_session.rs, tests/sftp_transfer.rs, and
+  # tests/forward.rs against a real sshd, since they're skipped entirely by
+  # the `test` job above whenever SLOOSH_TEST_SSH_HOST is unset. Runs sshd on
+  # the runner itself (no Docker needed) and points sloosh at it via an
+  # ~/.ssh/config alias, the same way a developer would point it at any other
+  # host.
   live-ssh:
     name: Live SSH integration tests
     runs-on: ubuntu-latest
@@ -116,4 +134,11 @@ jobs:
         run: SLOOSH_TEST_SSH_HOST=citest cargo test --test ssh_session -- --test-threads=1
 
       - name: Run live SFTP transfer integration tests
-        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test sftp_transfer -- --test-threads=1
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --features integration-test-hooks --test sftp_transfer -- --test-threads=1
+
+      - name: Run live port-forward integration tests
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test forward -- --test-threads=1
+
+      # tests/proxy_jump.rs additionally requires password SSH auth. Keep it
+      # out of hosted-runner CI until the job uses an isolated localhost-only
+      # sshd; enabling passwords on the runner's system sshd is too broad.

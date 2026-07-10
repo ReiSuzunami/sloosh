@@ -43,14 +43,14 @@ pub mod ssh;
 pub mod vault;
 
 use crate::proto::{self, Request, Response};
-use crate::transport::BindOutcome;
-use crate::transport::Channel;
 use crate::transport::unix;
+use crate::transport::{BindOutcome, Channel, MAX_RAW_FRAME_BYTES};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 /// Self-teaching error for a host-touching request with no matching lease
 /// (DESIGN.md §4, §7).
@@ -98,6 +98,7 @@ async fn require_lease(
 pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     let start = Instant::now();
     let pid = std::process::id();
+    unix::ensure_private_dir(&unix::sloosh_home())?;
 
     let listener = match unix::bind(&socket_path)? {
         BindOutcome::Bound(listener) => listener,
@@ -115,6 +116,7 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     // sessions (a no-op in a real daemon process; see `reset_registry`).
     session::reset_registry().await;
     session::spawn_idle_reaper();
+    lease::spawn_reaper();
     forward::reset_registry().await;
     forward::spawn_reaper();
 
@@ -160,6 +162,7 @@ async fn handle_connection(
     shutdown_tx: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let peer = chan.peer_pid().unwrap_or(None);
+    let mut negotiated = false;
     debug!(?peer, "connection accepted");
 
     loop {
@@ -168,18 +171,38 @@ async fn handle_connection(
             debug!(?peer, "connection closed by peer");
             break;
         };
-        debug!(?req, ?peer, "request received");
+        debug!(request_type = req.kind(), ?peer, "request received");
 
         match req {
             Request::Status => {
                 let reply = proto::StatusReply {
                     pid,
                     version: env!("CARGO_PKG_VERSION").to_string(),
+                    wire_protocol: proto::WIRE_PROTOCOL_VERSION,
                     uptime_secs: start.elapsed().as_secs(),
                     sessions: session::list_summaries().await,
                     leases: lease::list_summaries().await,
                 };
                 chan.send(&Response::Status(reply)).await?;
+            }
+            Request::Hello { wire_protocol } => {
+                if wire_protocol == proto::WIRE_PROTOCOL_VERSION {
+                    negotiated = true;
+                    chan.send(&Response::ProtocolReady {
+                        wire_protocol: proto::WIRE_PROTOCOL_VERSION,
+                    })
+                    .await?;
+                } else {
+                    negotiated = false;
+                    chan.send(&Response::Error {
+                        message: format!(
+                            "incompatible wire protocol {wire_protocol}; this daemon requires {}. \
+                             Run `sloosh daemon stop`, then retry with a matching CLI/daemon binary",
+                            proto::WIRE_PROTOCOL_VERSION
+                        ),
+                    })
+                    .await?;
+                }
             }
             Request::Shutdown => {
                 chan.send(&Response::Ok).await?;
@@ -187,6 +210,17 @@ async fn handle_connection(
                 // accept loop is already gone.
                 let _ = shutdown_tx.send(true);
                 break;
+            }
+            ref request if !negotiated => {
+                chan.send(&Response::Error {
+                    message: format!(
+                        "wire protocol handshake required before {}; use a matching sloosh CLI \
+                         that sends Hello protocol {}",
+                        request.kind(),
+                        proto::WIRE_PROTOCOL_VERSION
+                    ),
+                })
+                .await?;
             }
             Request::Run {
                 host,
@@ -365,22 +399,51 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
-                let resp = match require_lease(peer, &host, &lease_token).await {
-                    Err(denied) => denied,
-                    Ok(()) => {
-                        let lease_ctx = ssh::LeaseContext {
-                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
-                            lease_token: lease_token.clone(),
-                        };
-                        match session::put(&host, session, &local_path, &remote_path, lease_ctx)
-                            .await
-                        {
-                            Ok(reply) => Response::Transfer(reply),
-                            Err(e) => Response::Error {
+                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
+                    chan.send(&denied).await?;
+                    continue;
+                }
+                let caller_pid = peer.expect("require_lease Ok implies peer is Some");
+                let lease_ctx = ssh::LeaseContext {
+                    caller_pid,
+                    lease_token: lease_token.clone(),
+                };
+                let mut upload =
+                    match session::begin_put(&host, session, &local_path, &remote_path, lease_ctx)
+                        .await
+                    {
+                        Ok(upload) => upload,
+                        Err(e) => {
+                            chan.send(&Response::Error {
                                 message: e.to_string(),
-                            },
+                            })
+                            .await?;
+                            continue;
                         }
+                    };
+                chan.send(&Response::TransferReady).await?;
+
+                // A transfer is one finite operation authorized at start,
+                // like `run`: lease expiry blocks new operations but does not
+                // impose a time-derived size cap on an in-flight NAS copy.
+                let mut stream_error = None;
+                while let Some(chunk) = chan.recv_raw_frame().await? {
+                    let chunk = Zeroizing::new(chunk);
+                    if stream_error.is_some() {
+                        continue;
                     }
+                    if let Err(e) = upload.write_chunk(&chunk).await {
+                        stream_error = Some(e.to_string());
+                    }
+                }
+                let resp = match stream_error {
+                    Some(message) => Response::Error { message },
+                    None => match upload.finish().await {
+                        Ok(reply) => Response::Transfer(reply),
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
                 };
                 chan.send(&resp).await?;
             }
@@ -389,32 +452,46 @@ async fn handle_connection(
                 remote_path,
                 local_path,
                 session,
-                force,
                 lease_token,
             } => {
-                let resp = match require_lease(peer, &host, &lease_token).await {
-                    Err(denied) => denied,
-                    Ok(()) => {
-                        let lease_ctx = ssh::LeaseContext {
-                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
-                            lease_token: lease_token.clone(),
-                        };
-                        match session::get(
-                            &host,
-                            session,
-                            &remote_path,
-                            &local_path,
-                            force,
-                            lease_ctx,
-                        )
+                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
+                    chan.send(&denied).await?;
+                    continue;
+                }
+                let caller_pid = peer.expect("require_lease Ok implies peer is Some");
+                let lease_ctx = ssh::LeaseContext {
+                    caller_pid,
+                    lease_token: lease_token.clone(),
+                };
+                let mut download =
+                    match session::begin_get(&host, session, &remote_path, &local_path, lease_ctx)
                         .await
-                        {
-                            Ok(reply) => Response::Transfer(reply),
-                            Err(e) => Response::Error {
+                    {
+                        Ok(download) => download,
+                        Err(e) => {
+                            chan.send(&Response::Error {
                                 message: e.to_string(),
-                            },
+                            })
+                            .await?;
+                            continue;
                         }
+                    };
+                chan.send(&Response::TransferReady).await?;
+
+                // Keep the start-time grant for the complete stream. New
+                // transfers after expiry still fail at `require_lease` above.
+                let mut buffer = Zeroizing::new(vec![0u8; MAX_RAW_FRAME_BYTES]);
+                let stream_error = loop {
+                    match download.read_chunk(buffer.as_mut_slice()).await {
+                        Ok(0) => break None,
+                        Ok(read) => chan.send_raw_frame(&buffer[..read]).await?,
+                        Err(e) => break Some(e.to_string()),
                     }
+                };
+                chan.send_raw_frame(&[]).await?;
+                let resp = match stream_error {
+                    Some(message) => Response::Error { message },
+                    None => Response::Transfer(download.finish()),
                 };
                 chan.send(&resp).await?;
             }
@@ -513,6 +590,7 @@ async fn handle_connection(
             Request::ApproveLease {
                 id,
                 master_password,
+                approved_hosts,
             } => {
                 let Some(approver_pid) = peer else {
                     chan.send(&Response::Error {
@@ -528,6 +606,7 @@ async fn handle_connection(
                     approver_pid,
                     &id,
                     master_password.expose_secret().as_bytes(),
+                    &approved_hosts,
                 )
                 .await
                 {

@@ -3,18 +3,21 @@
 //! Same gating and isolation story as `tests/ssh_session.rs`: these need a
 //! real, reachable SSH host, so they're gated behind `SLOOSH_TEST_SSH_HOST`
 //! and skip cleanly (pass trivially) when it's unset. To exercise for real:
-//! `SLOOSH_TEST_SSH_HOST=myhost cargo test --test sftp_transfer --
-//! --test-threads=1` (single-threaded for the same `$SLOOSH_HOME`-isolation
+//! `SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks
+//! --test sftp_transfer -- --test-threads=1` (single-threaded for the same
+//! `$SLOOSH_HOME`-isolation
 //! reason as the other live-SSH test file).
 //!
 //! The remote side of each test writes under `/tmp` and cleans up after
 //! itself via a `run` cleanup command — these tests must never depend on or
 //! disturb anything else on the target host.
 
+#[cfg(feature = "integration-test-hooks")]
+use sloosh::daemon::session;
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{Request, Response};
-use sloosh::transport::Channel;
+use sloosh::proto::{Request, Response, TransferReply, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::unix::UnixChannel;
+use sloosh::transport::{Channel, MAX_RAW_FRAME_BYTES};
 
 fn test_host() -> Option<String> {
     std::env::var("SLOOSH_TEST_SSH_HOST")
@@ -23,11 +26,19 @@ fn test_host() -> Option<String> {
 }
 
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "sloosh-sftp-itest-{tag}-{}-{}.sock",
+    let dir = std::env::temp_dir().join(format!(
+        "sloosh-sftp-itest-{tag}-{}-{}",
         std::process::id(),
         tag.len()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    dir.join("sloosh.sock")
 }
 
 fn set_test_home(tag: &str) -> std::path::PathBuf {
@@ -69,7 +80,20 @@ async fn grant_lease_for_test(host: &str) {
 async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(path).await {
+        if let Ok(mut chan) = UnixChannel::connect(path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;
@@ -90,59 +114,269 @@ async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf
     (chan, socket_path)
 }
 
-/// A local temp file with `contents` written to it, cleaned up on drop.
-struct LocalTempFile {
-    path: std::path::PathBuf,
-}
-
-impl LocalTempFile {
-    fn new(tag: &str, contents: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "sloosh-sftp-itest-local-{tag}-{}-{}",
-            std::process::id(),
-            tag.len()
-        ));
-        std::fs::write(&path, contents).expect("write local temp file");
-        Self { path }
+async fn put_bytes(
+    chan: &mut UnixChannel,
+    host: &str,
+    local_label: &str,
+    remote_path: &str,
+    bytes: &[u8],
+) -> TransferReply {
+    chan.send(&Request::Put {
+        host: host.to_string(),
+        local_path: local_label.to_string(),
+        remote_path: remote_path.to_string(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send Put");
+    assert_eq!(
+        chan.recv::<Response>().await.unwrap(),
+        Some(Response::TransferReady)
+    );
+    for chunk in bytes.chunks(MAX_RAW_FRAME_BYTES) {
+        chan.send_raw_frame(chunk).await.expect("send upload frame");
     }
-
-    fn path_str(&self) -> String {
-        self.path.to_string_lossy().into_owned()
-    }
-}
-
-impl Drop for LocalTempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// A local temp path that does not exist yet (a `get` destination),
-/// removed on drop if it ends up created.
-struct LocalTempSlot {
-    path: std::path::PathBuf,
-}
-
-impl LocalTempSlot {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "sloosh-sftp-itest-slot-{tag}-{}-{}",
-            std::process::id(),
-            tag.len()
-        ));
-        let _ = std::fs::remove_file(&path);
-        Self { path }
-    }
-
-    fn path_str(&self) -> String {
-        self.path.to_string_lossy().into_owned()
+    chan.send_raw_frame(&[]).await.expect("send upload eof");
+    match chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("final Put reply")
+    {
+        Response::Transfer(reply) => reply,
+        other => panic!("expected Transfer, got {other:?}"),
     }
 }
 
-impl Drop for LocalTempSlot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+#[tokio::test]
+async fn put_then_get_crosses_multiple_raw_frames_without_total_limit() {
+    let Some(host) = test_host() else {
+        eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
+        return;
+    };
+    let (mut chan, _socket) = start_daemon("put-get-multiframe", &host).await;
+
+    // Cross the rejected design's former 32 MiB whole-transfer ceiling so a
+    // future aggregate cap cannot return unnoticed. Only each frame is
+    // bounded; the stream itself is not.
+    let payload_len = MAX_RAW_FRAME_BYTES * 33 + 257;
+    let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+    let remote_path = format!(
+        "/tmp/sloosh-sftp-itest-multiframe-{}.bin",
+        std::process::id()
+    );
+
+    let put_reply = put_bytes(
+        &mut chan,
+        &host,
+        "/virtual/multiframe-source",
+        &remote_path,
+        &payload,
+    )
+    .await;
+    assert_eq!(put_reply.bytes_transferred, payload_len as u64);
+
+    let (get_reply, downloaded) = get_bytes(
+        &mut chan,
+        &host,
+        &remote_path,
+        "/virtual/multiframe-destination",
+    )
+    .await;
+    assert_eq!(get_reply.bytes_transferred, payload_len as u64);
+    assert_eq!(downloaded, payload);
+
+    remote_rm(&mut chan, &host, &remote_path).await;
+}
+
+#[cfg(feature = "integration-test-hooks")]
+#[tokio::test]
+async fn in_flight_put_survives_lease_expiry_and_next_transfer_is_denied() {
+    let Some(host) = test_host() else {
+        eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
+        return;
+    };
+    let (mut chan, _socket) = start_daemon("put-expired-lease", &host).await;
+    let remote_path = format!(
+        "/tmp/sloosh-sftp-itest-expired-lease-{}.bin",
+        std::process::id()
+    );
+    let first = vec![0x41; MAX_RAW_FRAME_BYTES];
+    let second = vec![0x42; MAX_RAW_FRAME_BYTES];
+
+    chan.send(&Request::Put {
+        host: host.clone(),
+        local_path: "/virtual/lease-expiry-source".to_string(),
+        remote_path: remote_path.clone(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send Put");
+    assert_eq!(
+        chan.recv::<Response>().await.unwrap(),
+        Some(Response::TransferReady)
+    );
+    chan.send_raw_frame(&first).await.expect("send first frame");
+
+    lease::expire_active_leases_for_integration_test().await;
+
+    chan.send_raw_frame(&second)
+        .await
+        .expect("send frame after lease expiry");
+    chan.send_raw_frame(&[]).await.expect("send upload eof");
+    let completed = chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("final Put reply");
+    let Response::Transfer(reply) = completed else {
+        panic!("in-flight Put should complete after lease expiry, got {completed:?}");
+    };
+    assert_eq!(reply.bytes_transferred, (first.len() + second.len()) as u64);
+
+    chan.send(&Request::Get {
+        host: host.clone(),
+        remote_path: remote_path.clone(),
+        local_path: "/virtual/new-transfer".to_string(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send Get after lease expiry");
+    let denied = chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("lease denial reply");
+    let Response::Error { message } = denied else {
+        panic!("new transfer should be denied after lease expiry, got {denied:?}");
+    };
+    assert!(message.contains("lease"), "unexpected denial: {message}");
+
+    grant_lease_for_test(&host).await;
+    remote_rm(&mut chan, &host, &remote_path).await;
+}
+
+#[cfg(feature = "integration-test-hooks")]
+#[tokio::test]
+async fn in_flight_get_survives_lease_expiry_and_session_reaping() {
+    let Some(host) = test_host() else {
+        eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
+        return;
+    };
+    let (mut chan, _socket) = start_daemon("get-expired-lease", &host).await;
+    let remote_path = format!(
+        "/tmp/sloosh-sftp-itest-get-expired-lease-{}.bin",
+        std::process::id()
+    );
+    let payload_len = MAX_RAW_FRAME_BYTES * 4 + 257;
+    let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+    put_bytes(
+        &mut chan,
+        &host,
+        "/virtual/get-expiry-source",
+        &remote_path,
+        &payload,
+    )
+    .await;
+
+    chan.send(&Request::Get {
+        host: host.clone(),
+        remote_path: remote_path.clone(),
+        local_path: "/virtual/get-expiry-destination".to_string(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send Get");
+    assert_eq!(
+        chan.recv::<Response>().await.unwrap(),
+        Some(Response::TransferReady)
+    );
+    let first = chan
+        .recv_raw_frame()
+        .await
+        .expect("receive first download frame")
+        .expect("download must not be empty");
+    let mut downloaded = first;
+
+    lease::expire_active_leases_for_integration_test().await;
+    session::kill(&host, None)
+        .await
+        .expect("simulate the PTY idle reaper closing the reused session");
+
+    while let Some(chunk) = chan.recv_raw_frame().await.expect("download frame") {
+        downloaded.extend_from_slice(&chunk);
     }
+    let completed = chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("final Get reply");
+    let Response::Transfer(reply) = completed else {
+        panic!("in-flight Get should survive expiry/reaping, got {completed:?}");
+    };
+    assert_eq!(reply.bytes_transferred, payload.len() as u64);
+    assert_eq!(downloaded, payload);
+
+    chan.send(&Request::Get {
+        host: host.clone(),
+        remote_path: remote_path.clone(),
+        local_path: "/virtual/new-get".to_string(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send new Get after expiry");
+    let denied = chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("lease denial reply");
+    assert!(
+        matches!(&denied, Response::Error { message } if message.contains("lease")),
+        "new Get should be denied after lease expiry: {denied:?}"
+    );
+
+    grant_lease_for_test(&host).await;
+    remote_rm(&mut chan, &host, &remote_path).await;
+}
+
+async fn get_bytes(
+    chan: &mut UnixChannel,
+    host: &str,
+    remote_path: &str,
+    local_label: &str,
+) -> (TransferReply, Vec<u8>) {
+    chan.send(&Request::Get {
+        host: host.to_string(),
+        remote_path: remote_path.to_string(),
+        local_path: local_label.to_string(),
+        session: None,
+        lease_token: None,
+    })
+    .await
+    .expect("send Get");
+    assert_eq!(
+        chan.recv::<Response>().await.unwrap(),
+        Some(Response::TransferReady)
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chan.recv_raw_frame().await.expect("download frame") {
+        bytes.extend_from_slice(&chunk);
+    }
+    let reply = match chan
+        .recv::<Response>()
+        .await
+        .unwrap()
+        .expect("final Get reply")
+    {
+        Response::Transfer(reply) => reply,
+        other => panic!("expected Transfer, got {other:?}"),
+    };
+    (reply, bytes)
 }
 
 /// Ask the remote host to remove `path`, ignoring failures — best-effort
@@ -171,53 +405,23 @@ async fn put_then_get_round_trips_file_content() {
     let (mut chan, _socket) = start_daemon("put-get-roundtrip", &host).await;
 
     let payload = b"sloosh sftp round-trip test payload\n".to_vec();
-    let local_src = LocalTempFile::new("src", &payload);
     let remote_path = format!("/tmp/sloosh-sftp-itest-{}.txt", std::process::id());
 
-    chan.send(&Request::Put {
-        host: host.clone(),
-        local_path: local_src.path_str(),
-        remote_path: remote_path.clone(),
-        session: None,
-        lease_token: None,
-    })
-    .await
-    .expect("send Put");
-    let resp = chan.recv::<Response>().await.expect("recv").expect("some");
-    let Response::Transfer(put_reply) = resp else {
-        remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Transfer for Put, got {resp:?}");
-    };
+    let put_reply = put_bytes(&mut chan, &host, "/virtual/source", &remote_path, &payload).await;
     assert_eq!(put_reply.bytes_transferred, payload.len() as u64);
     assert_eq!(put_reply.host, host);
     assert_eq!(put_reply.remote_path, remote_path);
 
-    let local_dst = LocalTempSlot::new("dst");
-    chan.send(&Request::Get {
-        host: host.clone(),
-        remote_path: remote_path.clone(),
-        local_path: local_dst.path_str(),
-        session: None,
-        force: false,
-        lease_token: None,
-    })
-    .await
-    .expect("send Get");
-    let resp = chan.recv::<Response>().await.expect("recv").expect("some");
-    let Response::Transfer(get_reply) = resp else {
-        remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Transfer for Get, got {resp:?}");
-    };
+    let (get_reply, downloaded) =
+        get_bytes(&mut chan, &host, &remote_path, "/virtual/destination").await;
     assert_eq!(get_reply.bytes_transferred, payload.len() as u64);
-
-    let downloaded = std::fs::read(&local_dst.path).expect("read downloaded file");
     assert_eq!(downloaded, payload);
 
     remote_rm(&mut chan, &host, &remote_path).await;
 }
 
 #[tokio::test]
-async fn get_refuses_to_overwrite_existing_local_file_without_force() {
+async fn get_stream_never_writes_the_local_path_label() {
     let Some(host) = test_host() else {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
@@ -225,75 +429,33 @@ async fn get_refuses_to_overwrite_existing_local_file_without_force() {
     let (mut chan, _socket) = start_daemon("get-no-overwrite", &host).await;
 
     let remote_path = format!("/tmp/sloosh-sftp-itest-noforce-{}.txt", std::process::id());
-    // Bound to a variable: an unbound temporary would be dropped (deleting
-    // the file) at the end of the `send` statement, before the daemon task
-    // gets around to reading it.
-    let local_src = LocalTempFile::new("noforce-src", b"remote content");
-    chan.send(&Request::Put {
-        host: host.clone(),
-        local_path: local_src.path_str(),
-        remote_path: remote_path.clone(),
-        session: None,
-        lease_token: None,
-    })
-    .await
-    .expect("send Put");
-    let resp = chan.recv::<Response>().await.expect("recv");
-    let Some(Response::Transfer(_)) = resp else {
-        remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Transfer for Put, got {resp:?}");
-    };
+    put_bytes(
+        &mut chan,
+        &host,
+        "/virtual/source",
+        &remote_path,
+        b"remote content",
+    )
+    .await;
 
-    // The local destination already has content before the Get.
-    let local_dst = LocalTempFile::new("noforce-dst", b"pre-existing local content");
+    let local_dst = std::env::temp_dir().join(format!(
+        "sloosh-sftp-itest-local-label-{}",
+        std::process::id()
+    ));
+    std::fs::write(&local_dst, b"pre-existing local content").expect("write local label file");
 
-    chan.send(&Request::Get {
-        host: host.clone(),
-        remote_path: remote_path.clone(),
-        local_path: local_dst.path_str(),
-        session: None,
-        force: false,
-        lease_token: None,
-    })
-    .await
-    .expect("send Get");
-    let resp = chan.recv::<Response>().await.expect("recv").expect("some");
-    let Response::Error { message } = &resp else {
-        remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Error refusing the overwrite, got {resp:?}");
-    };
-    assert!(
-        message.contains("--force"),
-        "error should point at --force: {message}"
-    );
-    // Local file must be untouched.
-    let still_there = std::fs::read(&local_dst.path).expect("read local file");
+    let (_reply, downloaded) =
+        get_bytes(&mut chan, &host, &remote_path, &local_dst.to_string_lossy()).await;
+    assert_eq!(downloaded, b"remote content");
+    let still_there = std::fs::read(&local_dst).expect("read local file");
     assert_eq!(still_there, b"pre-existing local content");
 
-    // Retrying with force: true must succeed and overwrite it.
-    chan.send(&Request::Get {
-        host: host.clone(),
-        remote_path: remote_path.clone(),
-        local_path: local_dst.path_str(),
-        session: None,
-        force: true,
-        lease_token: None,
-    })
-    .await
-    .expect("send Get with force");
-    let resp = chan.recv::<Response>().await.expect("recv").expect("some");
-    let Response::Transfer(_) = &resp else {
-        remote_rm(&mut chan, &host, &remote_path).await;
-        panic!("expected Response::Transfer for forced Get, got {resp:?}");
-    };
-    let overwritten = std::fs::read(&local_dst.path).expect("read local file");
-    assert_eq!(overwritten, b"remote content");
-
+    let _ = std::fs::remove_file(&local_dst);
     remote_rm(&mut chan, &host, &remote_path).await;
 }
 
 #[tokio::test]
-async fn put_missing_local_file_is_a_self_teaching_error() {
+async fn put_treats_local_path_as_label_only() {
     let Some(host) = test_host() else {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
@@ -305,24 +467,21 @@ async fn put_missing_local_file_is_a_self_teaching_error() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&missing);
+    let remote_path = format!("/tmp/sloosh-sftp-itest-label-only-{}", std::process::id());
 
-    chan.send(&Request::Put {
-        host: host.clone(),
-        local_path: missing.to_string_lossy().into_owned(),
-        remote_path: "/tmp/sloosh-sftp-itest-should-not-be-created".to_string(),
-        session: None,
-        lease_token: None,
-    })
-    .await
-    .expect("send Put");
-    let resp = chan.recv::<Response>().await.expect("recv").expect("some");
-    let Response::Error { message } = &resp else {
-        panic!("expected Response::Error for a missing local file, got {resp:?}");
-    };
-    assert!(
-        message.contains("does not exist") || message.contains("not readable"),
-        "error should explain the local file is missing: {message}"
-    );
+    let reply = put_bytes(
+        &mut chan,
+        &host,
+        &missing.to_string_lossy(),
+        &remote_path,
+        b"label only",
+    )
+    .await;
+    assert_eq!(reply.bytes_transferred, 10);
+    let (_, downloaded) = get_bytes(&mut chan, &host, &remote_path, "/virtual/dst").await;
+    assert_eq!(downloaded, b"label only");
+
+    remote_rm(&mut chan, &host, &remote_path).await;
 }
 
 #[tokio::test]
@@ -333,16 +492,19 @@ async fn get_missing_remote_path_is_a_self_teaching_error() {
     };
     let (mut chan, _socket) = start_daemon("get-missing-remote", &host).await;
 
-    let local_dst = LocalTempSlot::new("missing-remote-dst");
+    let local_dst = std::env::temp_dir().join(format!(
+        "sloosh-sftp-itest-missing-remote-dst-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&local_dst);
     chan.send(&Request::Get {
         host: host.clone(),
         remote_path: format!(
             "/tmp/sloosh-sftp-itest-definitely-does-not-exist-{}",
             std::process::id()
         ),
-        local_path: local_dst.path_str(),
+        local_path: local_dst.to_string_lossy().into_owned(),
         session: None,
-        force: false,
         lease_token: None,
     })
     .await
@@ -356,7 +518,7 @@ async fn get_missing_remote_path_is_a_self_teaching_error() {
         "error should explain the remote path problem: {message}"
     );
     assert!(
-        !local_dst.path.exists(),
+        !local_dst.exists(),
         "a failed Get must not create the local destination"
     );
 }

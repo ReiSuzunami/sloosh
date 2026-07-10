@@ -1,5 +1,6 @@
-//! Port forwarding: `-L` (local) and `-R` (remote/reverse) tunnels through a
-//! leased host (DESIGN.md §6).
+//! Local (`-L`) port forwarding through a leased host (DESIGN.md §6).
+//! Remote (`-R`) specs still parse for compatibility, but creation is denied
+//! until capability-specific approval exists for exposing a remote listener.
 //!
 //! Each forward owns a dedicated [`ssh::Connection`], independent of any
 //! shell session's (`daemon::session`) — a tunnel's lifecycle is simpler
@@ -9,22 +10,21 @@
 //! torn down the moment the lease that justified it goes away.
 //!
 //! **Lease-expiry teardown** is driven by [`spawn_reaper`], a periodic sweep
-//! that re-checks every live forward's lease via [`lease::peek_authorized`],
+//! that re-checks every live forward's resolved [`lease::LeaseGrant`] via
+//! [`lease::peek_grant`],
 //! mirroring `session::spawn_idle_reaper`'s style rather than a push
 //! notification *from* `lease.rs`: this module already depends on `lease.rs`
-//! for the per-connection re-check (see `ssh::ForwardRoute` and the
-//! accept-loop below), so a `lease.rs -> forward.rs` dependency the other
-//! way would be a cycle. Polling reuses lease.rs's one authoritative expiry
-//! decision instead of duplicating it, at the cost of teardown lagging real
-//! expiry by up to [`REAP_SWEEP_INTERVAL`]. `-L` additionally re-checks on
-//! every accepted connection (belt-and-suspenders — the reaper alone already
-//! bounds the exposure window).
+//! for the accept-loop check below, so a `lease.rs -> forward.rs` dependency
+//! the other way would be a cycle. Polling reuses lease.rs's one authoritative
+//! expiry decision instead of duplicating it, at the cost of teardown lagging
+//! real expiry by up to [`REAP_SWEEP_INTERVAL`]. `-L` additionally re-checks
+//! on every accepted connection (belt-and-suspenders — the reaper alone
+//! already bounds the exposure window).
 //!
 //! **Idle refresh:** the sweep deliberately uses the non-touching
-//! `peek_authorized` — a poll that refreshed `last_used` would keep every
+//! `peek_grant` — a poll that refreshed `last_used` would keep every
 //! forward-backed lease alive forever. Only real traffic winds the idle
-//! clock: the accept-loop's per-connection `lease::check_authorized` (and
-//! the equivalent check on incoming `-R` connections) touches the lease,
+//! clock: the accept-loop's per-connection `lease::check_grant` touches the lease,
 //! matching `run`'s idle-refresh behavior (DESIGN.md §4).
 
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ use tracing::{info, warn};
 
 use crate::daemon::audit;
 use crate::daemon::lease;
-use crate::daemon::ssh::{self, ForwardRoute, LeaseContext, SshError};
+use crate::daemon::ssh::{self, LeaseContext, SshError};
 use crate::proto::ForwardSummary;
 
 /// How often [`spawn_reaper`] re-checks every live forward's lease
@@ -79,7 +79,7 @@ fn generate_forward_id() -> String {
 pub enum ForwardError {
     #[error(
         "invalid -L forward spec '{spec}' — expected `[bind_addr:]local_port:remote_host:remote_port` \
-         (e.g. `8080:127.0.0.1:80`, or `0.0.0.0:8080:127.0.0.1:80` to bind every local interface); \
+         (e.g. `8080:127.0.0.1:80`, or `127.0.0.2:8080:127.0.0.1:80`); \
          got {parts} colon-separated field(s), expected 3 or 4"
     )]
     BadLocalSpec { spec: String, parts: usize },
@@ -110,6 +110,27 @@ pub enum ForwardError {
     BadBindAddr { spec: String, addr: String },
 
     #[error(
+        "local forward bind address '{addr}' in spec '{spec}' is not loopback — sloosh currently \
+         permits `-L` listeners only on loopback (omit the bind address, or use 127.0.0.1). \
+         Exposing a tunnel to the LAN or public network needs capability-specific human approval, \
+         which is not implemented yet"
+    )]
+    NonLoopbackBind { spec: String, addr: String },
+
+    #[error(
+        "remote (`-R`) forwarding is temporarily disabled — it exposes a listener on the SSH \
+         server and needs capability-specific human approval that sloosh does not implement yet. \
+         Use a loopback-only `-L` forward when the service can be reached from the SSH host"
+    )]
+    RemoteForwardDisabled,
+
+    #[error(
+        "the lease that authorized host '{host}' ended while the forward was being created — \
+         request/approve a fresh lease, then retry"
+    )]
+    LeaseEnded { host: String },
+
+    #[error(
         "could not bind {addr} for the local forward — {source}. Something else may already be \
          listening on that port; pick a different local_port, or use 0 to let the OS choose one"
     )]
@@ -117,18 +138,6 @@ pub enum ForwardError {
         addr: SocketAddr,
         #[source]
         source: std::io::Error,
-    },
-
-    #[error(
-        "{host} refused to open the remote forward on port {port} — {source}. Its sshd may have \
-         `AllowTcpForwarding no` (or `no-port-forwarding` on the key), or something else on {host} \
-         may already be bound to that port"
-    )]
-    RemoteForwardRefused {
-        host: String,
-        port: u16,
-        #[source]
-        source: russh::Error,
     },
 
     #[error(
@@ -196,10 +205,19 @@ pub fn parse_local_spec(spec: &str) -> Result<LocalForwardSpec, ForwardError> {
             spec: spec.to_string(),
         });
     }
+    let bind_addr = bind.unwrap_or("127.0.0.1");
+    let bind_ip: IpAddr = bind_addr.parse().map_err(|_| ForwardError::BadBindAddr {
+        spec: spec.to_string(),
+        addr: bind_addr.to_string(),
+    })?;
+    if !bind_ip.is_loopback() {
+        return Err(ForwardError::NonLoopbackBind {
+            spec: spec.to_string(),
+            addr: bind_addr.to_string(),
+        });
+    }
     Ok(LocalForwardSpec {
-        bind_addr: bind
-            .map(str::to_string)
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        bind_addr: bind_addr.to_string(),
         local_port,
         remote_host: host.to_string(),
         remote_port,
@@ -241,14 +259,12 @@ pub fn parse_remote_spec(spec: &str) -> Result<RemoteForwardSpec, ForwardError> 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Direction {
     Local,
-    Remote,
 }
 
 impl Direction {
     fn as_str(self) -> &'static str {
         match self {
             Direction::Local => "L",
-            Direction::Remote => "R",
         }
     }
 }
@@ -278,8 +294,7 @@ struct ForwardEntry {
     spec: String,
     created_at: Instant,
     tunnel_count: Arc<AtomicUsize>,
-    caller_pid: u32,
-    lease_token: Option<String>,
+    grant: lease::LeaseGrant,
     /// Sent exactly once, by whichever caller (`stop`, or the reaper) wins
     /// the race to `remove` this entry from the registry — removal doubles
     /// as the single-consumption guard, so no separate `Option`/lock is
@@ -334,6 +349,12 @@ pub async fn create_local(
         .unwrap_or(spec.local_port);
     let listen_addr = format!("{}:{}", spec.bind_addr, actual_port);
 
+    let grant = lease::resolve_grant(lease_ctx.caller_pid, host, lease_ctx.lease_token.as_deref())
+        .await
+        .ok_or_else(|| ForwardError::LeaseEnded {
+            host: host.to_string(),
+        })?;
+
     // Connect *after* the bind succeeds, so a busy local port fails fast
     // without ever touching the network (DESIGN.md §7: cheap failures first).
     let conn = ssh::connect(host, &lease_ctx).await?;
@@ -349,8 +370,7 @@ pub async fn create_local(
         spec: spec_text.to_string(),
         created_at: Instant::now(),
         tunnel_count: tunnel_count.clone(),
-        caller_pid: lease_ctx.caller_pid,
-        lease_token: lease_ctx.lease_token.clone(),
+        grant: grant.clone(),
         stop_tx,
     };
     registry().lock().await.insert(id.clone(), entry);
@@ -369,8 +389,7 @@ pub async fn create_local(
         conn,
         spec.remote_host,
         spec.remote_port,
-        lease_ctx.caller_pid,
-        lease_ctx.lease_token,
+        grant,
         tunnel_count,
         closed_tx,
         closed_rx,
@@ -387,79 +406,14 @@ pub async fn create_local(
 }
 
 pub async fn create_remote(
-    host: &str,
+    _host: &str,
     spec_text: &str,
-    lease_ctx: LeaseContext,
+    _lease_ctx: LeaseContext,
 ) -> Result<Opened, ForwardError> {
-    let spec = parse_remote_spec(spec_text)?;
-    let tunnel_count = Arc::new(AtomicUsize::new(0));
-    let (closed_tx, closed_rx) = watch::channel(false);
-
-    let route = ForwardRoute {
-        local_host: spec.local_host.clone(),
-        local_port: spec.local_port,
-        caller_pid: lease_ctx.caller_pid,
-        lease_host: host.to_string(),
-        lease_token: lease_ctx.lease_token.clone(),
-        tunnel_count: tunnel_count.clone(),
-        closed: closed_rx.clone(),
-    };
-    let conn = ssh::connect_with_route(host, &lease_ctx, Some(route)).await?;
-
-    let bound_port = conn
-        .handle
-        .tcpip_forward(spec.bind_addr.clone(), spec.remote_port as u32)
-        .await
-        .map_err(|source| ForwardError::RemoteForwardRefused {
-            host: host.to_string(),
-            port: spec.remote_port,
-            source,
-        })?;
-    let actual_port = if spec.remote_port == 0 {
-        bound_port as u16
-    } else {
-        spec.remote_port
-    };
-    let listen_addr = format!("{}:{}", spec.bind_addr, actual_port);
-
-    let id = generate_forward_id();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let entry = ForwardEntry {
-        host: host.to_string(),
-        direction: Direction::Remote,
-        spec: spec_text.to_string(),
-        created_at: Instant::now(),
-        tunnel_count: tunnel_count.clone(),
-        caller_pid: lease_ctx.caller_pid,
-        lease_token: lease_ctx.lease_token.clone(),
-        stop_tx,
-    };
-    registry().lock().await.insert(id.clone(), entry);
-
-    audit::record(
-        "forward_opened",
-        serde_json::json!({
-            "id": id, "host": host, "direction": "R", "spec": spec_text,
-        }),
-    );
-
-    tokio::spawn(run_remote_forward(
-        id.clone(),
-        host.to_string(),
-        conn,
-        spec.bind_addr,
-        actual_port,
-        closed_tx,
-        stop_rx,
-    ));
-
-    Ok(Opened {
-        id,
-        host: host.to_string(),
-        direction: "R".to_string(),
-        spec: spec_text.to_string(),
-        listen_addr,
-    })
+    // Keep parsing active so malformed specs still get precise feedback and
+    // the syntax remains covered while capability-specific approval is built.
+    let _ = parse_remote_spec(spec_text)?;
+    Err(ForwardError::RemoteForwardDisabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +428,7 @@ async fn run_local_forward(
     conn: ssh::Connection,
     remote_host: String,
     remote_port: u16,
-    caller_pid: u32,
-    lease_token: Option<String>,
+    grant: lease::LeaseGrant,
     tunnel_count: Arc<AtomicUsize>,
     closed_tx: watch::Sender<bool>,
     closed_rx: watch::Receiver<bool>,
@@ -500,7 +453,7 @@ async fn run_local_forward(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer_addr)) => {
-                        if !lease::check_authorized(caller_pid, &host, lease_token.as_deref()).await {
+                        if !lease::check_grant(&grant).await {
                             registry().lock().await.remove(&id);
                             break StopReason::LeaseExpired;
                         }
@@ -557,48 +510,6 @@ async fn run_local_tunnel(
             );
         }
     }
-}
-
-async fn run_remote_forward(
-    id: String,
-    host: String,
-    conn: ssh::Connection,
-    bind_addr: String,
-    remote_port: u16,
-    closed_tx: watch::Sender<bool>,
-    mut stop_rx: oneshot::Receiver<StopReason>,
-) {
-    let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
-    health.tick().await; // consume the immediate first tick
-
-    let reason = loop {
-        tokio::select! {
-            biased;
-            stop_msg = &mut stop_rx => {
-                break stop_msg.unwrap_or(StopReason::ConnectionLost);
-            }
-            _ = health.tick() => {
-                if conn.handle.is_closed() {
-                    registry().lock().await.remove(&id);
-                    break StopReason::ConnectionLost;
-                }
-            }
-        }
-    };
-
-    let _ = closed_tx.send(true);
-    // Best-effort: if the connection already died, cancelling the forward
-    // request on it will simply fail too — nothing left to clean up remotely.
-    let _ = conn
-        .handle
-        .cancel_tcpip_forward(bind_addr, remote_port as u32)
-        .await;
-    drop(conn);
-    audit::record(
-        "forward_stopped",
-        serde_json::json!({"id": id, "reason": reason.as_str()}),
-    );
-    info!(id = %id, host = %host, reason = reason.as_str(), "forward stopped");
 }
 
 // ---------------------------------------------------------------------------
@@ -658,24 +569,17 @@ pub fn spawn_reaper() {
 }
 
 async fn reap_expired_leases() {
-    let candidates: Vec<(String, String, u32, Option<String>)> = {
+    let candidates: Vec<(String, lease::LeaseGrant)> = {
         let reg = registry().lock().await;
         reg.iter()
-            .map(|(id, e)| {
-                (
-                    id.clone(),
-                    e.host.clone(),
-                    e.caller_pid,
-                    e.lease_token.clone(),
-                )
-            })
+            .map(|(id, e)| (id.clone(), e.grant.clone()))
             .collect()
     };
-    for (id, host, caller_pid, lease_token) in candidates {
+    for (id, grant) in candidates {
         // peek, not check: this sweep must observe the idle clock, not wind
         // it — polling through the touching variant would keep every
         // forward-backed lease alive forever.
-        if !lease::peek_authorized(caller_pid, &host, lease_token.as_deref()).await {
+        if !lease::peek_grant(&grant).await {
             let entry = registry().lock().await.remove(&id);
             if let Some(entry) = entry {
                 let _ = entry.stop_tx.send(StopReason::LeaseExpired);
@@ -701,11 +605,23 @@ mod tests {
 
     #[test]
     fn parses_local_spec_with_explicit_bind_addr() {
-        let s = parse_local_spec("0.0.0.0:8080:127.0.0.1:80").unwrap();
-        assert_eq!(s.bind_addr, "0.0.0.0");
+        let s = parse_local_spec("127.0.0.2:8080:127.0.0.1:80").unwrap();
+        assert_eq!(s.bind_addr, "127.0.0.2");
         assert_eq!(s.local_port, 8080);
         assert_eq!(s.remote_host, "127.0.0.1");
         assert_eq!(s.remote_port, 80);
+    }
+
+    #[test]
+    fn rejects_local_spec_bound_beyond_loopback() {
+        for spec in [
+            "0.0.0.0:8080:127.0.0.1:80",
+            "192.168.1.20:8080:127.0.0.1:80",
+        ] {
+            let e = parse_local_spec(spec).unwrap_err();
+            assert!(matches!(e, ForwardError::NonLoopbackBind { .. }));
+            assert!(e.to_string().contains("capability-specific"));
+        }
     }
 
     #[test]
@@ -790,6 +706,24 @@ mod tests {
         assert!(matches!(e, ForwardError::EmptyHost { .. }));
     }
 
+    #[tokio::test]
+    async fn remote_forward_is_rejected_before_network_access() {
+        let result = create_remote(
+            "box",
+            "9000:127.0.0.1:3000",
+            LeaseContext {
+                caller_pid: 1,
+                lease_token: None,
+            },
+        )
+        .await;
+        let Err(e) = result else {
+            panic!("remote forwarding must remain disabled");
+        };
+        assert!(matches!(e, ForwardError::RemoteForwardDisabled));
+        assert!(e.to_string().contains("capability-specific"));
+    }
+
     // -- id generation -------------------------------------------------
 
     #[test]
@@ -811,8 +745,7 @@ mod tests {
             spec: "8080:127.0.0.1:80".to_string(),
             created_at: Instant::now(),
             tunnel_count: Arc::new(AtomicUsize::new(0)),
-            caller_pid: 1,
-            lease_token: None,
+            grant: lease::LeaseGrant::invalid_for_test(host),
             stop_tx,
         };
         registry().lock().await.insert(id.to_string(), entry);

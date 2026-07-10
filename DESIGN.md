@@ -1,137 +1,228 @@
-# sloosh — ssh-in-the-loop 设计定案
+# sloosh 设计与实现状态
 
-面向 Coding Agent 的 SSH 操作工具。解决两个核心痛点：
+本文描述当前代码的真实行为。安全边界见 [`SECURITY.md`](SECURITY.md)，线协议见
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md)，英文架构说明见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-1. **状态持久化**：Agent 的 shell 调用通常单次有效，跨调用丢失 cwd / 环境变量 / 后台任务；
-2. **凭据隔离**：Agent 在不接触任何连接凭证的前提下操作远程主机，授权由人类带外批准（human-in-the-loop）。
+## 1. 目标与边界
 
-命名：二进制 `sloosh`，repo `ssh-in-the-loop`（crates.io / Homebrew / GitHub 均已查证无撞车，2026-07）。
+`sloosh` 面向需要连续 SSH 状态的 Coding Agent：
 
----
+- daemon 维持远端 SSH 连接和 PTY shell，使 cwd、环境变量和后台进程跨 CLI 调用保留。
+- 人类在独立终端批准按主机划分的 lease。Agent 不需要持有 vault 主密码或 SSH 密码。
+- 本地文件访问留在 CLI 进程；daemon 只持有远端 SFTP 文件句柄。
+- 所有本地进程仍处于同一 OS 用户边界。它不是同 UID 恶意代码的强隔离沙箱。
 
-## 1. 架构总览
+当前支持 macOS 和 Linux。Windows Named Pipe 与 Windows 进程树实现尚未提供。
 
+## 2. 组件与数据所有权
+
+```text
+Coding Agent / human terminal
+             |
+             v
++----------------------- sloosh CLI -----------------------+
+| arguments, TTY prompts, protocol check, local file I/O  |
+| temporary approval-time vault read and host-key probes  |
++--------------------------+-------------------------------+
+                           |
+                           | Unix domain socket
+                           | NDJSON control + raw frames
+                           v
++---------------------- sloosh daemon ---------------------+
+| peer PID, lease state, vault writer/cache, audit         |
+| SSH connections, PTY sessions, spool, remote SFTP       |
+| loopback-only local forwards                             |
++--------------------------+-------------------------------+
+                           |
+                           v
+                    SSH / SFTP servers
 ```
-┌─────────────┐   spawn    ┌──────────────┐
-│ Coding Agent│──────────▶ │ sloosh (CLI) │──── UDS / Named Pipe ───┐
-└─────────────┘            └──────────────┘      NDJSON 协议        │
-                                                                    ▼
-┌─────────────┐            ┌──────────────┐            ┌────────────────────┐
-│ 人类（另一个 │──────────▶ │ sloosh       │───────────▶│ sloosh daemon      │
-│ 终端窗口）   │  approve   │ approve/add  │            │ · SSH 连接池 (russh)│
-└─────────────┘            └──────────────┘            │ · 持久 PTY 会话     │
-                                                       │ · vault（主密码加密）│
-                                                       │ · 租约管理          │
-                                                       │ · 审计日志          │
-                                                       └────────────────────┘
-```
 
-- **接口形态**：CLI + Skill。理由：CLI 是 Agent 驾驭能力最强、零配置、可组合的接口；Skill 按需载入近零上下文成本。MCP 二期可作薄皮。
-- **daemon 常驻、脱离 Agent 生命周期**：Agent 崩溃/重启不丢 SSH 状态，多 Agent 可共享连接。stdio 型 MCP Server 随 Agent 死亡，因此不采用。
-- **单二进制**：daemon 即 `sloosh daemon run` 子命令；CLI 发现 socket 不可用时 fork 自身自动拉起（bind 原子性解并发竞态）。显式 `daemon start/stop/status` 留作调试。自动拉起不扩大攻击面——vault 仍锁、租约仍需人批。
+CLI 和 daemon 是同一个二进制的不同子命令。普通 CLI 请求会连接常驻 daemon；若 socket
+不存在，CLI 自动启动 `sloosh daemon run`。daemon 重启会终止会话、forward、pending
+request 和 active lease。
 
-## 2. 技术选型
+## 3. 本地传输与 protocol 2
 
-| 组件 | 选择 | 决定性依据 |
+当前线协议版本是 `2`：
+
+- 控制消息为单行 NDJSON，包含结尾换行后最大 1 MiB。
+- `Put`/`Get` 在 `TransferReady` 后切换为 raw frame。
+- raw frame 为 4-byte big-endian `u32` 长度，加对应字节；长度 `0` 表示流结束。
+- 单个 raw frame 最大 1 MiB；一个流可包含任意数量 frame，所以协议不限制文件总大小。
+- 普通 CLI 先发送 `Status` 并要求 `wire_protocol == 2`，再发送
+  `Hello { wire_protocol: 2 }`；daemon 回复 `ProtocolReady { wire_protocol: 2 }` 后，该连接
+  才能发送普通请求。
+- daemon 对每条连接维护协商状态。协商前仅允许 `Status`、`Hello`、`Shutdown`；其他请求
+  在任何请求级副作用前返回错误。错误版本的 `Hello` 不会打开门禁。
+
+NDJSON 控制部分仍可人工查看，但 `nc -U` 不能代表完整客户端：它不执行 daemon 身份
+校验，也不会自动完成 `Status`/`Hello` 门禁、raw framing 或传输状态机。协议不是“所有
+功能都能用一行 nc 调试”的接口。
+
+CLI 连接后验证 socket 对端 eUID 与当前 `sloosh` 的 canonical executable path。daemon
+通过内核 peer credentials 获取客户端 PID。该校验减少误连和简单 socket 冒充，但不解决
+同 UID 进程注入、同路径二进制替换或进程调试。
+
+## 4. Lease 与批准流程
+
+### 4.1 请求和身份锚定
+
+`sloosh request <host>...` 创建 pending request。daemon 从 UDS peer PID 向上遍历进程树，
+选择一个 `(PID, process start time)` anchor。后续调用只要 ancestry 中包含该同一进程实例，
+即可继承 lease；PID start time 防止简单 PID 复用。`SLOOSH_LEASE` token 是进程树断裂时的
+bearer-token 逃生路径。
+
+Lease 范围是主机别名集合，不是命令级权限。对一个 host 的 lease 可用于该 host 上的
+session 操作、SFTP 和当前允许的 forward。
+
+### 4.2 ProxyJump 的 fail-closed 批准
+
+批准分两次独立解析：
+
+1. request 时 daemon 展开当时可见的 `ProxyJump` 链并建立 pending request。
+2. 人类 CLI 提示主密码，在自己的短期 vault cache 中重新展开完整链，显示精确 host 列表并
+   要求人类确认。
+3. CLI 发送 `ApproveLease { approved_hosts, ... }`。
+4. daemon 用同一主密码解锁自己的 vault cache，再独立展开一次。
+5. 两个有序列表必须完全相同；否则拒绝激活，pending request 保留。
+
+此流程覆盖 request 时 vault 尚锁定、vault-only jump 尚不可见的情况。连接时，每个使用
+vault 凭据的 jump alias 仍会再次检查 lease。
+
+首次 host key 确认按依赖顺序执行：先 jump，再 target。后续 target probe 通过已经验证并
+认证的 jump route 建立 `direct-tcpip`。未知最终 target 只完成 key exchange 以读取 key，
+不会认证；人类确认 fingerprint 后才写入 `~/.sloosh/known_hosts`。拒绝或 probe 失败不会
+自动信任，实际 SSH 连接继续 fail closed。
+
+### 4.3 生命周期
+
+- pending request: 15 分钟后过期。
+- active lease idle timeout: 2 小时。命中的真实操作刷新 idle clock。
+- active lease absolute lifetime: 8 小时。持续使用也不能延长。
+- lease reaper: 每 60 秒扫描一次；API 调用也会先同步 prune。
+- 最后一个 lease 消失后，daemon 清空并 zeroize vault cache。后台扫描带来最多约 60 秒的
+  空闲检测粒度；新的 API 调用会更早触发清理。
+
+长活任务不保存短命 CLI PID。创建 forward 时，daemon 将已解析授权转换为不透明
+`LeaseGrant`，内部绑定 lease token 与单个 host。真实 forward 流量刷新 grant；15 秒
+forward reaper 使用不刷新 idle clock 的检查，lease 失效后停止 listener 和已有 tunnel。
+
+Lease 过期不会杀死 PTY session 或远端命令；它只阻止新的访问。重新批准后可接回仍存活
+的 session。
+
+SFTP transfer 也是一次在开始时授权的有限操作。daemon 在打开远端 SFTP handle、发送
+`TransferReady` 前完成 lease 检查；进入 raw stream 后沿用该开始授权。即使 2h idle 或
+8h absolute 边界在传输中到达，当前 transfer 仍可完成，新 transfer 则被拒绝。这样 NAS
+大文件不会因 lease 时长变成隐含大小上限。
+
+## 5. Session、输出与 spool
+
+- 每个 `(host, session)` 持有一个远端 PTY shell。
+- `run` 用随机 sentinel 在 PTY 合流字节流中识别命令结束和 exit code。
+- timeout 返回 `running`，不杀远端命令。`peek` 使用共享 cursor；`send` 写按键；
+  `interrupt` 发 Ctrl-C 并用 resync sentinel 防止 session 永久卡在 busy。
+- SSH 断开后 session 标记 `dead`，不会静默创建一个 cwd 不同的新 shell。
+- session 连续 8 小时无读写会被回收；session reaper 每 5 分钟扫描。
+- 内存 ring 每 session 256 KiB。`run` 回复最多保留约 30,000 字符尾部。
+
+Spool 是有界诊断保留，不是全量归档：
+
+- 每个 run 的 spool 文件最大 64 MiB raw output。达到上限后写入明确 marker，后续输出不再
+  落盘，但 sentinel 解析、远端命令和内存 ring 继续工作。
+- 每个 session spool 目录保留预算为 64 MiB。打开/关闭 spool 时按最旧文件优先做
+  best-effort 清理；活跃文件和清理失败可造成短暂超预算。
+- 整个 spool root 跨所有 host/session 有 1 GiB 硬预算。每个 active run 启动时预留完整
+  64 MiB，因此最多同时保留 16 个 active reservation；预算不足时新 run 在执行远端命令前
+  失败。
+- root 清理保护 active spool，跨 session 目录按修改时间删除最旧的非活跃文件，并为全部
+  active reservation 留出空间。新文件创建、reservation 发布和 root 清理共用同一临界区，
+  清理器不会误删刚创建的 active spool。
+- host/session 名称编码为单一安全路径组件，避免目录穿越。
+- spool 目录为 0700，文件为 0600，并以 `O_NOFOLLOW` 打开。
+
+因此回复中的 `spool_path` 只表示“已保留输出”，不能承诺包含无限远端输出。
+这些预算只约束 PTY command output spool，绝不限制 SFTP 文件大小或传输时长。
+
+## 6. SFTP 传输
+
+`put`/`get` 在既有 SSH 连接上新开 SFTP subsystem channel。文件总大小没有应用层上限；
+实际限制来自本地/远端文件系统、网络和进程资源。
+`russh-sftp` 默认的单请求 10 秒 timeout 已替换为锁定 Tokio 版本的 far-future deadline
+（约 30 年）。这对 NAS 的 open/read/write/close 等同于无实际时限，但不是数学意义的无限；
+真实 SSH、服务端、文件系统或网络故障仍会结束传输。
+
+授权只在操作开始时检查。只有远端 SFTP handle 已成功打开，daemon 才发送
+`TransferReady`；此后该 in-flight transfer 不再重新计算授权状态。Lease 过期只阻止后续
+`put`/`get`，不截断当前大文件。
+
+### Put
+
+- CLI 解析并打开本地 regular file，然后逐个 1 MiB 以内 raw frame 发送。
+- daemon 收到的 `local_path` 仅用于显示和审计，绝不据此打开本地路径。
+- daemon 打开远端文件为 create + truncate + write，并逐 frame 写入。
+- 中断或远端错误可能留下已截断或部分写入的远端文件。当前无 resume 或远端原子替换。
+
+### Get
+
+- daemon 从远端 SFTP 文件读取并逐 frame 发给 CLI。
+- CLI 在目标目录创建 0600 临时文件。只有收到 raw EOF 和最终 `Transfer` 成功响应后，才
+  原子提交到目标路径。
+- 默认拒绝覆盖；`--force` 使用同目录 rename 替换。失败时既有目标保持不变；异常进程
+  终止可能留下未提交 temp 文件。
+
+## 7. Forward
+
+当前实现：
+
+- `-L [bind_addr:]local_port:remote_host:remote_port`。
+- bind address 必须是 loopback IP；省略时为 `127.0.0.1`。`0` 可请求 OS 分配监听端口。
+- 每个 forward 使用专用 SSH connection 和稳定 `LeaseGrant`。
+- `forward ls` 只读，`forward stop` 只减少访问，因此不要求 lease。
+
+当前禁用：
+
+- `-R` 语法可解析以提供准确错误，但创建始终拒绝。
+- 非 loopback `-L` 始终拒绝。
+
+两者都需要未来的 capability-specific human approval，不能只复用“主机可访问”lease。
+
+## 8. Vault、状态文件与审计
+
+Vault 使用 Argon2id 派生 32-byte key，再用 ChaCha20-Poly1305 加密 versioned JSON envelope。
+每次保存使用新 salt 和 nonce。daemon 是 vault mutation 的唯一正常写入者：add/rm 的完整
+read-modify-write 与 cache refresh 串行化，文件通过 0600 临时文件和 atomic rename 替换。
+
+`unlock_for_lease` 与 add/rm mutation 共用同一把 async mutation lock，因此 unlock 不会与
+写入或 cache refresh 交错。Unlock 只读取一个 `VaultFile` envelope，并从该同一快照的
+KDF 参数派生 key、解密同一快照的 nonce/ciphertext，再一次性发布 cache；不会混合两次
+文件读取，也不会让旧 unlock cache 回写覆盖较新的 mutation。
+
+至少一个 lease 存活时，daemon 缓存解密后的 vault 数据与派生 key。批准 CLI 也会短暂
+建立自己的只读 cache，用于完整 ProxyJump preview 和 routed host-key probe；流程结束必定
+清空。
+
+`~/.sloosh` 等私有目录创建/修复为 0700，拒绝 symlink、错误 owner 和非目录。socket、
+vault、daemon log、audit、known_hosts 与 spool 文件目标权限为 0600；不同文件使用的
+`O_NOFOLLOW`、`create_new` 和 ACL 清理细节见 `SECURITY.md`。
+
+Audit 是 best-effort 诊断记录，不是防篡改安全控制。它记录授权、连接、命令文本、路径和
+结果元数据，不记录命令输出；同 UID owner 可读取、删除或替换它。
+
+## 9. 状态矩阵与后续工作
+
+| 能力 | 当前状态 | 当前边界 |
 |---|---|---|
-| 语言/运行时 | Rust + tokio | russh 绑定 tokio；N 连接多路复用 + 定时器是 async 教科书场景 |
-| SSH 协议 | **russh**（+ russh-sftp） | 程序化密码认证是一等公民（vault 取密码建连是核心流程）；openssh 二进制包装的密码认证只能靠 SSH_ASKPASS hack，排除；ssh2/libssh2 阻塞 + C 依赖 + 算法跟进慢 |
-| 本地 IPC | 传输抽象 trait：Unix → UDS，Windows → Named Pipe | 鉴权模型依赖内核级 peer PID（`SO_PEERCRED` / `LOCAL_PEERPID` / `GetNamedPipeClientProcessId`）；TCP localhost 无可信对端识别，排除。Windows 的 AF_UNIX 无 Rust 生态支持且 peer creds 半文档化，用 Named Pipe |
-| 线协议 | 换行分隔 JSON（serde） | 不需要性能、不需要 schema 编译、不放弃流式；`nc -U` 裸调试能力宝贵 |
-| vault 加密 | argon2id 派生 + ChaCha20-Poly1305（AEAD） | 见 §4 |
-
-- `~/.ssh/config`：支持常用指令子集（`Host` `HostName` `Port` `User` `IdentityFile` `ProxyJump` `IdentityAgent`），未知指令**警告而非静默忽略**。ssh-agent（含 1Password/Bitwarden 的 agent 实现）优先于 vault；`IdentityAgent` 可指定该 host 改用哪个 agent socket（或 `none` 关闭该 host 的 agent 认证）。`ProxyJump` 支持逗号分隔的多跳链，且任意一跳可以有自己的 `ProxyJump`（递归展开），总深度上限 8 跳，成环即报错拒绝。
-- socket 路径：Linux `$XDG_RUNTIME_DIR/sloosh.sock`，macOS `~/.sloosh/sloosh.sock`，权限 0600。
-- **平台纪律**：任何平台差异代码不许内联，必须进抽象层（IPC、进程树、文件权限、路径约定）。一期交付 macOS + Linux，Windows 二期填实现不动骨架。
-
-## 3. 会话模型
-
-- **Shell 级持久化**：每会话在远端维持一个长活 PTY shell。cwd、env、venv、后台任务跨调用延续。这是本工具的灵魂——连接级复用（ControlMaster 式）解决不了连续性痛点。
-- **隐式寻址**：`sloosh run <host> "cmd"` 自动创建/复用该主机的默认会话；`--session <name>` 开同主机并行 shell（如一个挂 dev server、一个跑命令）。对 Agent 最好的簿记是没有簿记。
-- **混合执行模型**：
-  - `run` 默认阻塞（sentinel 切分输出与退出码），带超时；超时**不杀命令**，返回 `running` 状态 + 已有输出；
-  - `peek`：**游标增量制**——默认只返回自上次 peek 以来的新增输出（对齐 Claude Code BashOutput 的模式，避免重复烧 token）；`--tail N` 显式回看；
-  - `send`：向 PTY 发按键（应对交互式提示）；`interrupt`：发 Ctrl-C。
-  - `run` 返回含明确状态字段：`done` / `running` / `dead`。
-- **断线语义：报死不复活**。TCP 断开即远端 shell 死亡，daemon 如实报告 `dead` + 死因 + 遗言（最后的输出缓冲），由 Agent 决定重建。静默重建全新 shell 会让 Agent 在错误 cwd 里执行命令。远端 tmux 锚定的 `--resilient` 模式留二期，状态字段从第一天预留。
-- **生命周期**：租约管访问不管会话存亡——租约过期不杀会话及其中进程，重新授权后原样接回。会话独立空闲回收（默认 8h 无读写断开，可配）。
-
-## 4. 授权模型（核心创新点）
-
-### vault
-- 主密码加密文件：argon2id 派生密钥 + ChaCha20-Poly1305。
-- **凭据录入是人类专属交互操作**（`sloosh add`）：Agent 可调用的命令面只有别名引用，不存在接受明文凭据的参数入口——否则凭据经过 Agent 上下文，边界即破。
-- 密码仅在建连瞬间入内存，`zeroize` 用毕即抹；日志与错误信息永不回显。
-- vault 条目可选带 `jump` 字段（`sloosh add <alias> ... --jump <alias>`）：跳板机别名，可解析自 vault 或 `~/.ssh/config`，语法与 `~/.ssh/config` 的 `ProxyJump` 一致。非密钥字段，不参与 zeroize，`Debug` 输出无碍。
-- 后期扩展（不改 vault 格式，只加 key-wrapping 后端）：Touch ID / Windows Hello 门控的解锁路径；OS Keychain。
-
-### 带外授权流（device-code 式）
-1. Agent：`sloosh request <host>...` —— 请求**必须声明目标主机**（按主机授权；全库解锁使人类批准退化为橡皮图章）；daemon 收到请求后，会展开每个目标主机的 `ProxyJump` 链（vault `jump` 字段和/或 `~/.ssh/config` `ProxyJump`，递归展开、同样受 8 跳上限约束），把链上每一跳都并入请求的主机集合（目标在前，跳板依次在后，去重）——人类看到并批准的是整条路径，而不只是最终目标；
-2. daemon 生成请求 ID，CLI 输出一条完整授权命令（含 ID 与主机清单）；
-3. 人类在**另一个终端**（本机新窗口或另开 SSH 登入）粘贴该命令、输入主密码 → 租约生效。全程纯终端，天然支持无头环境；首次连接的 host key 指纹确认也放在这一步（正好有人在场）；
-4. 租约空闲超时自动失效/轮换；`request` 对已有覆盖该主机的有效租约幂等返回成功，Agent 无需自己记状态。
-5. **链上 lease 覆盖**：建连时，每拨一跳前都会检查——若该跳的凭据来自 vault（即 vault 里有这个别名的条目），调用方必须对这一跳也持有有效租约，检查方式与目标主机完全一致；纯粹从 `~/.ssh/config` 解析出来的跳板（走的是环境用户自己的凭据）不需要租约。缺租约时报错是教学式的：`jump host 'bastion' is vault-backed and needs its own lease; run: sloosh request <target> bastion`。
-6. **端口转发的租约语义与会话不同**：§3 说的"租约过期不杀会话"只适用于持久 shell——会话是状态，过期后原样接回即可。端口转发（`forward`，见 §6）是**持续开放的网络访问**，性质更接近租约本身：创建时校验一次不够，daemon 有一个后台任务定期复检每个存活转发的租约（同一个 `check_authorized` 调用，复用它对空闲计时器的副作用，不在 lease.rs 里另开一条推送通知路径），一旦该租约过期或被撤销，转发立即关闭——停止监听/取消远端转发、断开已有隧道连接——不会静默续期，也不会自动重连。
-
-### Agent 身份锚定
-- **主路径：进程祖先链绑定**。daemon 经 peer credentials 取调用方 PID，向上遍历进程树找到顶层 Agent 进程，租约绑定 **(PID + 进程启动时间)**（防 PID 复用）。该进程的一切后代自动命中租约 → **subagent 零配置继承**；Agent 重启 = 新进程 = 重新授权（合理的安全语义，用户已确认接受）。Agent 上下文中零 token。
-- **逃生舱：`SLOOSH_LEASE` 环境变量**（进程树断裂场景，如 detached 进程）。环境变量对子进程天然继承，语义与血缘一致。
-- Windows 注意：父进程死后 PPID 悬空可能指向被复用的 PID，须用"子进程创建时间晚于父进程创建时间"校验链条。
-
-### 审计日志
-- `~/.sloosh/audit.jsonl`，daemon 独写、追加式；Agent **可读**（回看自己操作史是正当需求，日志无凭据）。
-- 记录：鉴权事件（请求/批准/过期，含 Agent 身份与主机范围）、连接事件（建立/断开/死因）、操作事件（每条 `run` 完整命令文本 + 会话 + 时间戳 + 退出码；`put`/`get` 两端路径）。不记命令输出（spool 已有）。
-- `sloosh log` 供人查看，可按主机/时间过滤。没有留痕，带外授权只是仪式感。
-
-## 5. 输出处理
-
-- PTY 固有代价（知情即可）：stdout/stderr 合流；输出混有 ANSI 转义。
-- **源头减排**：持久 shell 初始化注入 `export NO_COLOR=1 TERM=dumb`；daemon 侧剥离 ANSI 兜底；`--raw` 保留原样。
-- `run` 返回最多尾部 **~30k 字符**（对齐 Claude Code 的 BASH_MAX_OUTPUT_LENGTH 量级，可配），带截断标记与总字节数。
-- **全量输出落盘 spool**：`~/.sloosh/spool/<session>/<seq>.log`，`run` 返回附路径——Agent 用 grep/tail 细查大输出，不过 socket、不进上下文。按时间/总量自动清理。相对 Claude Code 的增强：远端命令可能昂贵或不可重入，截断不等于丢失。
-- 会话环形缓冲默认 256KB，供 `peek` 使用。
-- `put`/`get` 走既有连接的 SFTP channel；**文件内容不过本地 socket**——CLI 只传路径，daemon 同用户直接读写磁盘。
-
-## 6. 命令面
-
-**一期**：
-
-| 类别 | 命令 |
-|---|---|
-| 执行 | `run` `peek` `send` `interrupt` |
-| 会话 | `open`（显式并行会话入口） `ls` `kill` |
-| 鉴权 | `request`（Agent 侧） `approve`（人类侧） |
-| 凭据 | `add` `rm`（人类专属，交互式） |
-| 传输 | `put` `get` |
-| 转发 | `forward <host> -L/-R <spec>`（开转发，daemon 后台常驻） `forward ls` `forward stop <id>` |
-| 运维 | `status`（daemon/租约/会话总览，Agent 迷茫时的锚点） `daemon start/stop/run/status` `log` |
-
-**二期（按序）**：Windows 支持 → `--resilient`（远端 tmux 锚定）→ MCP 薄皮 → 生物识别解锁 / OS Keychain / 1Password·Bitwarden agent 兼容性验证。
-
-## 7. Skill 策略
-
-- 主文件百行以内：工具是什么；心智模型三句话（会话是持久的 shell / 访问需要人类批准的租约 / 迷茫先跑 `sloosh status`）；最常用五条命令各一行示例。
-- 固化的 Agent 行为规则：鉴权请求发出后把授权命令展示给用户并**停下等待**，不轮询刷屏；`run` 返回 `running` 用 `peek` 增量跟进，不重复 `run`；**永不向用户索要密码/密钥**——凭据录入由用户在工具里自行完成。
-- 细节靠 `sloosh <cmd> --help` 渐进披露，Skill 不复制参数表，避免腐化。
-- **错误信息即教学素材**：如租约缺失报错直接给出 `run \`sloosh request <host>\` and show the approval command to your user`。工具运行时自我解释，Skill 只管开场。
-
-## 8. 模块划分（实现参考）
-
-```
-src/
-  main.rs            # 入口：CLI 解析，daemon 子命令分流
-  cli/               # clap 命令定义、client 侧逻辑、daemon 自动拉起
-  proto.rs           # NDJSON 请求/响应/事件类型（serde）
-  transport/         # IPC 抽象 trait；unix.rs (UDS)；windows.rs (Named Pipe, 二期)
-  daemon/
-    mod.rs           # accept loop、请求路由
-    session.rs       # PTY 会话：sentinel 切分、环形缓冲、游标、spool
-    ssh.rs           # russh 连接建立、ssh_config 子集解析、ProxyJump、known_hosts
-    forward.rs       # -L/-R 端口转发：注册表、租约到期轮询回收、forwarded-tcpip 路由
-    lease.rs         # 租约：进程祖先链锚定、env 逃生舱、空闲超时
-    vault.rs         # argon2id + ChaCha20-Poly1305、zeroize
-    audit.rs         # audit.jsonl 追加写
-  procs/             # 进程树遍历抽象；macos.rs (sysctl)；linux.rs (/proc)
-skills/sloosh/       # Agent Skill（SKILL.md，agentskills.io 标准，兼容 Claude Code / Codex 等；
-                     # 经 ReiSuzunami/nerv 插件市场与 npx skills 分发）
-```
+| macOS/Linux UDS | 已实现 | protocol 2，CLI peer 校验 + Status/Hello 双向门禁 |
+| 持久 PTY session | 已实现 | 8h idle 回收，不跨 daemon 重启 |
+| SFTP put/get | 已实现 | 单 frame 1 MiB，总量不限；开始时授权不截断当前大文件 |
+| Spool | 已实现 | 64 MiB/run，64 MiB/session，1 GiB/root；仅约束 PTY output |
+| ProxyJump | 已实现 | 递归最多 8 hop；批准列表双重解析；routed key probe |
+| `-L` forward | 已实现 | 仅 loopback listener |
+| `-R` forward | 禁用 | 等 capability-specific approval |
+| 非 loopback `-L` | 禁用 | 等 capability-specific approval |
+| Windows | 未来 | Named Pipe + PID reuse-safe ancestry |
+| resilient remote tmux | 未来 | 当前断线只报告 dead |
+| OS keychain/biometric | 未来 | 用于加强同 UID secret isolation |
+| MCP 薄层 | 未来 | CLI 仍是当前唯一正式接口 |

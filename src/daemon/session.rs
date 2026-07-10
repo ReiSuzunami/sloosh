@@ -6,20 +6,21 @@
 //! `daemon/mod.rs`): any local caller can address any session. No
 //! per-session authorization is enforced here yet.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rand::Rng;
-use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
+use russh_sftp::client::fs::File as SftpFile;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::sleep_until;
 use tracing::{info, warn};
@@ -27,17 +28,37 @@ use tracing::{info, warn};
 use crate::daemon::audit;
 use crate::daemon::ssh::{self, SshError};
 use crate::proto::{SessionSummary, TransferReply};
-use crate::transport::unix::sloosh_home;
+use crate::transport::unix::{ensure_private_dir as ensure_sloosh_private_dir, sloosh_home};
 
 /// Bound on how much output we keep in memory per session (DESIGN.md §5).
 const RING_CAPACITY: usize = 256 * 1024;
 /// Cap on how much of a single run/peek reply's `output` field we send back
-/// (DESIGN.md §5 "~30k 字符尾部"); the untruncated bytes are always on disk
-/// in the spool file.
+/// (DESIGN.md §5 "~30k 字符尾部"); spool persistence has separate bounded
+/// per-run and global budgets below.
 const MAX_OUTPUT_CHARS: usize = 30_000;
 /// Keep at most this many bytes per session's spool directory before
 /// deleting the oldest files (DESIGN.md §5, "simple size-based cleanup").
 const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
+/// Bound one active run's disk footprint. Reaching this limit stops spool
+/// persistence only: the in-memory ring, marker detection, and remote command
+/// keep running normally.
+const MAX_SPOOL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Global retained spool budget across every host/session. Active runs reserve
+/// their full per-run allowance up front, so concurrent session names cannot
+/// multiply disk use without bound.
+const MAX_SPOOL_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Replace russh-sftp's 10-second request deadline with the maximum value.
+/// In the pinned Tokio release this maps to its roughly 30-year far-future
+/// timer: operationally disabled for NAS transfers, though not mathematical
+/// infinity. Transport/server failures still surface normally.
+const SFTP_REQUEST_TIMEOUT_SECS: u64 = u64::MAX;
+/// Written inside a capped spool so readers can distinguish a complete log
+/// from one whose tail only remains available through the in-memory ring.
+const SPOOL_LIMIT_MARKER: &[u8] =
+    b"\n[... sloosh spool limit reached; further output was not persisted ...]\n";
+/// Keep the combined host/session directory component comfortably below the
+/// usual 255-byte filesystem limit, even after fixed prefixes/separators.
+const MAX_ENCODED_SPOOL_NAME_BYTES: usize = 96;
 /// A session with no read or write activity for this long is reaped
 /// (DESIGN.md §3). Configurable only in the sense that it's one constant to
 /// edit — no config surface for it in this milestone.
@@ -558,8 +579,8 @@ fn strip_echoed_command(output: &[u8], candidates: &[&str]) -> Vec<u8> {
 /// Shape raw command output for a reply: strip ANSI (unless `raw`), then
 /// cap to `MAX_OUTPUT_CHARS` (keeping the tail, since that's almost always
 /// what's relevant), returning `(shown, truncated, total_bytes)` where
-/// `total_bytes` is the size of the *shaped-but-untruncated* text — i.e.
-/// what you'd get from the spool file after the same ANSI handling.
+/// `total_bytes` is the size of the *shaped-but-untruncated* text. Spool files
+/// retain up to `MAX_SPOOL_FILE_BYTES` raw bytes per run.
 fn shape_output(raw: &[u8], raw_mode: bool) -> (String, bool, u64) {
     let processed = if raw_mode {
         raw.to_vec()
@@ -575,7 +596,7 @@ fn shape_output(raw: &[u8], raw_mode: bool) -> (String, bool, u64) {
         let skip = char_count - MAX_OUTPUT_CHARS;
         let tail: String = text.chars().skip(skip).collect();
         let marker = format!(
-            "... [truncated {skip} chars; {total_bytes} bytes total in this run — see spool file for full output] ...\n"
+            "... [truncated {skip} chars; {total_bytes} bytes total in this run — see spool file for retained output (64 MiB/run cap)] ...\n"
         );
         (marker + &tail, true, total_bytes)
     }
@@ -605,6 +626,135 @@ struct RunOutcome {
     end_offset: u64,
 }
 
+struct SpoolWriter {
+    file: std::fs::File,
+    path: PathBuf,
+    limit: u64,
+    bytes_written: u64,
+    limited: bool,
+    spool_root: Option<PathBuf>,
+}
+
+impl SpoolWriter {
+    fn new_reserved(file: std::fs::File, path: PathBuf, spool_root: PathBuf) -> Self {
+        Self {
+            file,
+            path,
+            limit: MAX_SPOOL_FILE_BYTES,
+            bytes_written: 0,
+            limited: false,
+            spool_root: Some(spool_root),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(file: std::fs::File, path: PathBuf, limit: u64) -> Self {
+        Self {
+            file,
+            path,
+            limit,
+            bytes_written: 0,
+            limited: false,
+            spool_root: None,
+        }
+    }
+
+    fn write_payload(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.limited || bytes.is_empty() {
+            return Ok(());
+        }
+
+        let marker_len = SPOOL_LIMIT_MARKER.len() as u64;
+        let payload_limit = self.limit.saturating_sub(marker_len);
+        let remaining = payload_limit.saturating_sub(self.bytes_written);
+        let keep = remaining.min(bytes.len() as u64) as usize;
+        if keep > 0 {
+            self.file.write_all(&bytes[..keep])?;
+            self.bytes_written += keep as u64;
+        }
+
+        if keep < bytes.len() {
+            if self.limit >= marker_len {
+                self.file.write_all(SPOOL_LIMIT_MARKER)?;
+                self.bytes_written += marker_len;
+            }
+            self.limited = true;
+            warn!(
+                spool_path = %self.path.display(),
+                limit_bytes = self.limit,
+                "spool file reached its per-run limit; further output remains in the memory ring only"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SpoolWriter {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
+        if let Some(root) = self.spool_root.as_deref() {
+            let mut active = lock_active_spool_reservations();
+            if let Some(dir) = self.path.parent() {
+                cleanup_spool_dir_preserving(dir, Some(&self.path));
+            }
+            if let Err(error) = cleanup_spool_root_locked(root, &active) {
+                warn!(spool_root = %root.display(), %error, "could not enforce global spool budget");
+            }
+            active.remove(&self.path);
+        } else if let Some(dir) = self.path.parent() {
+            cleanup_spool_dir_preserving(dir, Some(&self.path));
+        }
+    }
+}
+
+type ActiveSpoolReservations = HashMap<PathBuf, (PathBuf, u64)>;
+
+fn active_spool_reservations() -> &'static Mutex<ActiveSpoolReservations> {
+    static ACTIVE: OnceLock<Mutex<ActiveSpoolReservations>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_active_spool_reservations() -> MutexGuard<'static, ActiveSpoolReservations> {
+    active_spool_reservations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn reserve_active_spool_locked(
+    active: &mut ActiveSpoolReservations,
+    root: &std::path::Path,
+    path: &std::path::Path,
+    limit: u64,
+) -> std::io::Result<()> {
+    let reserved: u64 = active
+        .values()
+        .filter(|(candidate_root, _)| candidate_root == root)
+        .map(|(_, bytes)| *bytes)
+        .sum();
+    if reserved.saturating_add(limit) > MAX_SPOOL_ROOT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "global spool budget is fully reserved by active runs ({} MiB max); wait for a run to finish or stop an unused session",
+            MAX_SPOOL_ROOT_BYTES / (1024 * 1024)
+        )));
+    }
+    active.insert(path.to_path_buf(), (root.to_path_buf(), limit));
+    Ok(())
+}
+
+#[cfg(test)]
+fn reserve_active_spool(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    limit: u64,
+) -> std::io::Result<()> {
+    reserve_active_spool_locked(&mut lock_active_spool_reservations(), root, path, limit)
+}
+
+#[cfg(test)]
+fn release_active_spool(path: &std::path::Path) {
+    lock_active_spool_reservations().remove(path);
+}
+
 struct SessionState {
     ring: RingBuffer,
     /// Single global read cursor for `peek` (DESIGN.md §5 simplification:
@@ -619,7 +769,7 @@ struct SessionState {
     run_seq: u64,
     current_run: Option<CurrentRun>,
     last_result: Option<RunOutcome>,
-    spool_file: Option<std::fs::File>,
+    spool_file: Option<SpoolWriter>,
     /// Removes framing internals from the raw PTY stream before anything
     /// reaches `ring`/`spool_file`.
     scrubber: FrameScrubber,
@@ -673,8 +823,37 @@ fn default_session_name(session: Option<String>) -> String {
     session.unwrap_or_else(|| "default".to_string())
 }
 
-fn spool_dir(host: &str, name: &str) -> PathBuf {
-    sloosh_home().join("spool").join(format!("{host}--{name}"))
+fn encode_spool_name(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(value.len().min(MAX_ENCODED_SPOOL_NAME_BYTES));
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('~');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    if encoded.len() <= MAX_ENCODED_SPOOL_NAME_BYTES {
+        return encoded;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    let suffix = format!("~{:016x}", hasher.finish());
+    encoded.truncate(MAX_ENCODED_SPOOL_NAME_BYTES - suffix.len());
+    encoded.push_str(&suffix);
+    encoded
+}
+
+fn spool_dir_under(root: &std::path::Path, host: &str, name: &str) -> PathBuf {
+    root.join(format!(
+        "h-{}--s-{}",
+        encode_spool_name(host),
+        encode_spool_name(name)
+    ))
 }
 
 fn state_label(state: &SessionState) -> &'static str {
@@ -911,11 +1090,19 @@ fn ingest(state: &mut SessionState, data: &[u8]) {
                     continue;
                 }
                 state.ring.push_slice(&bytes);
-                if let Some(file) = state.spool_file.as_mut() {
+                if let Some(writer) = state.spool_file.as_mut() {
                     // Local disk writes are small and fast; a brief
                     // synchronous write here is simpler and cheaper than
                     // wiring up tokio::fs for this milestone.
-                    let _ = file.write_all(&bytes);
+                    let path = writer.path.clone();
+                    if let Err(error) = writer.write_payload(&bytes) {
+                        warn!(
+                            spool_path = %path.display(),
+                            %error,
+                            "spool write failed; command and in-memory output continue"
+                        );
+                        state.spool_file = None;
+                    }
                 }
             }
             ScrubEvent::Marker {
@@ -981,13 +1168,74 @@ async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
     inner.wake_tx.send_modify(|v| *v = v.wrapping_add(1));
 }
 
-fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf, std::fs::File)> {
-    let dir = spool_dir(host, name);
-    std::fs::create_dir_all(&dir)?;
+fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    ensure_sloosh_private_dir(path).map_err(std::io::Error::other)
+}
+
+fn open_spool_file_under(
+    root: &std::path::Path,
+    host: &str,
+    name: &str,
+    seq: u64,
+) -> std::io::Result<(PathBuf, SpoolWriter)> {
+    ensure_private_dir(root)?;
+    let dir = spool_dir_under(root, host, name);
+    ensure_private_dir(&dir)?;
     let path = dir.join(format!("{seq:08}.log"));
-    let file = std::fs::File::create(&path)?;
-    cleanup_spool_dir(&dir);
-    Ok((path, file))
+    // Hold the reservation registry lock before the file appears and through
+    // global cleanup. This makes the filesystem view and the protected-path
+    // set one transaction, so a concurrent cleanup cannot delete a newly
+    // created active spool between its directory scan and delete pass.
+    let mut active = lock_active_spool_reservations();
+    reserve_active_spool_locked(&mut active, root, &path, MAX_SPOOL_FILE_BYTES)?;
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            active.remove(&path);
+            return Err(error);
+        }
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            active.remove(&path);
+            let _ = std::fs::remove_file(&path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("spool path '{}' is not a regular file", path.display()),
+            ));
+        }
+        Err(error) => {
+            active.remove(&path);
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+    }
+    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        active.remove(&path);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    cleanup_spool_dir_preserving(&dir, Some(&path));
+    if let Err(error) = cleanup_spool_root_locked(root, &active) {
+        active.remove(&path);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    drop(active);
+    let writer = SpoolWriter::new_reserved(file, path.clone(), root.to_path_buf());
+    Ok((path, writer))
+}
+
+fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf, SpoolWriter)> {
+    open_spool_file_under(&sloosh_home().join("spool"), host, name, seq)
 }
 
 /// Simple size-based retention: while the directory holds more than
@@ -995,13 +1243,16 @@ fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf
 /// zero-padded sequence number so lexicographic order is chronological)
 /// until it doesn't. Best-effort — errors are logged, not propagated,
 /// since spool cleanup should never block a `run` from completing.
-fn cleanup_spool_dir(dir: &std::path::Path) {
-    let mut entries: Vec<(PathBuf, u64)> = match std::fs::read_dir(dir) {
+fn cleanup_spool_dir_preserving(dir: &std::path::Path, preserve: Option<&std::path::Path>) {
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter_map(|e| {
+                if !e.file_type().ok()?.is_file() {
+                    return None;
+                }
                 let meta = e.metadata().ok()?;
-                Some((e.path(), meta.len()))
+                Some((e.path(), meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)))
             })
             .collect(),
         Err(e) => {
@@ -1009,16 +1260,85 @@ fn cleanup_spool_dir(dir: &std::path::Path) {
             return;
         }
     };
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut total: u64 = entries.iter().map(|(_, len)| *len).sum();
-    let mut i = 0;
-    while total > MAX_SPOOL_DIR_BYTES && i < entries.len() {
-        let (path, len) = &entries[i];
-        if std::fs::remove_file(path).is_ok() {
-            total = total.saturating_sub(*len);
+    entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let mut total: u64 = entries.iter().map(|(_, len, _)| *len).sum();
+    for (path, len, _) in &entries {
+        if total <= MAX_SPOOL_DIR_BYTES {
+            break;
         }
-        i += 1;
+        if preserve.is_some_and(|keep| keep == path) {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => total = total.saturating_sub(*len),
+            Err(error) => {
+                warn!(spool_path = %path.display(), %error, "could not remove old spool file")
+            }
+        }
     }
+}
+
+#[cfg(test)]
+fn cleanup_spool_root(root: &std::path::Path) -> std::io::Result<()> {
+    let active = lock_active_spool_reservations();
+    cleanup_spool_root_locked(root, &active)
+}
+
+fn cleanup_spool_root_locked(
+    root: &std::path::Path,
+    active: &ActiveSpoolReservations,
+) -> std::io::Result<()> {
+    let protected: HashSet<PathBuf> = active
+        .iter()
+        .filter(|(_, (candidate_root, _))| candidate_root == root)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let reserved = active
+        .values()
+        .filter(|(candidate_root, _)| candidate_root == root)
+        .map(|(_, bytes)| *bytes)
+        .sum();
+    let retained_budget = MAX_SPOOL_ROOT_BYTES.saturating_sub(reserved);
+    let mut entries = Vec::new();
+    for session_entry in std::fs::read_dir(root)? {
+        let session_entry = session_entry?;
+        if !session_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for file_entry in std::fs::read_dir(session_entry.path())? {
+            let file_entry = file_entry?;
+            if !file_entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = file_entry.path();
+            if protected.contains(&path) {
+                continue;
+            }
+            let metadata = file_entry.metadata()?;
+            entries.push((
+                path,
+                metadata.len(),
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+            ));
+        }
+    }
+
+    entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let mut retained: u64 = entries.iter().map(|(_, len, _)| *len).sum();
+    for (path, len, _) in entries {
+        if retained <= retained_budget {
+            break;
+        }
+        std::fs::remove_file(&path)?;
+        retained = retained.saturating_sub(len);
+    }
+    if retained > retained_budget {
+        return Err(std::io::Error::other(format!(
+            "could not reduce retained spool data to the {} MiB global budget",
+            MAX_SPOOL_ROOT_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
 }
 
 fn dead_reply_output(state: &SessionState, start_offset: u64, raw: bool) -> (String, bool, u64) {
@@ -1059,12 +1379,12 @@ pub async fn run(
                 session: name,
             });
         }
-        state.busy = true;
         state.run_seq += 1;
         start_offset = state.ring.total_written;
         let (path, file) = open_spool_file(host, &name, state.run_seq)?;
         spool_path = path;
         state.spool_file = Some(file);
+        state.busy = true;
         state.current_run = Some(CurrentRun {
             sentinel: sentinel.clone(),
             resync: None,
@@ -1359,6 +1679,13 @@ pub async fn list_summaries() -> Vec<SessionSummary> {
 // `put`/`get` over SFTP (DESIGN.md §5-6)
 // ---------------------------------------------------------------------------
 
+fn sftp_client_config() -> SftpConfig {
+    SftpConfig {
+        request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECS,
+        ..SftpConfig::default()
+    }
+}
+
 /// Get (or create) the named session, then open a fresh SFTP-subsystem
 /// channel on its *existing* SSH connection (DESIGN.md §5: "put/get 走既有
 /// 连接的 SFTP channel" — reuse the authenticated connection, never redial or
@@ -1381,7 +1708,7 @@ async fn sftp_session(
         .request_subsystem(true, "sftp")
         .await
         .map_err(SshError::from)?;
-    let sftp = SftpSession::new(channel.into_stream())
+    let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_client_config())
         .await
         .map_err(|e| SessionError::Sftp {
             host: host.to_string(),
@@ -1414,147 +1741,157 @@ fn remote_path_error(host: &str, path: &str, err: SftpClientError) -> SessionErr
     }
 }
 
-/// `put <host> <local-path> <remote-path>` — upload a local file over SFTP
-/// (DESIGN.md §5-6). `local_path` must already be absolute: the CLI resolves
-/// relative paths before sending, since the daemon's own working directory
-/// is not the caller's. File content is read directly off this process's
-/// local filesystem and written directly to the remote one — it never
-/// crosses the CLI<->daemon socket, only the two paths and the resulting
-/// byte count do. Overwriting an existing file at `remote_path` is always
-/// allowed: the remote host is the disposable workspace.
-pub async fn put(
+/// Open the remote half of an upload. The caller streams bounded chunks from
+/// the sandboxed CLI into [`UploadTransfer::write_chunk`]; no local path is
+/// ever opened by the daemon and total file size is unbounded.
+pub async fn begin_put(
     host: &str,
     session: Option<String>,
     local_path: &str,
     remote_path: &str,
     lease_ctx: ssh::LeaseContext,
-) -> Result<TransferReply, SessionError> {
-    let mut local_file = tokio::fs::File::open(local_path).await.map_err(|source| {
-        SessionError::LocalFileMissing {
-            path: local_path.to_string(),
-            source,
-        }
-    })?;
-
+) -> Result<UploadTransfer, SessionError> {
     let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-
-    let mut remote_file = sftp
+    let remote_file = sftp
         .open_with_flags(
             remote_path,
             OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
         )
         .await
         .map_err(|e| remote_path_error(host, remote_path, e))?;
-
-    let bytes_transferred = tokio::io::copy(&mut local_file, &mut remote_file)
-        .await
-        .map_err(|source| SessionError::Transfer {
-            host: host.to_string(),
-            local: local_path.to_string(),
-            remote: remote_path.to_string(),
-            source,
-        })?;
-    let _ = remote_file.shutdown().await;
-
-    audit::record(
-        "put",
-        serde_json::json!({
-            "host": host,
-            "session": session_name,
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "bytes": bytes_transferred,
-        }),
-    );
-
-    Ok(TransferReply {
+    Ok(UploadTransfer {
         host: host.to_string(),
         session: session_name,
         local_path: local_path.to_string(),
         remote_path: remote_path.to_string(),
-        bytes_transferred,
+        remote_file,
+        bytes_transferred: 0,
     })
 }
 
-/// `get <host> <remote-path> <local-path>` — download a remote file over
-/// SFTP (DESIGN.md §5-6), same connection-reuse contract as `put`. Refuses
-/// to overwrite an existing local file unless `force`: unlike `put`, the
-/// destination here is the user's own machine, so an accidental overwrite is
-/// worse than a refusal. The existence check is checked up front (fail fast
-/// without even dialing SFTP) and re-checked atomically via `create_new`
-/// when actually opening the destination, closing the TOCTOU window between
-/// the two.
-pub async fn get(
+pub struct UploadTransfer {
+    host: String,
+    session: String,
+    local_path: String,
+    remote_path: String,
+    remote_file: SftpFile,
+    bytes_transferred: u64,
+}
+
+impl UploadTransfer {
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), SessionError> {
+        self.remote_file
+            .write_all(chunk)
+            .await
+            .map_err(|source| SessionError::Transfer {
+                host: self.host.clone(),
+                local: self.local_path.clone(),
+                remote: self.remote_path.clone(),
+                source,
+            })?;
+        self.bytes_transferred = self.bytes_transferred.saturating_add(chunk.len() as u64);
+        Ok(())
+    }
+
+    pub async fn finish(mut self) -> Result<TransferReply, SessionError> {
+        self.remote_file
+            .shutdown()
+            .await
+            .map_err(|source| SessionError::Transfer {
+                host: self.host.clone(),
+                local: self.local_path.clone(),
+                remote: self.remote_path.clone(),
+                source,
+            })?;
+        audit::record(
+            "put",
+            serde_json::json!({
+                "host": self.host,
+                "session": self.session,
+                "local_path": self.local_path,
+                "remote_path": self.remote_path,
+                "bytes": self.bytes_transferred,
+            }),
+        );
+        Ok(TransferReply {
+            host: self.host,
+            session: self.session,
+            local_path: self.local_path,
+            remote_path: self.remote_path,
+            bytes_transferred: self.bytes_transferred,
+        })
+    }
+}
+
+/// Open the remote half of a download. The caller repeatedly invokes
+/// [`DownloadTransfer::read_chunk`] and forwards each bounded chunk to the
+/// sandboxed CLI, which owns the local destination file.
+pub async fn begin_get(
     host: &str,
     session: Option<String>,
     remote_path: &str,
     local_path: &str,
-    force: bool,
     lease_ctx: ssh::LeaseContext,
-) -> Result<TransferReply, SessionError> {
-    if !force && tokio::fs::try_exists(local_path).await.unwrap_or(false) {
-        return Err(SessionError::LocalDestinationExists {
-            path: local_path.to_string(),
-        });
-    }
-
+) -> Result<DownloadTransfer, SessionError> {
     let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-
-    let mut remote_file = sftp
+    let remote_file = sftp
         .open(remote_path)
         .await
         .map_err(|e| remote_path_error(host, remote_path, e))?;
-
-    let mut open_opts = tokio::fs::OpenOptions::new();
-    open_opts.write(true);
-    if force {
-        open_opts.create(true).truncate(true);
-    } else {
-        open_opts.create_new(true);
-    }
-    let mut local_file = match open_opts.open(local_path).await {
-        Ok(f) => f,
-        Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(SessionError::LocalDestinationExists {
-                path: local_path.to_string(),
-            });
-        }
-        Err(source) => {
-            return Err(SessionError::LocalDestinationUnwritable {
-                path: local_path.to_string(),
-                source,
-            });
-        }
-    };
-
-    let bytes_transferred = tokio::io::copy(&mut remote_file, &mut local_file)
-        .await
-        .map_err(|source| SessionError::Transfer {
-            host: host.to_string(),
-            local: local_path.to_string(),
-            remote: remote_path.to_string(),
-            source,
-        })?;
-    let _ = local_file.flush().await;
-
-    audit::record(
-        "get",
-        serde_json::json!({
-            "host": host,
-            "session": session_name,
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "bytes": bytes_transferred,
-        }),
-    );
-
-    Ok(TransferReply {
+    Ok(DownloadTransfer {
         host: host.to_string(),
         session: session_name,
         local_path: local_path.to_string(),
         remote_path: remote_path.to_string(),
-        bytes_transferred,
+        remote_file,
+        bytes_transferred: 0,
     })
+}
+
+pub struct DownloadTransfer {
+    host: String,
+    session: String,
+    local_path: String,
+    remote_path: String,
+    remote_file: SftpFile,
+    bytes_transferred: u64,
+}
+
+impl DownloadTransfer {
+    pub async fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, SessionError> {
+        let read =
+            self.remote_file
+                .read(buffer)
+                .await
+                .map_err(|source| SessionError::Transfer {
+                    host: self.host.clone(),
+                    local: self.local_path.clone(),
+                    remote: self.remote_path.clone(),
+                    source,
+                })?;
+        self.bytes_transferred = self.bytes_transferred.saturating_add(read as u64);
+        Ok(read)
+    }
+
+    pub fn finish(self) -> TransferReply {
+        audit::record(
+            "get",
+            serde_json::json!({
+                "host": self.host,
+                "session": self.session,
+                "local_path": self.local_path,
+                "remote_path": self.remote_path,
+                "bytes": self.bytes_transferred,
+            }),
+        );
+        TransferReply {
+            host: self.host,
+            session: self.session,
+            local_path: self.local_path,
+            remote_path: self.remote_path,
+            bytes_transferred: self.bytes_transferred,
+        }
+    }
 }
 
 /// Spawn the background idle-session reaper. Call once, at daemon startup.
@@ -2006,28 +2343,215 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }
 
-    // --- spool cleanup -------------------------------------------------
+    // --- spool safety / cleanup ----------------------------------------
+
+    fn temp_spool_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sloosh-spool-{label}-{}-{}",
+            std::process::id(),
+            make_sentinel()
+        ))
+    }
+
+    #[test]
+    fn spool_paths_encode_untrusted_host_and_session_names() {
+        let sandbox = temp_spool_root("traversal");
+        let root = sandbox.join("spool");
+        let escaped = sandbox.join("escaped");
+        let (path, writer) =
+            open_spool_file_under(&root, "../../escaped/host", "../session/../../outside", 1)
+                .unwrap();
+        drop(writer);
+
+        assert!(path.starts_with(&root));
+        let relative = path.strip_prefix(&root).unwrap();
+        assert_eq!(relative.components().count(), 2);
+        assert!(
+            !escaped.exists(),
+            "untrusted names must not escape spool root"
+        );
+        let session_component = relative.components().next().unwrap().as_os_str();
+        let session_component = session_component.to_string_lossy();
+        assert!(!session_component.contains('/'));
+        assert!(!session_component.contains(".."));
+
+        let long = "../".repeat(500);
+        let encoded = encode_spool_name(&long);
+        assert!(encoded.len() <= MAX_ENCODED_SPOOL_NAME_BYTES);
+        assert!(!encoded.contains('/'));
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn spool_directories_and_files_are_private() {
+        let root = temp_spool_root("permissions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let (path, writer) = open_spool_file_under(&root, "host", "session", 1).unwrap();
+        drop(writer);
+
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_limit_does_not_stop_ring_or_command_completion() {
+        let root = temp_spool_root("limit");
+        ensure_private_dir(&root).unwrap();
+        let path = root.join("limited.log");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_limit(file, path.clone(), 128));
+
+        let payload = "x".repeat(256);
+        ingest(
+            &mut state,
+            format!("{payload}\r\n\r\n{sentinel}0{sentinel}\r\n").as_bytes(),
+        );
+
+        assert!(!state.busy, "marker handling must continue after spool cap");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(
+            ring_contents(&state).len() > 128,
+            "memory ring must keep output beyond disk cap"
+        );
+        let persisted = std::fs::read(&path).unwrap();
+        assert_eq!(persisted.len(), 128);
+        assert!(persisted.ends_with(SPOOL_LIMIT_MARKER));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cleanup_spool_dir_removes_oldest_when_over_budget() {
-        let dir = std::env::temp_dir().join(format!(
-            "sloosh-spool-test-{}-{}",
-            std::process::id(),
-            make_sentinel()
-        ));
+        let dir = temp_spool_root("cleanup");
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..3u32 {
             let path = dir.join(format!("{i:08}.log"));
-            std::fs::write(&path, vec![0u8; 10]).unwrap();
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len(32 * 1024 * 1024).unwrap();
         }
         let saved = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(saved, 3);
-        // Directly exercising the real 64MiB budget would require huge
-        // files; this confirms the no-op path (well under budget, nothing
-        // pruned) since that's what every real invocation hits in tests.
-        cleanup_spool_dir(&dir);
-        let remaining = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(remaining, 3, "well under the size budget, nothing pruned");
+        cleanup_spool_dir_preserving(&dir, None);
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        let total: u64 = remaining
+            .iter()
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert!(remaining.len() < 3);
+        assert!(total <= MAX_SPOOL_DIR_BYTES);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_spool_budget_removes_oldest_files_across_sessions() {
+        let root = temp_spool_root("global-cleanup");
+        ensure_private_dir(&root).unwrap();
+        for i in 0..3u32 {
+            let dir = root.join(format!("session-{i}"));
+            ensure_private_dir(&dir).unwrap();
+            let file = std::fs::File::create(dir.join("00000001.log")).unwrap();
+            file.set_len(512 * 1024 * 1024).unwrap();
+        }
+
+        cleanup_spool_root(&root).unwrap();
+        let total: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .flat_map(|dir| {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+            })
+            .map(|file| file.metadata().unwrap().len())
+            .sum();
+        assert!(total <= MAX_SPOOL_ROOT_BYTES);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_spool_open_waits_until_cleanup_registry_is_unlocked() {
+        let root = temp_spool_root("concurrent-open");
+        let path = spool_dir_under(&root, "host", "session").join("00000001.log");
+        let active = lock_active_spool_reservations();
+        let thread_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            open_spool_file_under(&thread_root, "host", "session", 1).unwrap()
+        });
+
+        let parent = path.parent().unwrap();
+        for _ in 0..100 {
+            if parent.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(parent.exists(), "worker should reach the reservation lock");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !path.exists(),
+            "an active spool file must not appear outside the reservation/cleanup critical section"
+        );
+
+        drop(active);
+        let (opened_path, writer) = worker.join().unwrap();
+        assert_eq!(opened_path, path);
+        assert!(path.exists());
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn active_spool_reservations_cannot_exceed_global_budget() {
+        let root = temp_spool_root("global-reservations");
+        let slots = (MAX_SPOOL_ROOT_BYTES / MAX_SPOOL_FILE_BYTES) as usize;
+        let paths: Vec<PathBuf> = (0..slots)
+            .map(|i| root.join(format!("active-{i}.log")))
+            .collect();
+        for path in &paths {
+            reserve_active_spool(&root, path, MAX_SPOOL_FILE_BYTES).unwrap();
+        }
+        let overflow = root.join("overflow.log");
+        assert!(reserve_active_spool(&root, &overflow, MAX_SPOOL_FILE_BYTES).is_err());
+        for path in &paths {
+            release_active_spool(path);
+        }
+    }
+
+    #[test]
+    fn sftp_config_replaces_the_short_default_with_far_future_deadline() {
+        let config = sftp_client_config();
+        assert_eq!(config.request_timeout_secs, u64::MAX);
+        assert!(
+            tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(config.request_timeout_secs))
+                .is_none(),
+            "Tokio must route the maximum duration to its far-future path"
+        );
     }
 }

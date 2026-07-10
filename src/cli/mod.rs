@@ -13,15 +13,18 @@ use args::{
 
 use crate::daemon::audit;
 use crate::daemon::ssh;
+use crate::daemon::vault;
 use crate::proto::{
     self, ForwardDirection, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response,
     RunReply, SecretString, SessionSummary, StatusReply,
 };
-use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
+use crate::transport::{Channel, MAX_RAW_FRAME_BYTES};
 use clap::Parser as _;
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use zeroize::Zeroizing;
 
 /// Run the parsed CLI command. Errors are rendered by `main` and always
 /// exit non-zero; nothing in here panics or uses `todo!()`.
@@ -136,6 +139,7 @@ async fn request_status(chan: &mut UnixChannel) -> anyhow::Result<StatusReply> {
 fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
     println!("sloosh daemon: running (pid {})", reply.pid);
     println!("  version:  {}", reply.version);
+    println!("  protocol: {}", reply.wire_protocol);
     println!("  uptime:   {}s", reply.uptime_secs);
     println!("  socket:   {}", socket_path.display());
     println!("  sessions: {}", reply.sessions.len());
@@ -146,7 +150,7 @@ fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
     for l in &reply.leases {
         println!(
             "    - {} — {} (pid {}), idle timeout in {}s",
-            l.hosts.join(", "),
+            display_host_list(&l.hosts),
             l.anchor_name.as_deref().unwrap_or("unknown process"),
             l.anchor_pid,
             l.idle_remaining_secs,
@@ -366,7 +370,7 @@ async fn cmd_request(args: RequestArgs) -> anyhow::Result<()> {
         Response::Ok => {
             println!(
                 "already authorized: an active lease already covers {}",
-                args.hosts.join(", ")
+                display_host_list(&args.hosts)
             );
         }
         Response::LeaseRequestPending(info) => print_pending_request_instructions(&info),
@@ -380,7 +384,7 @@ fn print_pending_request_instructions(info: &LeaseRequestSummary) {
     println!(
         "Approval needed. Ask your user to run this in ANOTHER terminal:\n\n    sloosh approve {}\n\nGrants: {} — requested by {} (pid {}). Then wait; do not poll.",
         info.id,
-        info.hosts.join(", "),
+        display_host_list(&info.hosts),
         anchor,
         info.anchor_pid,
     );
@@ -405,7 +409,7 @@ async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     };
 
     println!("Lease request {}", info.id);
-    println!("  hosts:        {}", info.hosts.join(", "));
+    println!("  hosts:        {}", display_host_list(&info.hosts));
     println!(
         "  requested by: {} (pid {})",
         info.anchor_name.as_deref().unwrap_or("unknown process"),
@@ -423,29 +427,69 @@ async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     println!();
 
     let master_password = prompt_master_password(true)?;
+    vault::unlock_for_lease(master_password.expose_secret().as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("could not unlock vault to preview full host list: {e}"))?;
 
-    let approve_req = Request::ApproveLease {
-        id: args.request_id,
-        master_password,
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&approve_req).await?)?;
-    let Response::LeaseActivated(activated) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
-    };
+    // Keep this process-local cache alive through host-key confirmation: a
+    // ProxyJump-aware probe can then resolve vault-only bastions without a
+    // second password prompt. Always clear it before returning, including
+    // cancellation and daemon rejection paths.
+    let approval_result: anyhow::Result<LeaseActivatedInfo> = async {
+        let approved_hosts = ssh::expand_lease_hosts(&info.hosts).await;
+        confirm_approved_hosts(&approved_hosts)?;
 
-    // Host-key confirmation happens after the lease is activated, because
-    // only then can the daemon resolve vault-only aliases (the vault is
-    // unlocked by the approval itself). The daemon reports which resolved
-    // endpoints have no recorded key yet; this process dials each one
-    // directly (a read-only probe, no secrets involved) so the human can
-    // confirm its fingerprint (DESIGN.md §4).
-    for unverified in &activated.unverified_hosts {
-        confirm_and_record_host_key(&unverified.host, &unverified.hostname, unverified.port)
-            .await?;
+        let approve_req = Request::ApproveLease {
+            id: args.request_id,
+            master_password,
+            approved_hosts,
+        };
+        let resp = bail_on_error_or_unexpected(send_request(&approve_req).await?)?;
+        let Response::LeaseActivated(activated) = resp else {
+            anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
+        };
+
+        // Confirm dependencies before targets. A target reachable only via
+        // a bastion can then probe through that already-trusted hop instead
+        // of incorrectly trying a direct TCP connection.
+        for target in ssh::host_key_confirmation_order(&activated.hosts).await {
+            if ssh::host_has_known_key(&target.hostname, target.port) {
+                continue;
+            }
+            confirm_and_record_host_key(&target).await?;
+        }
+        Ok(activated)
     }
-
+    .await;
+    vault::clear_cache().await;
+    let activated = approval_result?;
     print_lease_activated(&activated);
     Ok(())
+}
+
+fn confirm_approved_hosts(hosts: &[String]) -> anyhow::Result<()> {
+    println!("Full host grant after vault-backed ProxyJump expansion:");
+    for host in hosts {
+        // Debug formatting visibly escapes terminal controls and newlines,
+        // so an untrusted requested alias cannot forge another list item.
+        println!("  - {host:?}");
+    }
+    print!("Approve exactly this host list? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        anyhow::bail!("approval cancelled; lease request remains pending");
+    }
+    Ok(())
+}
+
+fn display_host_list(hosts: &[String]) -> String {
+    hosts
+        .iter()
+        .map(|host| format!("{host:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn cmd_vault_init() -> anyhow::Result<()> {
@@ -496,45 +540,47 @@ fn prompt_master_password(vault_exists: bool) -> anyhow::Result<SecretString> {
     }
 }
 
-/// Dial `hostname:port` directly (not through the daemon — this is a plain
-/// read-only network probe with no secrets involved), show the human the
-/// host key's SHA256 fingerprint, and on confirmation record it in
-/// `~/.sloosh/known_hosts` (DESIGN.md §4). The endpoint comes pre-resolved
-/// from the daemon's `ApproveLease` reply, which applies the same precedence
-/// a real connection will (vault entry — visible to the daemon now the
-/// approval unlocked it — then `~/.ssh/config`, then the literal alias), so
-/// vault-only aliases get their real address confirmed too.
-async fn confirm_and_record_host_key(host: &str, hostname: &str, port: u16) -> anyhow::Result<()> {
-    print!("Fetching host key for {host} ({hostname}:{port})... ");
+/// Probe `host` through its configured ProxyJump route, show the human the
+/// final target's SHA256 fingerprint, and on confirmation record it in
+/// `~/.sloosh/known_hosts` (DESIGN.md §4). Intermediate hops retain normal
+/// strict host-key verification and authentication; the final target only
+/// performs key exchange and is never authenticated to by this probe.
+async fn confirm_and_record_host_key(
+    target: &ssh::HostKeyConfirmationTarget,
+) -> anyhow::Result<()> {
+    let host = &target.alias;
+    let host_display = format!("{host:?}");
+    print!("Fetching host key for {host_display} through configured SSH route... ");
     std::io::stdout().flush().ok();
-    let key = match ssh::fetch_host_key(hostname, port).await {
-        Ok(key) => key,
+    let probe = match ssh::fetch_host_key_for_confirmation_target(target).await {
+        Ok(probe) => probe,
         Err(e) => {
             println!("failed.");
             println!(
-                "warning: could not fetch a host key for '{host}' to record automatically \
+                "warning: could not fetch a host key for {host_display} to record automatically \
                  ({e}); continuing without recording one — the connection will still refuse to \
-                 trust an unrecorded key. Run `ssh {host}` by hand once if you need to accept it \
-                 manually."
+                 trust an unrecorded key. Verify its ProxyJump route and record the endpoint key \
+                 manually, or re-run this approval after fixing the route."
             );
             return Ok(());
         }
     };
     println!("done.");
 
-    let fingerprint = key.fingerprint(russh::keys::HashAlg::Sha256);
+    let fingerprint = probe.key.fingerprint(russh::keys::HashAlg::Sha256);
+    let endpoint_display = format!("{:?}:{}", probe.hostname, probe.port);
     print!(
-        "Host key fingerprint for {host} ({hostname}:{port}):\n    {fingerprint}\nTrust this key and remember it? [y/N] "
+        "Host key fingerprint for {host_display} ({endpoint_display}):\n    {fingerprint}\nTrust this key and remember it? [y/N] "
     );
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     if answer.trim().eq_ignore_ascii_case("y") {
-        ssh::record_sloosh_known_host(hostname, port, &key)?;
+        ssh::record_sloosh_known_host(&probe.hostname, probe.port, &probe.key)?;
         println!("recorded in ~/.sloosh/known_hosts");
     } else {
         println!(
-            "not recorded — connecting to '{host}' will refuse to trust its key until this is \
+            "not recorded — connecting to {host_display} will refuse to trust its key until this is \
              resolved (record it here, or add it to ~/.ssh/known_hosts by hand)."
         );
     }
@@ -546,7 +592,7 @@ fn print_lease_activated(info: &LeaseActivatedInfo) {
         "approved: {} (pid {}) can now access {}",
         info.anchor_name.as_deref().unwrap_or("unknown process"),
         info.anchor_pid,
-        info.hosts.join(", "),
+        display_host_list(&info.hosts),
     );
     println!(
         "\nEscape hatch, only if needed (e.g. the caller isn't a descendant of this approval's \
@@ -603,14 +649,9 @@ async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
 // put/get over SFTP (DESIGN.md §5-6).
 // ---------------------------------------------------------------------
 
-/// Resolve `path` to an absolute path against *this* process's current
-/// directory. Required before sending a local path to the daemon: the
-/// daemon reads/writes the local filesystem directly on the CLI's behalf
-/// (file content never crosses the socket), but the daemon's own working
-/// directory is not the caller's, so a relative path would resolve
-/// somewhere else entirely on that side. Existence is not required here —
-/// `get`'s local destination may not exist yet — this is pure path
-/// arithmetic, not a filesystem check.
+/// Resolve a user-facing path against this CLI process's cwd. The CLI owns
+/// every local filesystem operation; the daemon receives this string only as
+/// an audit/display label and never opens it.
 fn resolve_local_path(path: &str) -> anyhow::Result<String> {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -625,18 +666,182 @@ fn resolve_local_path(path: &str) -> anyhow::Result<String> {
     Ok(cwd.join(p).to_string_lossy().into_owned())
 }
 
+async fn open_local_upload(path: &str) -> anyhow::Result<tokio::fs::File> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("local upload '{path}' is not readable: {e}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("local upload '{path}' is not a regular file");
+    }
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("could not open local upload '{path}': {e}"))
+}
+
+struct LocalDownload {
+    destination: std::path::PathBuf,
+    temp: std::path::PathBuf,
+    file: Option<tokio::fs::File>,
+    force: bool,
+    committed: bool,
+}
+
+impl LocalDownload {
+    async fn open(path: &Path, force: bool) -> anyhow::Result<Self> {
+        if !force && tokio::fs::try_exists(path).await.unwrap_or(false) {
+            anyhow::bail!(
+                "local destination '{}' already exists; pass --force to replace it",
+                path.display()
+            );
+        }
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("local destination '{}' has no parent", path.display())
+        })?;
+        if !parent.is_dir() {
+            anyhow::bail!(
+                "local destination directory '{}' does not exist",
+                parent.display()
+            );
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
+        let temp = parent.join(format!(
+            ".{name}.sloosh-{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&temp)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not create local download temp file: {e}"))?;
+        Ok(Self {
+            destination: path.to_path_buf(),
+            temp,
+            file: Some(file),
+            force,
+            committed: false,
+        })
+    }
+
+    async fn write_chunk(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.file
+            .as_mut()
+            .expect("download file remains open until finish")
+            .write_all(data)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not write local download: {e}"))
+    }
+
+    async fn finish(mut self) -> anyhow::Result<()> {
+        let file = self
+            .file
+            .take()
+            .expect("download file remains open until finish");
+        file.sync_all()
+            .await
+            .map_err(|e| anyhow::anyhow!("could not flush local download: {e}"))?;
+        drop(file);
+
+        let temp = self.temp.clone();
+        let destination = self.destination.clone();
+        let force = self.force;
+        tokio::task::spawn_blocking(move || {
+            if force {
+                std::fs::rename(&temp, &destination).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not replace local destination '{}': {e}",
+                        destination.display()
+                    )
+                })?;
+            } else {
+                std::fs::hard_link(&temp, &destination).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        anyhow::anyhow!(
+                            "local destination '{}' already exists; pass --force to replace it",
+                            destination.display()
+                        )
+                    } else {
+                        anyhow::anyhow!(
+                            "could not create local destination '{}': {e}",
+                            destination.display()
+                        )
+                    }
+                })?;
+                std::fs::remove_file(&temp).map_err(|e| {
+                    anyhow::anyhow!("download succeeded but temp-file cleanup failed: {e}")
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("local download finalizer failed: {e}"))??;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for LocalDownload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+}
+
+async fn connect_for_transfer() -> anyhow::Result<UnixChannel> {
+    client::connect_or_spawn(&unix::resolve_socket_path()).await
+}
+
+async fn expect_transfer_ready(chan: &mut UnixChannel, operation: &str) -> anyhow::Result<()> {
+    let resp = chan
+        .recv::<Response>()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed before {operation} became ready"))?;
+    match bail_on_error_or_unexpected(resp)? {
+        Response::TransferReady => Ok(()),
+        other => anyhow::bail!("daemon sent an unexpected reply to {operation}: {other:?}"),
+    }
+}
+
 async fn cmd_put(args: PutArgs) -> anyhow::Result<()> {
     let local_path = resolve_local_path(&args.local_path)?;
+    let mut local_file = open_local_upload(&local_path).await?;
     let req = Request::Put {
         host: args.host,
-        local_path,
+        local_path: local_path.clone(),
         remote_path: args.remote_path,
         session: args.session,
         lease_token: lease_token_from_env(),
     };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Transfer(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Put: {resp:?}");
+    let mut chan = connect_for_transfer().await?;
+    chan.send(&req).await?;
+    expect_transfer_ready(&mut chan, "Put").await?;
+
+    let mut buffer = Zeroizing::new(vec![0u8; MAX_RAW_FRAME_BYTES]);
+    loop {
+        let read = local_file
+            .read(buffer.as_mut_slice())
+            .await
+            .map_err(|e| anyhow::anyhow!("could not read local upload '{local_path}': {e}"))?;
+        if read == 0 {
+            break;
+        }
+        chan.send_raw_frame(&buffer[..read]).await?;
+    }
+    chan.send_raw_frame(&[]).await?;
+
+    let resp = chan
+        .recv::<Response>()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed before Put completed"))?;
+    let Response::Transfer(reply) = bail_on_error_or_unexpected(resp)? else {
+        anyhow::bail!("daemon sent an unexpected final reply to Put");
     };
     println!(
         "put: {} -> {}:{} ({} bytes)",
@@ -647,18 +852,29 @@ async fn cmd_put(args: PutArgs) -> anyhow::Result<()> {
 
 async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
     let local_path = resolve_local_path(&args.local_path)?;
+    let mut local_file = LocalDownload::open(Path::new(&local_path), args.force).await?;
     let req = Request::Get {
         host: args.host,
         remote_path: args.remote_path,
-        local_path,
+        local_path: local_path.clone(),
         session: args.session,
-        force: args.force,
         lease_token: lease_token_from_env(),
     };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Transfer(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Get: {resp:?}");
+    let mut chan = connect_for_transfer().await?;
+    chan.send(&req).await?;
+    expect_transfer_ready(&mut chan, "Get").await?;
+    while let Some(chunk) = chan.recv_raw_frame().await? {
+        let chunk = Zeroizing::new(chunk);
+        local_file.write_chunk(&chunk).await?;
+    }
+    let resp = chan
+        .recv::<Response>()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("daemon closed before Get completed"))?;
+    let Response::Transfer(reply) = bail_on_error_or_unexpected(resp)? else {
+        anyhow::bail!("daemon sent an unexpected final reply to Get");
     };
+    local_file.finish().await?;
     println!(
         "get: {}:{} -> {} ({} bytes)",
         reply.host, reply.remote_path, reply.local_path, reply.bytes_transferred
@@ -822,7 +1038,7 @@ fn print_audit_event_human(v: &serde_json::Value) {
 
 fn render_field_value(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::String(s) => format!("{s:?}"),
         other => other.to_string(),
     }
 }
@@ -865,5 +1081,82 @@ mod tests {
         let cwd = std::env::current_dir().expect("current dir");
         let expected = cwd.join("file.txt").to_string_lossy().into_owned();
         assert_eq!(resolve_local_path("file.txt").unwrap(), expected);
+    }
+
+    #[test]
+    fn audit_string_fields_escape_terminal_controls() {
+        let rendered = render_field_value(&serde_json::Value::String(
+            "host\n\u{1b}[31mforged".to_string(),
+        ));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    fn transfer_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sloosh-cli-transfer-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[tokio::test]
+    async fn upload_file_is_opened_by_cli_without_total_size_limit() {
+        let path = transfer_test_path("upload");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        let file = open_local_upload(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 128 * 1024 * 1024);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn download_write_is_atomic_and_refuses_clobber_without_force() {
+        let path = transfer_test_path("download");
+        std::fs::write(&path, b"keep-me").unwrap();
+
+        let err = match LocalDownload::open(&path, false).await {
+            Ok(_) => panic!("existing destination should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--force"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep-me");
+
+        let mut download = LocalDownload::open(&path, true).await.unwrap();
+        download.write_chunk(b"replace").await.unwrap();
+        download.write_chunk(b"ment").await.unwrap();
+        download.finish().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_removes_temp_without_creating_destination() {
+        let path = transfer_test_path("interrupted-download");
+        let _ = std::fs::remove_file(&path);
+
+        let mut download = LocalDownload::open(&path, false).await.unwrap();
+        download.write_chunk(b"partial bytes").await.unwrap();
+        let temp = download.temp.clone();
+        assert!(temp.exists());
+        drop(download);
+
+        assert!(!temp.exists(), "partial temp file must be removed");
+        assert!(
+            !path.exists(),
+            "an interrupted download must not create the final destination"
+        );
     }
 }

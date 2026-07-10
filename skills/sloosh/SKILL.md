@@ -27,6 +27,7 @@ sloosh run myhost "npm test"                 # run a command in myhost's default
 sloosh peek myhost                           # incremental output since your last peek
 sloosh put myhost ./build.tar.gz /srv/app/   # upload a local file over the same connection
 sloosh get myhost /var/log/app.log ./log.txt # download a remote file
+sloosh forward myhost -L 8080:127.0.0.1:80  # loopback-only local tunnel
 sloosh status                                # daemon/lease/session overview — run this when lost
 ```
 
@@ -43,6 +44,18 @@ sloosh status                                # daemon/lease/session overview —
   `sloosh add` and wait.
 - Sessions keep their working directory and environment between calls; you
   don't need to `cd` back into place or re-`export` things every time.
+- `put`/`get` stream files in frames of at most 1 MiB with no total-size cap.
+  Command-output spool limits do not apply to SFTP, and the dependency's short
+  request timeout is raised to a far-future deadline. `put` truncates an
+  existing remote destination; check the remote path before starting it.
+- A file transfer is lease-authorized before streaming starts. Once started,
+  that finite transfer may finish even if the lease expires; lease expiry
+  still blocks new operations.
+- `get` refuses to overwrite an existing local file. Use `--force` only when
+  replacing that file is explicitly intended; completed downloads are
+  committed atomically.
+- Port forwarding supports loopback-only `-L`. Remote `-R` forwarding and
+  non-loopback listeners are currently rejected.
 
 ## More detail
 

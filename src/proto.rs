@@ -1,11 +1,14 @@
 //! NDJSON wire protocol between the `sloosh` CLI and `sloosh daemon`.
 //!
-//! Every message is a single JSON object serialized on one line (newline
-//! delimited JSON), so the protocol stays debuggable with `nc -U` and never
-//! needs a schema compiler. Enums are internally tagged (`"type"` field) so
-//! new variants and fields can be added without breaking older peers —
-//! unknown fields are ignored by serde by default, and `#[serde(default)]`
-//! lets old messages satisfy newly-added fields.
+//! Control messages are single JSON objects serialized one per line (NDJSON),
+//! so ordinary request/reply traffic stays inspectable without a schema
+//! compiler. SFTP payload bytes switch the same connection to bounded raw
+//! frames after `TransferReady`; see `docs/PROTOCOL.md`. Enums are internally
+//! tagged (`"type"` field). Unknown fields are ignored by serde by default,
+//! and `#[serde(default)]` lets old messages satisfy selected newly-added
+//! fields. New variants or sequencing changes are not inherently compatible,
+//! so clients verify [`WIRE_PROTOCOL_VERSION`] through `Status` before
+//! sending ordinary requests.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,6 +16,16 @@ use std::fmt;
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroize;
+
+/// Control messages are small JSON objects. File bytes use the transport's
+/// separate bounded-frame stream, so a large file never needs a large JSON
+/// allocation.
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Exact CLI/daemon wire contract version. Bump this for any incompatible
+/// message shape or sequencing change; package versions may differ while this
+/// remains equal.
+pub const WIRE_PROTOCOL_VERSION: u32 = 2;
 
 /// A password/secret that crosses the CLI<->daemon socket (DESIGN.md §4:
 /// "passwords/keys crossing the socket is acceptable, same-user 0600" — but
@@ -68,6 +81,10 @@ impl Drop for SecretString {
 pub enum Request {
     /// Report daemon health: pid, version, uptime, live sessions and leases.
     Status,
+    /// Negotiate the exact wire contract before any ordinary request. Status
+    /// and Shutdown remain available without this handshake so a newer CLI
+    /// can inspect and stop an older resident daemon.
+    Hello { wire_protocol: u32 },
     /// Ask the daemon to shut down gracefully after replying `Ok`.
     Shutdown,
     /// Run a command in a host's default (or named) session, auto-creating
@@ -150,6 +167,16 @@ pub enum Request {
     ApproveLease {
         id: String,
         master_password: SecretString,
+        /// Exact host list the human saw and confirmed after locally
+        /// unlocking the vault and expanding every ProxyJump chain. The
+        /// daemon independently repeats that expansion after unlocking its
+        /// own vault cache and refuses activation unless the lists match.
+        ///
+        /// Defaulting keeps an older client's message parseable, but the
+        /// empty list cannot match a real non-empty request, so it fails
+        /// closed with a self-teaching approval error.
+        #[serde(default)]
+        approved_hosts: Vec<String>,
     },
     /// Whether a vault exists yet, so `add`/`approve` can decide whether to
     /// walk the human through first-time master-password setup.
@@ -197,6 +224,8 @@ pub enum Request {
     /// disposable workspace.
     Put {
         host: String,
+        /// Label for audit/output only. The daemon never opens this path;
+        /// bytes follow as bounded raw frames after `TransferReady`.
         local_path: String,
         remote_path: String,
         #[serde(default)]
@@ -205,18 +234,15 @@ pub enum Request {
         lease_token: Option<String>,
     },
     /// Download a remote file to the local filesystem over SFTP, same
-    /// connection-reuse contract as `Put`. Refuses to overwrite an existing
-    /// local file unless `force` is set — unlike `put`, the destination
-    /// here is the user's own machine, so accidental overwrite is worse
-    /// than a refusal.
+    /// connection-reuse contract as `Put`. The daemon treats `local_path` as
+    /// a label only; overwrite policy and atomic commit are enforced entirely
+    /// by the CLI that owns the local destination.
     Get {
         host: String,
         remote_path: String,
         local_path: String,
         #[serde(default)]
         session: Option<String>,
-        #[serde(default)]
-        force: bool,
         #[serde(default)]
         lease_token: Option<String>,
     },
@@ -242,6 +268,38 @@ pub enum Request {
     ForwardStop { id: String },
 }
 
+impl Request {
+    /// Stable, field-free request name for diagnostics. Logging a full
+    /// request would expose lease tokens, interactive keystrokes, and file
+    /// payloads.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Status => "Status",
+            Self::Hello { .. } => "Hello",
+            Self::Shutdown => "Shutdown",
+            Self::Run { .. } => "Run",
+            Self::Peek { .. } => "Peek",
+            Self::Send { .. } => "Send",
+            Self::Interrupt { .. } => "Interrupt",
+            Self::Open { .. } => "Open",
+            Self::Ls { .. } => "Ls",
+            Self::Kill { .. } => "Kill",
+            Self::RequestLease { .. } => "RequestLease",
+            Self::DescribeLeaseRequest { .. } => "DescribeLeaseRequest",
+            Self::ApproveLease { .. } => "ApproveLease",
+            Self::VaultExists => "VaultExists",
+            Self::InitVault { .. } => "InitVault",
+            Self::AddCred { .. } => "AddCred",
+            Self::RmCred { .. } => "RmCred",
+            Self::Put { .. } => "Put",
+            Self::Get { .. } => "Get",
+            Self::Forward { .. } => "Forward",
+            Self::ForwardLs => "ForwardLs",
+            Self::ForwardStop { .. } => "ForwardStop",
+        }
+    }
+}
+
 /// Which side of a forward is doing the listening, carrying the raw spec
 /// string for that direction (DESIGN.md §6). A newtype-per-variant rather
 /// than a shared `spec: String` + separate `is_remote: bool` field, so a
@@ -265,6 +323,9 @@ fn default_run_timeout_secs() -> u64 {
 pub enum Response {
     /// Reply to `Request::Status`.
     Status(StatusReply),
+    /// The daemon accepted `Request::Hello`; ordinary requests may follow on
+    /// this connection.
+    ProtocolReady { wire_protocol: u32 },
     /// Reply to `Request::Run`.
     Run(RunReply),
     /// Reply to `Request::Peek`.
@@ -291,6 +352,9 @@ pub enum Response {
     LeaseActivated(LeaseActivatedInfo),
     /// Reply to `Request::Put`/`Request::Get`.
     Transfer(TransferReply),
+    /// SFTP endpoint is open. The sender may start raw frame streaming on the
+    /// same channel; zero-length frame terminates the byte stream.
+    TransferReady,
     /// Reply to `Request::Forward`: the daemon prints this and the CLI
     /// exits — the forward itself keeps running in the daemon.
     Forward(ForwardOpened),
@@ -345,6 +409,11 @@ pub struct PeekReply {
 pub struct StatusReply {
     pub pid: u32,
     pub version: String,
+    /// Exact wire contract spoken by the daemon. Missing means a legacy
+    /// daemon that predates protocol negotiation and therefore cannot safely
+    /// be used by a current CLI.
+    #[serde(default)]
+    pub wire_protocol: u32,
     pub uptime_secs: u64,
     /// Live PTY sessions. Empty until session management lands.
     #[serde(default)]
@@ -486,6 +555,16 @@ where
     let mut line =
         serde_json::to_string(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     line.push('\n');
+    if line.len() > MAX_WIRE_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "wire message is {} bytes, exceeds {} byte limit",
+                line.len(),
+                MAX_WIRE_MESSAGE_BYTES
+            ),
+        ));
+    }
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await
 }
@@ -497,16 +576,45 @@ where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
+    read_message_with_limit(reader, MAX_WIRE_MESSAGE_BYTES).await
+}
+
+async fn read_message_with_limit<R, T>(reader: &mut R, limit: usize) -> io::Result<Option<T>>
+where
+    R: AsyncBufRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let take = newline.map_or(available.len(), |i| i + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("wire message exceeds {limit} byte limit"),
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    if line.is_empty() {
         return Ok(None);
     }
-    let trimmed = line.trim_end();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_str(trimmed)
+    serde_json::from_slice(&line)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -530,6 +638,16 @@ mod tests {
     }
 
     #[test]
+    fn protocol_handshake_round_trips() {
+        round_trip(Request::Hello {
+            wire_protocol: WIRE_PROTOCOL_VERSION,
+        });
+        round_trip(Response::ProtocolReady {
+            wire_protocol: WIRE_PROTOCOL_VERSION,
+        });
+    }
+
+    #[test]
     fn request_shutdown_round_trips() {
         round_trip(Request::Shutdown);
     }
@@ -539,6 +657,7 @@ mod tests {
         round_trip(Response::Status(StatusReply {
             pid: 1234,
             version: "0.1.0".to_string(),
+            wire_protocol: WIRE_PROTOCOL_VERSION,
             uptime_secs: 42,
             sessions: vec![SessionSummary {
                 name: "default".to_string(),
@@ -570,6 +689,7 @@ mod tests {
         // #[serde(default)] must keep this backward compatible.
         let json = r#"{"pid":1,"version":"0.0.1","uptime_secs":0}"#;
         let reply: StatusReply = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(reply.wire_protocol, 0);
         assert!(reply.sessions.is_empty());
         assert!(reply.leases.is_empty());
     }
@@ -671,6 +791,7 @@ mod tests {
         round_trip(Request::ApproveLease {
             id: "ABCD1234".to_string(),
             master_password: SecretString::new("hunter2"),
+            approved_hosts: vec!["web".to_string(), "bastion".to_string()],
         });
         round_trip(Request::VaultExists);
         round_trip(Request::InitVault {
@@ -790,9 +911,24 @@ mod tests {
         let req = Request::ApproveLease {
             id: "X".to_string(),
             master_password: SecretString::new("super-secret-password"),
+            approved_hosts: vec!["web".to_string()],
         };
         let debug = format!("{req:?}");
         assert!(!debug.contains("super-secret-password"), "{debug}");
+    }
+
+    #[test]
+    fn old_approve_request_defaults_to_empty_for_fail_closed_check() {
+        let json = r#"{"type":"ApproveLease","id":"ABCD1234","master_password":"hunter2"}"#;
+        let req: Request = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            req,
+            Request::ApproveLease {
+                id: "ABCD1234".to_string(),
+                master_password: SecretString::new("hunter2"),
+                approved_hosts: Vec::new(),
+            }
+        );
     }
 
     #[test]
@@ -871,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn put_get_requests_round_trip_with_defaults() {
+    fn put_get_requests_carry_labels_not_local_file_authority() {
         round_trip(Request::Put {
             host: "box".to_string(),
             local_path: "/home/u/file.txt".to_string(),
@@ -884,48 +1020,31 @@ mod tests {
             remote_path: "/tmp/file.txt".to_string(),
             local_path: "/home/u/file.txt".to_string(),
             session: Some("dev".to_string()),
-            force: true,
             lease_token: Some("deadbeef".to_string()),
         });
-
-        // Old clients that omit `session`/`force`/`lease_token` entirely
-        // must still parse (#[serde(default)] discipline).
-        let json = r#"{"type":"Put","host":"box","local_path":"/a","remote_path":"/b"}"#;
-        let req: Request = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(
-            req,
-            Request::Put {
-                host: "box".to_string(),
-                local_path: "/a".to_string(),
-                remote_path: "/b".to_string(),
-                session: None,
-                lease_token: None,
-            }
-        );
-
-        let json = r#"{"type":"Get","host":"box","remote_path":"/a","local_path":"/b"}"#;
-        let req: Request = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(
-            req,
-            Request::Get {
-                host: "box".to_string(),
-                remote_path: "/a".to_string(),
-                local_path: "/b".to_string(),
-                session: None,
-                force: false,
-                lease_token: None,
-            }
-        );
     }
 
     #[test]
     fn transfer_reply_round_trips() {
-        round_trip(Response::Transfer(TransferReply {
+        let reply = TransferReply {
             host: "box".to_string(),
             session: "default".to_string(),
             local_path: "/home/u/file.txt".to_string(),
             remote_path: "/tmp/file.txt".to_string(),
             bytes_transferred: 1234,
-        }));
+        };
+        round_trip(Response::Transfer(reply.clone()));
+        round_trip(Response::TransferReady);
+    }
+
+    #[tokio::test]
+    async fn oversized_wire_message_is_rejected_before_unbounded_growth() {
+        let input = b"{\"type\":\"Status\",\"padding\":\"xxxxxxxx\"}\n";
+        let mut reader = tokio::io::BufReader::new(&input[..]);
+        let err = read_message_with_limit::<_, Request>(&mut reader, 16)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"));
     }
 }

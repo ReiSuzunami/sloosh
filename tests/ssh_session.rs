@@ -17,7 +17,7 @@
 //! time.
 
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{Request, Response};
+use sloosh::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
@@ -28,11 +28,19 @@ fn test_host() -> Option<String> {
 }
 
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "sloosh-ssh-itest-{tag}-{}-{}.sock",
+    let dir = std::env::temp_dir().join(format!(
+        "sloosh-ssh-itest-{tag}-{}-{}",
         std::process::id(),
         tag.len()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    dir.join("sloosh.sock")
 }
 
 /// Point `$SLOOSH_HOME` at a private temp directory for the rest of this
@@ -89,7 +97,20 @@ async fn grant_lease_for_test(host: &str) {
 async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(path).await {
+        if let Ok(mut chan) = UnixChannel::connect(path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;

@@ -746,6 +746,33 @@ impl russh::client::Handler for KeyCapturingHandler {
     }
 }
 
+/// One host-key confirmation item, ordered so every ProxyJump dependency
+/// appears before a target that needs it. Kept crate-private: routed probes
+/// are only part of the human `approve` flow while that CLI process has
+/// locally unlocked the vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostKeyConfirmationTarget {
+    pub alias: String,
+    pub hostname: String,
+    pub port: u16,
+    route: HostKeyProbeRoute,
+}
+
+/// Result of a read-only routed key probe. The endpoint is returned from the
+/// same resolution used for the actual probe, so the CLI records the key
+/// against what was really dialed rather than an earlier preview.
+pub(crate) struct HostKeyProbeResult {
+    pub hostname: String,
+    pub port: u16,
+    pub key: PublicKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostKeyProbeRoute {
+    hops: Vec<HostConfig>,
+    target: HostConfig,
+}
+
 /// Whether *any* key is already recorded for `hostname:port` in either
 /// known_hosts file, regardless of whether it would actually match a live
 /// connection's key. Used by the `sloosh approve` flow (DESIGN.md §4) to
@@ -770,15 +797,56 @@ pub fn host_has_known_key(hostname: &str, port: u16) -> bool {
 /// involved.
 pub async fn fetch_host_key(hostname: &str, port: u16) -> Result<PublicKey, SshError> {
     let tcp = open_tcp(hostname, port).await?;
+    capture_host_key_over_stream(tcp, hostname, port).await
+}
+
+/// Fetch a host key by alias using the same ProxyJump route resolution as a
+/// real connection. Intermediate hops use the normal strict known-hosts
+/// handler and normal authentication. Only the final target accepts and
+/// captures an unknown key, and the probe stops before authenticating to it.
+///
+/// This deliberately does not enforce daemon leases: it runs in the
+/// separate human CLI during `approve`, after that process locally unlocked
+/// the vault with the entered master password. Keeping it crate-private
+/// prevents it becoming a general-purpose host access path.
+pub(crate) async fn fetch_host_key_for_confirmation_target(
+    confirmation: &HostKeyConfirmationTarget,
+) -> Result<HostKeyProbeResult, SshError> {
+    let route = &confirmation.route;
+    let hostname = route.target.hostname.clone();
+    let port = route.target.port;
+
+    let key = if route.hops.is_empty() {
+        let tcp = open_tcp(&hostname, port).await?;
+        capture_host_key_over_stream(tcp, &hostname, port).await?
+    } else {
+        capture_host_key_via_hops(&route.hops, &route.target).await?
+    };
+
+    Ok(HostKeyProbeResult {
+        hostname,
+        port,
+        key,
+    })
+}
+
+async fn capture_host_key_over_stream<S>(
+    stream: S,
+    hostname: &str,
+    port: u16,
+) -> Result<PublicKey, SshError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let config = Arc::new(russh::client::Config::default());
     let captured: Arc<Mutex<Option<PublicKey>>> = Arc::new(Mutex::new(None));
     let handler = KeyCapturingHandler {
         captured: captured.clone(),
     };
-    russh::client::connect_stream(config, tcp, handler)
+    let handle = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| add_handshake_context(e, hostname, port))?;
-    captured
+    let key = captured
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
@@ -786,7 +854,63 @@ pub async fn fetch_host_key(hostname: &str, port: u16) -> Result<PublicKey, SshE
             host: hostname.to_string(),
             port,
             source: russh::Error::Disconnect,
-        })
+        })?;
+    drop(handle);
+    Ok(key)
+}
+
+async fn resolve_host_key_probe_route(
+    config: &SshConfig,
+    alias: &str,
+) -> Result<HostKeyProbeRoute, SshError> {
+    let target = resolve_host_config(config, alias).await;
+    let mut hops = Vec::new();
+    if let Some(jump_spec) = target.proxy_jump.as_deref() {
+        let mut seen = HashSet::new();
+        seen.insert(target.alias.clone());
+        expand_proxy_jump_spec(config, jump_spec, &mut hops, &mut seen).await?;
+    }
+    Ok(HostKeyProbeRoute { hops, target })
+}
+
+async fn capture_host_key_via_hops(
+    hops: &[HostConfig],
+    target: &HostConfig,
+) -> Result<PublicKey, SshError> {
+    let mut handles: Vec<russh::client::Handle<Handler>> = Vec::with_capacity(hops.len());
+    for (index, hop) in hops.iter().enumerate() {
+        let handle = if index == 0 {
+            let tcp = open_tcp(&hop.hostname, hop.port).await?;
+            connect_over_stream(tcp, hop, None).await?
+        } else {
+            let previous = handles
+                .last()
+                .expect("first hop is connected before later hops");
+            let channel = previous
+                .channel_open_direct_tcpip(hop.hostname.clone(), hop.port as u32, "127.0.0.1", 0)
+                .await
+                .map_err(|source| SshError::ProxyTunnel {
+                    host: hop.hostname.clone(),
+                    port: hop.port,
+                    source,
+                })?;
+            connect_over_stream(channel.into_stream(), hop, None).await?
+        };
+        handles.push(handle);
+    }
+
+    let last = handles
+        .last()
+        .expect("routed key probe calls this helper with at least one hop");
+    let channel = last
+        .channel_open_direct_tcpip(target.hostname.clone(), target.port as u32, "127.0.0.1", 0)
+        .await
+        .map_err(|source| SshError::ProxyTunnel {
+            host: target.hostname.clone(),
+            port: target.port,
+            source,
+        })?;
+    capture_host_key_over_stream(channel.into_stream(), &target.hostname, target.port).await
 }
 
 /// Record `key` as the trusted host key for `hostname:port` in sloosh's own
@@ -1074,6 +1198,81 @@ pub async fn expand_lease_hosts(hosts: &[String]) -> Vec<String> {
         }
     }
     expanded
+}
+
+/// Build host-key confirmation work in dependency order: every target's
+/// ProxyJump chain first (dial order), then the target, deduplicated across
+/// all granted hosts. This lets the human record a bastion before a later
+/// target probe must strictly verify and authenticate through that bastion.
+pub(crate) async fn host_key_confirmation_order(
+    hosts: &[String],
+) -> Vec<HostKeyConfirmationTarget> {
+    let config = SshConfig::load_default();
+    host_key_confirmation_order_with_config(&config, hosts).await
+}
+
+async fn host_key_confirmation_order_with_config(
+    config: &SshConfig,
+    hosts: &[String],
+) -> Vec<HostKeyConfirmationTarget> {
+    let mut dependency_groups = Vec::with_capacity(hosts.len());
+    let mut routes: Vec<(String, HostKeyProbeRoute)> = Vec::new();
+    for host in hosts {
+        let route = match resolve_host_key_probe_route(config, host).await {
+            Ok(route) => route,
+            Err(e) => {
+                warn!(host, error = %e, "could not plan ProxyJump host-key confirmation route; \
+                       skipping the probe rather than bypassing the configured route");
+                continue;
+            }
+        };
+        let dependencies: Vec<String> = route.hops.iter().map(|hop| hop.alias.clone()).collect();
+        for (index, hop) in route.hops.iter().enumerate() {
+            if !routes.iter().any(|(alias, _)| alias == &hop.alias) {
+                routes.push((
+                    hop.alias.clone(),
+                    HostKeyProbeRoute {
+                        hops: route.hops[..index].to_vec(),
+                        target: hop.clone(),
+                    },
+                ));
+            }
+        }
+        if !routes.iter().any(|(alias, _)| alias == host) {
+            routes.push((host.clone(), route));
+        }
+        dependency_groups.push((host.clone(), dependencies));
+    }
+
+    let aliases = dependency_first_aliases(&dependency_groups);
+    let mut targets = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let route = routes
+            .iter()
+            .find(|(candidate, _)| candidate == &alias)
+            .map(|(_, route)| route.clone())
+            .expect("every ordered alias has a planned probe route");
+        targets.push(HostKeyConfirmationTarget {
+            alias,
+            hostname: route.target.hostname.clone(),
+            port: route.target.port,
+            route,
+        });
+    }
+    targets
+}
+
+fn dependency_first_aliases(groups: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for (target, dependencies) in groups {
+        for alias in dependencies.iter().chain(std::iter::once(target)) {
+            if seen.insert(alias.clone()) {
+                ordered.push(alias.clone());
+            }
+        }
+    }
+    ordered
 }
 
 /// The alias chain of `alias`'s `ProxyJump` (if any), in dial order — reuses
@@ -1503,6 +1702,82 @@ Host hop2
         // hop1 (hop2's own jump host) must be dialed before hop2.
         let aliases: Vec<&str> = chain.iter().map(|c| c.alias.as_str()).collect();
         assert_eq!(aliases, vec!["hop1", "hop2"]);
+    }
+
+    #[test]
+    fn host_key_dependencies_are_ordered_before_targets_and_deduplicated() {
+        let groups = vec![
+            (
+                "nas".to_string(),
+                vec!["edge".to_string(), "bastion".to_string()],
+            ),
+            ("db".to_string(), vec!["edge".to_string()]),
+            ("bastion".to_string(), vec!["edge".to_string()]),
+            ("nas".to_string(), Vec::new()),
+        ];
+
+        assert_eq!(
+            dependency_first_aliases(&groups),
+            vec!["edge", "bastion", "nas", "db"]
+        );
+    }
+
+    #[tokio::test]
+    async fn host_key_confirmation_plan_uses_nested_proxy_route_without_network() {
+        let config = SshConfig::parse(
+            "\
+Host sloosh-probe-target
+    HostName 10.0.0.30
+    ProxyJump sloosh-probe-hop2
+Host sloosh-probe-hop2
+    HostName 10.0.0.20
+    ProxyJump sloosh-probe-hop1
+Host sloosh-probe-hop1
+    HostName 10.0.0.10
+Host sloosh-probe-other
+    HostName 10.0.0.40
+    ProxyJump sloosh-probe-hop1
+",
+        );
+        let hosts = vec![
+            "sloosh-probe-target".to_string(),
+            "sloosh-probe-other".to_string(),
+            "sloosh-probe-hop2".to_string(),
+        ];
+
+        let plan = host_key_confirmation_order_with_config(&config, &hosts).await;
+        let aliases: Vec<&str> = plan.iter().map(|target| target.alias.as_str()).collect();
+        assert_eq!(
+            aliases,
+            vec![
+                "sloosh-probe-hop1",
+                "sloosh-probe-hop2",
+                "sloosh-probe-target",
+                "sloosh-probe-other",
+            ]
+        );
+        assert_eq!(plan[0].hostname, "10.0.0.10");
+        assert_eq!(plan[1].hostname, "10.0.0.20");
+        assert_eq!(plan[2].hostname, "10.0.0.30");
+        assert_eq!(plan[3].hostname, "10.0.0.40");
+    }
+
+    #[tokio::test]
+    async fn host_key_confirmation_never_falls_back_to_direct_on_bad_route() {
+        let config = SshConfig::parse(
+            "\
+Host sloosh-probe-cycle-a
+    HostName 10.0.0.10
+    ProxyJump sloosh-probe-cycle-b
+Host sloosh-probe-cycle-b
+    HostName 10.0.0.20
+    ProxyJump sloosh-probe-cycle-a
+",
+        );
+        let plan =
+            host_key_confirmation_order_with_config(&config, &["sloosh-probe-cycle-a".to_string()])
+                .await;
+        assert!(plan.is_empty());
     }
 
     #[tokio::test]
