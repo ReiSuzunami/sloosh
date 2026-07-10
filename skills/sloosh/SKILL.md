@@ -28,6 +28,7 @@ sloosh peek myhost                           # incremental output since your las
 sloosh put myhost ./build.tar.gz /srv/app/   # upload a local file over the same connection
 sloosh get myhost /var/log/app.log ./log.txt # download a remote file
 sloosh forward myhost -L 8080:127.0.0.1:80  # loopback-only local tunnel
+sloosh forward myhost -R 9000:127.0.0.1:3000 # remote listener to a local service
 sloosh status                                # daemon/lease/session overview — run this when lost
 ```
 
@@ -54,8 +55,10 @@ sloosh status                                # daemon/lease/session overview —
 - `get` refuses to overwrite an existing local file. Use `--force` only when
   replacing that file is explicitly intended; completed downloads are
   committed atomically.
-- Port forwarding supports loopback-only `-L`. Remote `-R` forwarding and
-  non-loopback listeners are currently rejected.
+- Port forwarding supports loopback-only `-L` and remote `-R`. Use `-R` only
+  when a remote listener is intended, and choose its bind address carefully:
+  the SSH server's `GatewayPorts` policy decides whether it is externally
+  reachable. Non-loopback local `-L` listeners are rejected.
 
 ## More detail
 

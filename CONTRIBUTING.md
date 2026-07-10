@@ -5,14 +5,14 @@ near a trust boundary need explicit reasoning and focused tests.
 
 ## Dev setup
 
-The minimum supported Rust version (MSRV) is 1.88. Normal development uses a
+The minimum supported Rust version (MSRV) is 1.85. Normal development uses a
 current stable toolchain; CI separately verifies that the code still checks
-with Rust 1.88.
+with Rust 1.85.
 
 ```
 git clone https://github.com/ReiSuzunami/sloosh
 cd sloosh
-rustup toolchain install stable 1.88.0
+rustup toolchain install stable 1.85.0
 cargo build
 ```
 
@@ -22,16 +22,17 @@ network or your real `~/.sloosh`.
 
 ## Before you open a PR
 
-These are the same checks CI runs; please run them locally first:
+Run the full local gate before opening a PR:
 
 ```
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test
-cargo +1.88.0 check --all-targets --all-features --locked
+cargo test --all-targets --all-features --locked
+cargo +1.85.0 check --all-targets --all-features --locked
+git diff --check
 ```
 
-All four must pass cleanly. If `cargo fmt` reports a diff, run
+All five must pass cleanly. If `cargo fmt` reports a diff, run
 `cargo fmt --all` and commit the result rather than hand-formatting.
 
 CI maps these checks as follows:
@@ -40,8 +41,8 @@ CI maps these checks as follows:
 |---|---|---|
 | `lint` | Ubuntu, stable | `cargo fmt --all --check` and strict clippy |
 | `test` | Ubuntu + macOS, stable | Unit tests and non-live integration tests |
-| `msrv` | Ubuntu, Rust 1.88 | `cargo check --all-targets --locked` |
-| `live-ssh` | Ubuntu, stable | Live session, SFTP, and local-forward tests against a local sshd |
+| `msrv` | Ubuntu, Rust 1.85 | `cargo check --all-targets --all-features --locked` |
+| `live-ssh` | Ubuntu, stable | Live session, SFTP, and local/remote-forward tests against a local sshd |
 
 ## Running the live SSH tests
 
@@ -53,14 +54,15 @@ set:
 |---|---|---|---|
 | `ssh_session` | Persistent PTY operations and session lifecycle | `SLOOSH_TEST_SSH_HOST` | Yes |
 | `sftp_transfer` | Streaming `put`/`get`, >32 MiB no-total-cap, in-flight lease expiry, and PTY-reaper survival | `SLOOSH_TEST_SSH_HOST` | Yes |
-| `forward` | Loopback-only local forwarding and lease teardown | `SLOOSH_TEST_SSH_HOST` | Yes |
+| `forward` | Local and remote forwarding plus lease teardown | `SLOOSH_TEST_SSH_HOST` | Yes |
 | `proxy_jump` | Vault-backed jump, tunneled handshake, per-hop lease | `SLOOSH_TEST_SSH_HOST`, `SLOOSH_TEST_SSH_PASSWORD` | Manual |
 
 ```
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
 SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
   --test sftp_transfer -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
+  --test forward -- --test-threads=1
 SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
   cargo test --test proxy_jump -- --test-threads=1
 ```
@@ -82,7 +84,7 @@ an isolated test host.
 Changes touching any of the following will be held to a higher review bar,
 and PRs there should explain their reasoning in more depth than usual:
 
-- `src/proto.rs`, `src/transport/`, and `src/cli/client.rs` — wire protocol 2,
+- `src/proto.rs`, `src/transport/`, and `src/cli/client.rs` — wire protocol 1,
   control-message limits, raw transfer framing, peer identity, daemon version
   checks, and private socket/log paths.
 - `src/daemon/lease.rs` and `src/daemon/forward.rs` — process-ancestry
@@ -97,7 +99,7 @@ and PRs there should explain their reasoning in more depth than usual:
 
 Keep these contracts intact unless the change explicitly revises them:
 
-- Protocol 2 control messages are bounded NDJSON. SFTP data uses raw frames
+- Protocol 1 control messages are bounded NDJSON. SFTP data uses raw frames
   capped at 1 MiB each, with no total transfer-size cap.
 - Connection setup is bidirectional: the CLI validates `Status`, then sends
   `Hello` and waits for `ProtocolReady`. The daemon rejects ordinary requests
@@ -112,14 +114,18 @@ Keep these contracts intact unless the change explicitly revises them:
 - SFTP replaces `russh-sftp`'s 10-second request default with the pinned
   Tokio far-future deadline (roughly 30 years); do not restore the short
   default, which breaks slow NAS operations.
-- `get` commits through a mode-`0600` temporary file and does not clobber by
-  default. `put` truncates the remote destination and is not atomic remotely.
-- Local forwards bind only loopback addresses. Remote (`-R`) forwarding stays
-  disabled until capability-specific approval exists.
+- `get` requests mode `0666` for its temporary file, lets the caller's umask
+  determine the effective mode, and does not clobber by default. `put`
+  truncates the remote destination and is not atomic remotely.
+- Local forwards bind only loopback addresses. Remote (`-R`) forwarding is
+  supported under the host lease and may expose a listener according to the
+  SSH server's `GatewayPorts` policy.
 - Command-output spool persistence is bounded at 64 MiB per run, 64 MiB per
-  session directory, and 1 GiB globally across active-run reservations and
-  retained files. It is separate from SFTP and must not be described as an
-  SFTP cap or an unlimited/complete command-output archive.
+  session directory, and 1 GiB globally by actual persisted bytes. Active runs
+  do not reserve their unused allowance, and cleanup failure must not fail a
+  command. Spool is separate from SFTP and is not an unlimited/complete
+  command-output archive. Synchronous append/eviction latency on a slow spool
+  filesystem remains a known limitation; do not add per-run full-tree scans.
 
 Any incompatible request, response, framing, or sequencing change must bump
 `WIRE_PROTOCOL_VERSION`, update both client and daemon handling, and add a

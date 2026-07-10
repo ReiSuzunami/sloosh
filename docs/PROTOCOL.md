@@ -1,9 +1,9 @@
 # Local Wire Protocol
 
 This document specifies the current CLI-to-daemon wire contract. The exact
-version constant is `WIRE_PROTOCOL_VERSION = 2` in `src/proto.rs`.
+version constant is `WIRE_PROTOCOL_VERSION = 1` in `src/proto.rs`.
 
-Protocol 2 is local IPC over a Unix domain socket. It combines NDJSON control
+Protocol 1 is local IPC over a Unix domain socket. It combines NDJSON control
 messages with bounded binary frames for SFTP data. It is not a network API and
 has no compatibility promise for arbitrary raw clients.
 
@@ -18,10 +18,10 @@ For ordinary new CLI connections:
 1. CLI authenticates the daemon peer by eUID and canonical executable path.
 2. CLI sends `{"type":"Status"}\n` as the first request.
 3. Daemon returns a `Status` response containing `wire_protocol`.
-4. CLI requires an exact value of `2`.
-5. CLI sends `{"type":"Hello","wire_protocol":2}\n`.
+4. CLI requires an exact value of `1`.
+5. CLI sends `{"type":"Hello","wire_protocol":1}\n`.
 6. Daemon replies
-   `{"type":"ProtocolReady","wire_protocol":2}\n` and marks that connection
+   `{"type":"ProtocolReady","wire_protocol":1}\n` and marks that connection
    negotiated.
 7. Only then may the CLI send an ordinary request on that connection.
 
@@ -53,6 +53,21 @@ the new CLI reports a protocol mismatch:
 2. Run `sloosh daemon stop` manually.
 3. Retry the desired command; the new CLI will auto-start a matching daemon.
 
+On Linux, replacing the binary in place can make the old process's
+`/proc/<pid>/exe` resolve as `(deleted)`. The new CLI then cannot authenticate
+that peer and `daemon status`, `start`, and `stop` deliberately return a
+"refusing to use the daemon socket" error instead of claiming it is absent or
+sending `Shutdown` to an unverified process. In that case, inspect the
+same-user process with `ps`/`/proc`, confirm it is the expected
+`sloosh daemon run`, terminate that PID manually, then retry:
+
+```sh
+pgrep -u "$(id -u)" -af 'sloosh daemon run'
+```
+
+After confirming the PID from that output, run `kill PID`. The next CLI
+invocation removes the stale socket and starts the installed binary.
+
 Stopping the daemon terminates active sessions and forwards and loses pending
 requests, active leases, and other in-memory state. It does not preserve or
 migrate live protocol state.
@@ -64,8 +79,8 @@ terminated by one newline byte:
 
 ```text
 {"type":"Status"}\n
-{"type":"Hello","wire_protocol":2}\n
-{"type":"ProtocolReady","wire_protocol":2}\n
+{"type":"Hello","wire_protocol":1}\n
+{"type":"ProtocolReady","wire_protocol":1}\n
 {"type":"Ok"}\n
 {"type":"Error","message":"..."}\n
 ```
@@ -196,7 +211,7 @@ the protocol. If the 2-hour idle or 8-hour absolute lease boundary passes after
 ```text
 CLI                                             daemon
  |                                                |
- | create 0600 temp in destination directory      |
+ | create temp with 0666 reduced by caller umask   |
  |                                                |
  | NDJSON Get ----------------------------------->|
  |                         check host lease once   |
@@ -228,7 +243,9 @@ owns the local destination:
 - without `--force`, the CLI refuses an existing destination and commits with
   a hard link that still fails if another process creates the path first;
 - with `--force`, the CLI commits by same-directory rename;
-- the temp file is synced before commit.
+- the temp file is synced before commit;
+- the CLI requests mode `0666` at `create_new`, so the process umask is applied
+  atomically by the kernel and the committed file keeps that effective mode.
 
 Behavior:
 
@@ -253,7 +270,7 @@ last control message:
 ```text
 UNNEGOTIATED
   | Status -> Status                 (stay UNNEGOTIATED)
-  | Hello(2) -> ProtocolReady(2)
+  | Hello(1) -> ProtocolReady(1)
   v
 CONTROL
   | Put/Get accepted

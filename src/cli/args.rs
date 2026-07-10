@@ -47,7 +47,7 @@ pub enum Command {
     Put(PutArgs),
     /// Download a remote file from a host over SFTP.
     Get(GetArgs),
-    /// Open a loopback-only `-L` forward, or manage active ones (`ls`/`stop`).
+    /// Open an `-L` or `-R` forward, or manage active ones (`ls`/`stop`).
     Forward(ForwardArgs),
     /// Show daemon/session/lease status — the anchor command when unsure what's going on.
     Status(StatusArgs),
@@ -220,8 +220,9 @@ pub struct PutArgs {
     long_about = "Download a remote file from a host over SFTP, reusing the session's existing \
 SSH connection (no redial, no reauth). Unlike `put`, an existing file at the local destination \
 is left alone unless you pass --force: the remote host is a disposable workspace, but your local \
-machine is not, so `get` refuses to clobber it by default. The download is streamed to a private \
-temporary file and atomically committed only after success; total file size is not capped."
+machine is not, so `get` refuses to clobber it by default. The download is streamed to a \
+same-directory temporary file using the caller's umask and atomically committed only after \
+success; total file size is not capped."
 )]
 pub struct GetArgs {
     /// Source host.
@@ -243,8 +244,7 @@ pub struct GetArgs {
 /// `ls`/`stop` are real subcommand keywords. Anything else is treated as
 /// `<host> -L/-R spec`, re-parsed by [`ForwardOpenArgs`] via clap's
 /// `external_subcommand` escape hatch (see `Command::Forward`'s dispatch in
-/// `cli::mod`). `-R` is still parsed so it can return a precise disabled
-/// message while capability-specific approval is being designed.
+/// `cli::mod`).
 #[derive(Debug, Args)]
 pub struct ForwardArgs {
     #[command(subcommand)]
@@ -257,8 +257,8 @@ pub enum ForwardAction {
     Ls(ForwardLsArgs),
     /// Stop an active forward.
     Stop(ForwardStopArgs),
-    /// `<host> -L ...` (or parsed-but-disabled `-R`) — not a real keyword;
-    /// clap hands us the raw tokens and `cli::mod` re-parses them.
+    /// `<host> -L ...` or `<host> -R ...` — not a real keyword; clap hands us
+    /// the raw tokens and `cli::mod` re-parses them.
     #[command(external_subcommand)]
     Open(Vec<String>),
 }
@@ -278,8 +278,11 @@ pub struct ForwardOpenArgs {
     /// to pick a port).
     #[arg(short = 'L', long = "local", value_name = "SPEC")]
     pub local: Option<String>,
-    /// Remote (reverse) forward syntax. Currently rejected because exposing
-    /// a remote listener needs capability-specific human approval.
+    /// Remote (reverse) forward: listen on the SSH server and tunnel to
+    /// local_host:local_port. `[bind_addr:]remote_port:local_host:local_port`
+    /// (bind_addr defaults to 127.0.0.1; remote_port 0 asks the server to pick a port).
+    /// The server's GatewayPorts policy decides whether that listener is reachable
+    /// beyond its loopback interface.
     #[arg(short = 'R', long = "remote", value_name = "SPEC")]
     pub remote: Option<String>,
     /// Print machine-readable JSON instead of a human summary.
@@ -296,7 +299,7 @@ pub struct ForwardLsArgs {
 
 #[derive(Debug, Args)]
 pub struct ForwardStopArgs {
-    /// Forward id printed by `sloosh forward <host> -L ...` (also shown by `forward ls`).
+    /// Forward id printed when opening `-L`/`-R` (also shown by `forward ls`).
     pub id: String,
 }
 

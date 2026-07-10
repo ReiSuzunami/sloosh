@@ -30,6 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use russh::Pty;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
@@ -49,6 +50,7 @@ use crate::transport::unix::sloosh_home;
 /// `MAX_PROXY_JUMP` bound in spirit — deep chains are almost always a
 /// misconfigured loop, not a real topology.
 const MAX_PROXY_JUMP_HOPS: usize = 8;
+const FORWARD_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything that can go wrong establishing an SSH connection. Variants
 /// carry self-teaching messages (DESIGN.md §7): the human reading a CLI
@@ -370,25 +372,35 @@ impl SshConfig {
             if !host_patterns_match(&block.patterns, host_key) {
                 continue;
             }
-            if !hostname_set && let Some(h) = &block.hostname {
-                cfg.hostname = h.clone();
-                hostname_set = true;
+            if !hostname_set {
+                if let Some(h) = &block.hostname {
+                    cfg.hostname = h.clone();
+                    hostname_set = true;
+                }
             }
-            if !port_set && let Some(p) = block.port {
-                cfg.port = p;
-                port_set = true;
+            if !port_set {
+                if let Some(p) = block.port {
+                    cfg.port = p;
+                    port_set = true;
+                }
             }
-            if !user_set && let Some(u) = &block.user {
-                cfg.user = u.clone();
-                user_set = true;
+            if !user_set {
+                if let Some(u) = &block.user {
+                    cfg.user = u.clone();
+                    user_set = true;
+                }
             }
-            if !proxy_jump_set && let Some(pj) = &block.proxy_jump {
-                cfg.proxy_jump = Some(pj.clone());
-                proxy_jump_set = true;
+            if !proxy_jump_set {
+                if let Some(pj) = &block.proxy_jump {
+                    cfg.proxy_jump = Some(pj.clone());
+                    proxy_jump_set = true;
+                }
             }
-            if !identity_agent_set && let Some(ia) = &block.identity_agent {
-                cfg.identity_agent = Some(ia.clone());
-                identity_agent_set = true;
+            if !identity_agent_set {
+                if let Some(ia) = &block.identity_agent {
+                    cfg.identity_agent = Some(ia.clone());
+                    identity_agent_set = true;
+                }
             }
             // IdentityFile is cumulative across matching blocks, like real ssh_config.
             cfg.identity_files
@@ -473,15 +485,15 @@ fn sloosh_known_hosts_path() -> PathBuf {
 
 /// Resolve the local user for the "no config entry" default (DESIGN.md §2).
 fn current_user() -> String {
-    if let Ok(u) = std::env::var("USER")
-        && !u.is_empty()
-    {
-        return u;
+    if let Ok(u) = std::env::var("USER") {
+        if !u.is_empty() {
+            return u;
+        }
     }
-    if let Ok(u) = std::env::var("LOGNAME")
-        && !u.is_empty()
-    {
-        return u;
+    if let Ok(u) = std::env::var("LOGNAME") {
+        if !u.is_empty() {
+            return u;
+        }
     }
     // SAFETY: getuid/getpwuid are plain libc lookups with no preconditions;
     // the returned pointer is a static/thread-local buffer we only read
@@ -564,9 +576,71 @@ pub struct LeaseContext {
     pub lease_token: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardRouteState {
+    Pending,
+    Active,
+    Closed,
+}
+
+#[derive(Clone)]
+pub(crate) struct ForwardRouteLifecycle {
+    state: watch::Sender<ForwardRouteState>,
+}
+
+impl ForwardRouteLifecycle {
+    pub(crate) fn new() -> Self {
+        let (state, _receiver) = watch::channel(ForwardRouteState::Pending);
+        Self { state }
+    }
+
+    pub(crate) fn state(&self) -> ForwardRouteState {
+        *self.state.borrow()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.state() == ForwardRouteState::Active
+    }
+
+    pub(crate) fn activate(&self) -> bool {
+        self.state.send_if_modified(|state| {
+            if *state == ForwardRouteState::Pending {
+                *state = ForwardRouteState::Active;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub(crate) fn close(&self) -> bool {
+        self.state.send_if_modified(|state| {
+            if *state == ForwardRouteState::Closed {
+                false
+            } else {
+                *state = ForwardRouteState::Closed;
+                true
+            }
+        })
+    }
+
+    pub(crate) async fn wait_closed(&self) {
+        let mut receiver = self.state.subscribe();
+        loop {
+            let state = *receiver.borrow_and_update();
+            if state == ForwardRouteState::Closed {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Where to dial locally when the remote end pushes a `forwarded-tcpip`
 /// channel back to us — the `-R` (remote/reverse) forward case (DESIGN.md
-/// §6). Only ever set on the one [`Connection`] a remote forward owns
+/// §7). Only ever set on the one [`Connection`] a remote forward owns
 /// (`daemon::forward`); a plain session/`-L`-forward connection's [`Handler`]
 /// has `route: None`, so [`Handler::server_channel_open_forwarded_tcpip`]
 /// falls back to rejecting rather than silently accepting and hanging.
@@ -576,30 +650,51 @@ pub struct LeaseContext {
 /// `forward.rs` builds one of these and hands it to [`connect_with_route`];
 /// `ssh.rs` never looks inside `forward.rs` to construct or interpret it.
 #[derive(Clone)]
-pub struct ForwardRoute {
+pub(crate) struct ForwardRoute {
     /// Local host/port to dial for each incoming forwarded connection.
-    pub local_host: String,
-    pub local_port: u16,
-    /// Caller identity to re-check on every forwarded connection, so a
-    /// lease that expired *after* the forward was created still gets
-    /// enforced per DESIGN.md §4 (idle-refresh doubles as re-validation:
-    /// see `lease::check_authorized`).
-    pub caller_pid: u32,
-    pub lease_host: String,
-    pub lease_token: Option<String>,
+    pub(crate) local_host: String,
+    pub(crate) local_port: u16,
+    /// Stable authorization selected before the short-lived CLI exits.
+    /// Every incoming forwarded connection revalidates and touches it.
+    pub(crate) grant: lease::LeaseGrant,
     /// Live tunnel count, shared with the forward's registry entry, for
     /// `forward ls`'s connection-count column.
-    pub tunnel_count: Arc<AtomicUsize>,
-    /// Flips to `true` when the forward is stopped (requested, lease
-    /// expiry, or connection loss), so an in-flight tunnel copy loop can
-    /// race it and end promptly instead of lingering after teardown.
-    pub closed: watch::Receiver<bool>,
+    pub(crate) tunnel_count: Arc<AtomicUsize>,
+    /// Shared Pending -> Active -> Closed gate. Server callbacks may route
+    /// channels only while Active; Closed also wakes in-flight work.
+    pub(crate) lifecycle: ForwardRouteLifecycle,
+}
+
+#[derive(Debug)]
+enum ForwardTargetConnectError {
+    Closed,
+    TimedOut,
+    Io(std::io::Error),
+}
+
+async fn race_forward_target_connect<T, F>(
+    lifecycle: &ForwardRouteLifecycle,
+    timeout: Duration,
+    connect: F,
+) -> Result<T, ForwardTargetConnectError>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    tokio::select! {
+        biased;
+        _ = lifecycle.wait_closed() => Err(ForwardTargetConnectError::Closed),
+        result = tokio::time::timeout(timeout, connect) => match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(ForwardTargetConnectError::Io(error)),
+            Err(_) => Err(ForwardTargetConnectError::TimedOut),
+        },
+    }
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
 /// `~/.ssh/known_hosts` (DESIGN.md §2 "known_hosts hash 条目支持"), plus
 /// (only when `route` is set) routing server-initiated `forwarded-tcpip`
-/// channels to a local target for `-R` forwards (DESIGN.md §6).
+/// channels to a local target for `-R` forwards (DESIGN.md §7).
 pub struct Handler {
     host: String,
     port: u16,
@@ -648,7 +743,7 @@ impl russh::client::Handler for Handler {
         }
     }
 
-    /// Handle a `-R` forward's incoming connection (DESIGN.md §6): only ever
+    /// Handle a `-R` forward's incoming connection (DESIGN.md §7): only ever
     /// invoked on the one connection a remote forward owns (`route.is_some()`
     /// — every other connection, including `ProxyJump` hops, rejects this
     /// outright rather than accepting a channel nothing will service). Dials
@@ -674,15 +769,16 @@ impl russh::client::Handler for Handler {
                 .await;
             return Ok(());
         };
-        if !lease::check_authorized(
-            route.caller_pid,
-            &route.lease_host,
-            route.lease_token.as_deref(),
-        )
-        .await
-        {
+        if !route.lifecycle.is_active() {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        if !lease::check_grant(&route.grant).await || !route.lifecycle.is_active() {
             warn!(
-                host = %route.lease_host,
+                local_host = %route.local_host,
+                local_port = route.local_port,
                 "remote forward: lease no longer covers this host, refusing forwarded connection"
             );
             reply
@@ -690,12 +786,48 @@ impl russh::client::Handler for Handler {
                 .await;
             return Ok(());
         }
-        match TcpStream::connect((route.local_host.as_str(), route.local_port)).await {
+        let connect = TcpStream::connect((route.local_host.as_str(), route.local_port));
+        match race_forward_target_connect(&route.lifecycle, FORWARD_TARGET_CONNECT_TIMEOUT, connect)
+            .await
+        {
             Ok(tcp) => {
-                reply.accept().await;
-                tokio::spawn(pump_forwarded_tcpip(channel, tcp, route));
+                if !route.lifecycle.is_active()
+                    || !lease::check_grant(&route.grant).await
+                    || !route.lifecycle.is_active()
+                {
+                    reply
+                        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                        .await;
+                    return Ok(());
+                }
+
+                let lifecycle = route.lifecycle.clone();
+                let accept = reply.accept();
+                tokio::pin!(accept);
+                tokio::select! {
+                    biased;
+                    _ = lifecycle.wait_closed() => {
+                        // Dropping the pending accept future rejects the channel.
+                    }
+                    _ = &mut accept => {
+                        tokio::spawn(pump_forwarded_tcpip(channel, tcp, route));
+                    }
+                }
             }
-            Err(e) => {
+            Err(ForwardTargetConnectError::Closed) => {
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            }
+            Err(ForwardTargetConnectError::TimedOut) => {
+                warn!(
+                    local_host = %route.local_host, local_port = route.local_port,
+                    timeout_secs = FORWARD_TARGET_CONNECT_TIMEOUT.as_secs(),
+                    "remote forward: timed out connecting to local target"
+                );
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            }
+            Err(ForwardTargetConnectError::Io(e)) => {
                 warn!(
                     local_host = %route.local_host, local_port = route.local_port, error = %e,
                     "remote forward: local target refused connection"
@@ -718,10 +850,9 @@ async fn pump_forwarded_tcpip(channel: Channel, mut tcp: TcpStream, route: Forwa
         .tunnel_count
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut remote = channel.into_stream();
-    let mut closed = route.closed.clone();
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut tcp, &mut remote) => {}
-        _ = closed.changed() => {}
+        _ = route.lifecycle.wait_closed() => {}
     }
     route
         .tunnel_count
@@ -956,7 +1087,7 @@ pub async fn connect(alias: &str, lease_ctx: &LeaseContext) -> Result<Connection
 /// host's [`Handler`] only (never an intermediate `ProxyJump` hop's), so
 /// `server_channel_open_forwarded_tcpip` can route the target's
 /// `forwarded-tcpip` channels to the forward's local destination.
-pub async fn connect_with_route(
+pub(crate) async fn connect_with_route(
     alias: &str,
     lease_ctx: &LeaseContext,
     route: Option<ForwardRoute>,
@@ -1308,10 +1439,10 @@ fn apply_proxy_jump_overrides(spec: &str, cfg: &mut HostConfig) {
     if let Some(user) = user_part {
         cfg.user = user.to_string();
     }
-    if let Some((_, port_str)) = host_part.split_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
-        cfg.port = port;
+    if let Some((_, port_str)) = host_part.split_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            cfg.port = port;
+        }
     }
 }
 
@@ -1530,6 +1661,68 @@ pub use russh::ChannelMsg as SessionChannelMsg;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_forward_route_lifecycle_is_monotonic() {
+        let lifecycle = ForwardRouteLifecycle::new();
+        assert_eq!(lifecycle.state(), ForwardRouteState::Pending);
+        assert!(!lifecycle.is_active());
+
+        assert!(lifecycle.activate());
+        assert_eq!(lifecycle.state(), ForwardRouteState::Active);
+        assert!(lifecycle.is_active());
+
+        assert!(lifecycle.close());
+        assert_eq!(lifecycle.state(), ForwardRouteState::Closed);
+        assert!(!lifecycle.is_active());
+        assert!(!lifecycle.activate(), "closed routes must never reopen");
+        assert_eq!(lifecycle.state(), ForwardRouteState::Closed);
+    }
+
+    #[tokio::test]
+    async fn remote_forward_route_close_wakes_waiters() {
+        let lifecycle = ForwardRouteLifecycle::new();
+        let waiter = lifecycle.clone();
+        let task = tokio::spawn(async move { waiter.wait_closed().await });
+
+        tokio::task::yield_now().await;
+        assert!(lifecycle.close());
+        tokio::time::timeout(std::time::Duration::from_millis(100), task)
+            .await
+            .expect("closing route should wake waiters")
+            .expect("waiter task should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_forward_local_connect_races_close_and_timeout() {
+        let lifecycle = ForwardRouteLifecycle::new();
+        assert!(lifecycle.activate());
+        let closing_lifecycle = lifecycle.clone();
+        let task = tokio::spawn(async move {
+            race_forward_target_connect(
+                &closing_lifecycle,
+                std::time::Duration::from_secs(30),
+                std::future::pending::<std::io::Result<()>>(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        lifecycle.close();
+        assert!(matches!(
+            task.await.expect("connect race task should complete"),
+            Err(ForwardTargetConnectError::Closed)
+        ));
+
+        let lifecycle = ForwardRouteLifecycle::new();
+        assert!(lifecycle.activate());
+        let result = race_forward_target_connect(
+            &lifecycle,
+            std::time::Duration::from_millis(1),
+            std::future::pending::<std::io::Result<()>>(),
+        )
+        .await;
+        assert!(matches!(result, Err(ForwardTargetConnectError::TimedOut)));
+    }
 
     #[test]
     fn glob_matches_star_and_question_mark() {

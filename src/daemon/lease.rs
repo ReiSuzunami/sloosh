@@ -561,20 +561,20 @@ async fn approve_lease_for_chain_checked(
     // vault change between preview and activation fails closed and leaves
     // the pending request intact.
     let resolved_hosts = ssh::expand_lease_hosts(&pending.hosts).await;
-    if let Some(approved_hosts) = approved_hosts
-        && approved_hosts != resolved_hosts
-    {
-        let approved = format_host_list(approved_hosts);
-        let resolved = format_host_list(&resolved_hosts);
-        let clear_cache = st.active.is_empty();
-        if clear_cache {
-            vault::clear_cache().await;
+    if let Some(approved_hosts) = approved_hosts {
+        if approved_hosts != resolved_hosts {
+            let approved = format_host_list(approved_hosts);
+            let resolved = format_host_list(&resolved_hosts);
+            let clear_cache = st.active.is_empty();
+            if clear_cache {
+                vault::clear_cache().await;
+            }
+            return Err(LeaseError::ApprovedHostsMismatch {
+                id: id.to_string(),
+                approved,
+                resolved,
+            });
         }
-        return Err(LeaseError::ApprovedHostsMismatch {
-            id: id.to_string(),
-            approved,
-            resolved,
-        });
     }
 
     let pending = st
@@ -692,19 +692,20 @@ async fn resolve_grant_for_chain(
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
 
-    if let Some(token) = lease_token
-        && let Some(l) = st
+    if let Some(token) = lease_token {
+        if let Some(l) = st
             .active
             .iter_mut()
             .find(|l| l.token == token && l.hosts.contains(host))
-    {
-        if touch {
-            l.last_used = Instant::now();
+        {
+            if touch {
+                l.last_used = Instant::now();
+            }
+            return Some(LeaseGrant {
+                token: l.token.clone(),
+                host: host.to_string(),
+            });
         }
-        return Some(LeaseGrant {
-            token: l.token.clone(),
-            host: host.to_string(),
-        });
     }
 
     if let Some(l) = st

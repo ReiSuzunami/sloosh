@@ -1,4 +1,5 @@
-//! Live-SSH integration test for `-L` port forwarding (DESIGN.md §6), gated
+//! Live-SSH integration tests for `-L` and `-R` port forwarding (DESIGN.md
+//! §6), gated
 //! behind `SLOOSH_TEST_SSH_HOST` exactly like `tests/ssh_session.rs` — see
 //! that file's module doc for the full rationale and the `--test-threads=1`
 //! requirement (each test points `$SLOOSH_HOME` at its own temp dir via a
@@ -10,12 +11,13 @@
 //! banner (`SSH-2.0...`) is a clean, host-agnostic way to prove bytes made
 //! it through the tunnel without needing any other service to exist.
 
+use sloosh::daemon::ssh::{self, LeaseContext};
 use sloosh::daemon::{lease, vault};
 use sloosh::proto::{ForwardDirection, Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 fn test_host() -> Option<String> {
     std::env::var("SLOOSH_TEST_SSH_HOST")
@@ -124,15 +126,15 @@ async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf
 }
 
 #[tokio::test]
-async fn remote_forward_is_rejected_before_any_ssh_connection() {
+async fn remote_forward_dispatches_to_remote_parser_without_network() {
     let _guard = test_lock().lock().await;
-    let host = "remote-forward-must-not-connect.invalid";
-    let (mut chan, _socket) = start_daemon("remote-disabled", host).await;
+    let host = "remote-forward-parser.invalid";
+    let (mut chan, _socket) = start_daemon("remote-parser", host).await;
 
     chan.send(&Request::Forward {
         host: host.to_string(),
         direction: ForwardDirection::Remote {
-            spec: "9000:127.0.0.1:3000".to_string(),
+            spec: "9000:127.0.0.1:0".to_string(),
         },
         lease_token: None,
     })
@@ -140,10 +142,190 @@ async fn remote_forward_is_rejected_before_any_ssh_connection() {
     .expect("send remote Forward");
 
     let Some(Response::Error { message }) = chan.recv::<Response>().await.expect("recv") else {
-        panic!("expected remote forwarding to be rejected");
+        panic!("zero local target port should fail during remote spec parsing");
     };
-    assert!(message.contains("temporarily disabled"), "{message}");
-    assert!(message.contains("capability-specific"), "{message}");
+    assert!(message.contains("targets port 0"), "{message}");
+    assert!(!message.contains("temporarily disabled"), "{message}");
+}
+
+async fn start_local_echo() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind local echo listener");
+    let port = listener.local_addr().expect("echo listener address").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept reverse tunnel");
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if stream.write_all(&buffer[..read]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (port, task)
+}
+
+fn remote_port(listen_addr: &str) -> u16 {
+    listen_addr
+        .rsplit_once(':')
+        .expect("remote listen address contains a port")
+        .1
+        .parse()
+        .expect("remote listen port is numeric")
+}
+
+async fn wait_for_remote_listener_close(connection: &ssh::Connection, port: u16) {
+    for _ in 0..100 {
+        if connection
+            .handle
+            .channel_open_direct_tcpip("127.0.0.1", port as u32, "127.0.0.1", 0)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("remote forward listener still accepted connections after teardown");
+}
+
+#[tokio::test]
+async fn remote_forward_tunnels_to_local_target_and_stops_cleanly() {
+    let _guard = test_lock().lock().await;
+    let Some(host) = test_host() else {
+        eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
+        return;
+    };
+    let (local_port, echo_task) = start_local_echo().await;
+    let (mut chan, _socket) = start_daemon("remote-forward", &host).await;
+
+    chan.send(&Request::Forward {
+        host: host.clone(),
+        direction: ForwardDirection::Remote {
+            spec: format!("0:127.0.0.1:{local_port}"),
+        },
+        lease_token: None,
+    })
+    .await
+    .expect("send remote Forward");
+    let Some(Response::Forward(opened)) = chan.recv::<Response>().await.expect("recv") else {
+        panic!("expected Response::Forward");
+    };
+    assert_eq!(opened.direction, "R");
+    let port = remote_port(&opened.listen_addr);
+
+    let connection = ssh::connect(
+        &host,
+        &LeaseContext {
+            caller_pid: std::process::id(),
+            lease_token: None,
+        },
+    )
+    .await
+    .expect("open verifier SSH connection");
+    let channel = connection
+        .handle
+        .channel_open_direct_tcpip("127.0.0.1", port as u32, "127.0.0.1", 0)
+        .await
+        .expect("connect to remote listener");
+    let mut tunnel = channel.into_stream();
+    tunnel.write_all(b"reverse-forward").await.expect("send");
+    let mut echoed = [0u8; 15];
+    tunnel.read_exact(&mut echoed).await.expect("receive echo");
+    assert_eq!(&echoed, b"reverse-forward");
+
+    chan.send(&Request::ForwardStop {
+        id: opened.id.clone(),
+    })
+    .await
+    .expect("send ForwardStop");
+    assert_eq!(
+        chan.recv::<Response>().await.expect("recv"),
+        Some(Response::Ok)
+    );
+
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.read(&mut byte))
+        .await
+        .expect("active reverse tunnel did not close after stop");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    wait_for_remote_listener_close(&connection, port).await;
+    echo_task.abort();
+    let _ = echo_task.await;
+}
+
+#[cfg(feature = "integration-test-hooks")]
+#[tokio::test]
+async fn remote_forward_listener_and_tunnel_close_when_lease_expires() {
+    let _guard = test_lock().lock().await;
+    let Some(host) = test_host() else {
+        eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
+        return;
+    };
+    let (local_port, echo_task) = start_local_echo().await;
+    let (mut chan, _socket) = start_daemon("remote-expiry", &host).await;
+
+    chan.send(&Request::Forward {
+        host: host.clone(),
+        direction: ForwardDirection::Remote {
+            spec: format!("0:127.0.0.1:{local_port}"),
+        },
+        lease_token: None,
+    })
+    .await
+    .expect("send remote Forward");
+    let Some(Response::Forward(opened)) = chan.recv::<Response>().await.expect("recv") else {
+        panic!("expected Response::Forward");
+    };
+    let port = remote_port(&opened.listen_addr);
+    let connection = ssh::connect(
+        &host,
+        &LeaseContext {
+            caller_pid: std::process::id(),
+            lease_token: None,
+        },
+    )
+    .await
+    .expect("open verifier SSH connection");
+    let channel = connection
+        .handle
+        .channel_open_direct_tcpip("127.0.0.1", port as u32, "127.0.0.1", 0)
+        .await
+        .expect("connect to remote listener");
+    let mut tunnel = channel.into_stream();
+    tunnel.write_all(b"before-expiry").await.expect("send");
+    let mut echoed = [0u8; 13];
+    tunnel.read_exact(&mut echoed).await.expect("receive echo");
+    assert_eq!(&echoed, b"before-expiry");
+
+    lease::expire_active_leases_for_integration_test().await;
+    sloosh::daemon::forward::reap_expired_leases_for_integration_test().await;
+
+    chan.send(&Request::ForwardLs)
+        .await
+        .expect("send ForwardLs");
+    let Some(Response::ForwardLs { forwards }) = chan.recv::<Response>().await.expect("recv")
+    else {
+        panic!("expected Response::ForwardLs");
+    };
+    assert!(forwards.is_empty());
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), tunnel.read(&mut byte))
+        .await
+        .expect("active reverse tunnel did not close after lease expiry");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    wait_for_remote_listener_close(&connection, port).await;
+    echo_task.abort();
+    let _ = echo_task.await;
 }
 
 #[tokio::test]

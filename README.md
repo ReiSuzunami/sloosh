@@ -15,7 +15,7 @@ out-of-band lease so the agent never sees a credential.
 
 ## Install
 
-Building from source requires Rust 1.88 or newer.
+Building from source requires Rust 1.85 or newer.
 
 ```
 cargo build --release
@@ -78,11 +78,11 @@ use. The CLI and daemon communicate through a Unix domain socket inside a
 private directory. The daemon obtains the caller PID from kernel peer
 credentials; the CLI checks that the daemon peer has the same effective UID
 and resolves to the current sloosh executable. It then requires wire protocol
-version 2 before sending normal requests. The client checks `Status`, sends a
+version 1 before sending normal requests. The client checks `Status`, sends a
 versioned `Hello`, and waits for `ProtocolReady`; the daemon rejects ordinary
 requests until that handshake succeeds, before request side effects begin.
 
-Protocol 2 uses bounded newline-delimited JSON for control messages and
+Protocol 1 uses bounded newline-delimited JSON for control messages and
 switches to bounded, length-prefixed raw frames for SFTP bytes. These checks
 protect against another OS user and an obvious wrong-daemon socket. They do
 not defend against hostile code already running as the same UID, and the
@@ -125,15 +125,20 @@ server, filesystem, and network failures still end the transfer.
 - `put` creates or truncates the remote destination before streaming. It is
   not an atomic remote replacement; a failed transfer can leave a partial
   remote file.
-- `get` writes a mode-`0600` temporary file beside the destination and commits
-  it only after the full transfer succeeds. It refuses to replace an existing
-  local file unless `--force` is given.
+- `get` creates a temporary file beside the destination with requested mode
+  `0666`, so the invoking process's umask determines its permissions, and
+  commits it only after the full transfer succeeds. It refuses to replace an
+  existing local file unless `--force` is given.
 - A command reply returns at most about 30,000 characters. Raw command output
   is retained in a spool file up to 64 MiB per run, with a 64 MiB retention
-  budget per session directory and a 1 GiB global budget shared by active-run
-  reservations and retained files; a marker records when per-run persistence
-  hits its limit, and older retained files are removed first. These spool
-  limits apply only to command output, not SFTP transfers.
+  budget per session directory and a 1 GiB global budget charged by bytes
+  actually persisted. Active runs reserve no phantom capacity; inactive files
+  are removed oldest first when real output needs room. Cleanup failures stop
+  further persistence at the cap without making the command fail. Retained
+  files are opened collision-safely, so a restarted session does not truncate
+  an old run with the same sequence number. Slow spool filesystems can still
+  delay synchronous append/eviction at the cap. These spool limits apply only
+  to command output, not SFTP transfers.
 
 For the full design (wire protocol, session/output model, audit log, vault
 crypto), see [`DESIGN.md`](./DESIGN.md) (the authoritative design document,
@@ -161,7 +166,7 @@ reference on any of them.
 | `vault` | Manage the credential vault itself (e.g. first-time initialization). |
 | `put` | Stream a local file to a remote path over SFTP; the remote destination is truncated first. |
 | `get` | Stream a remote file to an atomic local download; refuses to overwrite unless `--force` is used. |
-| `forward` | Open a lease-gated, loopback-only `-L` forward; `-R` is currently disabled. `forward ls` and `forward stop` manage live forwards. |
+| `forward` | Open a lease-gated loopback `-L` or remote `-R` forward. `forward ls` and `forward stop` manage live forwards. |
 | `status` | Show daemon/session/lease status — the anchor command when unsure what's going on. |
 | `daemon` | Manage the sloosh daemon process directly (normally auto-started on demand). |
 | `log` | Show the audit log. |
@@ -207,14 +212,15 @@ cp -r skills/sloosh ~/.agents/skills/sloosh   # Codex (and other .agents/skills 
 ## Development
 
 ```
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo +1.88.0 check --all-targets --locked
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo +1.85.0 check --all-targets --all-features --locked
+git diff --check
 ```
 
-All four gates must pass cleanly. CI runs formatting and clippy on stable
-Rust, non-live tests on Linux and macOS, an explicit Rust 1.88 MSRV check,
+All five gates must pass cleanly. CI runs formatting and clippy on stable
+Rust, non-live tests on Linux and macOS, an explicit Rust 1.85 MSRV check,
 and live session/SFTP/forward tests against a local Linux sshd.
 
 Most of the test suite runs without any external dependency. The
@@ -222,8 +228,10 @@ live integration tests are gated behind environment variables:
 
 ```
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test sftp_transfer -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
+  --test sftp_transfer -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
+  --test forward -- --test-threads=1
 SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
   cargo test --test proxy_jump -- --test-threads=1
 ```

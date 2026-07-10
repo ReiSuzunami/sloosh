@@ -14,13 +14,14 @@ must remain a relative symlink to this file so both entry points stay aligned.
 ## Project
 
 `sloosh` is a security-sensitive Rust CLI and background daemon for persistent
-SSH sessions, human-approved host leases, SFTP, and local forwarding. CLI and
-daemon are subcommands of one binary. Supported platforms are macOS and Linux.
+SSH sessions, human-approved host leases, SFTP, and local/remote forwarding.
+CLI and daemon are subcommands of one binary. Supported platforms are macOS
+and Linux.
 
 Toolchain:
 
 - Rust edition 2024
-- MSRV 1.88
+- MSRV 1.85
 - Tokio async runtime
 - `russh` and `russh-sftp` for SSH/SFTP
 
@@ -47,7 +48,7 @@ tests as needed, then update every affected document in the same change.
 - `src/daemon/mod.rs`: request authorization and daemon dispatch.
 - `src/daemon/session.rs`: PTY sessions, framing, spool, and remote SFTP.
 - `src/daemon/lease.rs`: pending requests, ancestry leases, and stable grants.
-- `src/daemon/forward.rs`: loopback local forwarding and lease teardown.
+- `src/daemon/forward.rs`: local/remote forwarding and lease teardown.
 - `src/daemon/ssh.rs`: SSH config, auth, ProxyJump, and host-key checks.
 - `src/daemon/vault.rs`: encrypted vault, atomic mutation, and cache lifecycle.
 - `src/daemon/audit.rs`: private NDJSON audit log.
@@ -60,7 +61,8 @@ tests as needed, then update every affected document in the same change.
 
 ### IPC and protocol
 
-- Current wire protocol is version 2.
+- Current wire protocol is version 1. The project is still pre-release; do not
+  bump it without a concrete incompatible wire change.
 - CLI verifies daemon eUID and canonical executable path.
 - CLI performs `Status -> Hello -> ProtocolReady` before ordinary requests.
 - Daemon rejects unnegotiated ordinary requests before side effects.
@@ -88,7 +90,9 @@ tests as needed, then update every affected document in the same change.
   interactive `send` contents, or decrypted vault data.
 - Use redacted/zeroizing types for secret material.
 - CLI alone opens SFTP local paths. Daemon treats `local_path` as a label.
-- `get` uses a mode-`0600` same-directory temp file and atomic commit.
+- `get` uses a same-directory `create_new` temp file with requested mode
+  `0666`, so the caller's umask determines the final mode, then commits
+  atomically.
 - `put` truncates the remote destination and is not remotely atomic.
 - Vault writes stay serialized, mode `0600`, and atomic via unique temp rename.
 - Private directories stay `0700`; sockets/logs/spool/vault stay `0600` where
@@ -97,12 +101,26 @@ tests as needed, then update every affected document in the same change.
 ### Network and resources
 
 - Local forwarding binds loopback only.
-- Remote `-R` forwarding remains rejected until capability-specific approval
-  exists.
+- Remote `-R` forwarding is supported under the host lease. Treat its remote
+  listener as deliberate network exposure; the SSH server's `GatewayPorts`
+  policy controls whether a non-loopback bind is externally reachable.
+- A remote route is monotonic `Pending -> Active -> Closed`. Only `Active`
+  routes may dial the local target; stop/expiry closes the route before any
+  remote cancellation await, and cancellation must remain time-bounded.
 - Host-key mismatches fail closed. Unknown target probing must follow the real
   ProxyJump route and require human fingerprint confirmation.
 - PTY output limits are 256 KiB ring, about 30,000 reply characters, 64 MiB per
   run spool, 64 MiB per session retention, and 1 GiB global spool budget.
+- The spool root budget is charged by bytes actually persisted. Active runs do
+  not reserve unused capacity; cleanup failures may stop further persistence
+  at the cap but must never fail the command or erase active files.
+- Spool files are collision-safe `create_new` files. Session recreation or a
+  daemon restart must never truncate a retained file with a reused run number.
+- An incomplete initial spool index fails closed for persistence and retries
+  later; command processing and the memory ring remain available.
+- Do not reintroduce full-tree scans at each run boundary. Current synchronous
+  append/eviction calls can still delay PTY consumption on a slow spool
+  filesystem; move them off the reader path before claiming latency isolation.
 - Spool limits apply only to command output, never to SFTP bytes.
 - `russh-sftp`'s short request timeout must remain replaced by the pinned
   Tokio far-future deadline for slow NAS operations.
@@ -131,7 +149,7 @@ Run from repository root:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
-cargo +1.88.0 check --all-targets --all-features --locked
+cargo +1.85.0 check --all-targets --all-features --locked
 git diff --check
 ```
 
@@ -143,7 +161,8 @@ Live tests require an explicit test host and must run single-threaded:
 SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
 SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
   --test sftp_transfer -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
+SLOOSH_TEST_SSH_HOST=myhost cargo test --features integration-test-hooks \
+  --test forward -- --test-threads=1
 ```
 
 `tests/proxy_jump.rs` also requires `SLOOSH_TEST_SSH_PASSWORD` and should use
@@ -156,7 +175,7 @@ or wire protocol.
 ## Rust and Test Style
 
 - Follow `rustfmt`; keep strict Clippy clean on all targets and features.
-- Preserve Rust 1.88 compatibility.
+- Preserve Rust 1.85 compatibility.
 - Prefer typed errors and self-teaching user messages over string parsing.
 - Bound allocations before reading attacker-controlled lengths.
 - Keep `unsafe` blocks minimal and include a concrete `SAFETY` comment.

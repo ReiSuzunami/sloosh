@@ -25,7 +25,7 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Exact CLI/daemon wire contract version. Bump this for any incompatible
 /// message shape or sequencing change; package versions may differ while this
 /// remains equal.
-pub const WIRE_PROTOCOL_VERSION: u32 = 2;
+pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 
 /// A password/secret that crosses the CLI<->daemon socket (DESIGN.md §4:
 /// "passwords/keys crossing the socket is acceptable, same-user 0600" — but
@@ -247,11 +247,11 @@ pub enum Request {
         lease_token: Option<String>,
     },
     /// Open a `-L` (local) or `-R` (remote/reverse) port forward through
-    /// `host` (DESIGN.md §6). `direction` carries the raw OpenSSH-style spec
+    /// `host` (DESIGN.md §7). `direction` carries the raw OpenSSH-style spec
     /// string exactly as typed (`[bind_addr:]port:host:port` shape); the
     /// daemon owns parsing it (`daemon::forward::parse_local_spec` /
     /// `parse_remote_spec`) so the error message stays daemon-side "teaching
-    /// material" (DESIGN.md §7) rather than duplicated in the CLI. Gated by
+    /// material rather than duplicated in the CLI. Gated by
     /// the same lease as `Run`/`Open` (DESIGN.md §4) — creating a forward is
     /// live network access to `host`.
     Forward {
@@ -260,10 +260,10 @@ pub enum Request {
         #[serde(default)]
         lease_token: Option<String>,
     },
-    /// List active forwards (DESIGN.md §6). Not gated by a lease, same as
+    /// List active forwards (DESIGN.md §7). Not gated by a lease, same as
     /// `Ls`/`Status` — read-only.
     ForwardLs,
-    /// Stop an active forward (DESIGN.md §6). Not gated by a lease:
+    /// Stop an active forward (DESIGN.md §7). Not gated by a lease:
     /// stopping only ever *reduces* access, never grants it.
     ForwardStop { id: String },
 }
@@ -301,7 +301,7 @@ impl Request {
 }
 
 /// Which side of a forward is doing the listening, carrying the raw spec
-/// string for that direction (DESIGN.md §6). A newtype-per-variant rather
+/// string for that direction (DESIGN.md §7). A newtype-per-variant rather
 /// than a shared `spec: String` + separate `is_remote: bool` field, so a
 /// malformed wire message can never claim both/neither direction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -504,7 +504,7 @@ pub struct TransferReply {
 
 /// Reply to `Request::Forward` once the daemon has bound the local listener
 /// (`-L`) or registered the remote listen request (`-R`) and the tunnel is
-/// live (DESIGN.md §6).
+/// live (DESIGN.md §7).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForwardOpened {
     /// Short `fwd-`-prefixed id (`daemon::forward`), used by `forward stop`.
@@ -517,7 +517,7 @@ pub struct ForwardOpened {
     /// Where traffic actually enters the tunnel: the local bind address for
     /// `-L`, or `bind_addr:remote_port` on `host` for `-R`. Reported instead
     /// of echoing the requested port because `local_port`/`remote_port` `0`
-    /// asks for an OS-assigned port (DESIGN.md §6).
+    /// asks for an OS-assigned port (DESIGN.md §7).
     pub listen_addr: String,
 }
 

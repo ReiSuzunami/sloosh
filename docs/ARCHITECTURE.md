@@ -77,7 +77,10 @@ Socket locations are:
 - macOS: `$SLOOSH_HOME/sloosh.sock`, normally `~/.sloosh/sloosh.sock`.
 - `$SLOOSH_SOCKET` overrides either path.
 
-The parent directory is repaired to mode `0700` and the socket to `0600`.
+Sloosh-managed parents are created or repaired to mode `0700`, and the socket
+is set to `0600`. A non-default parent selected through `$SLOOSH_SOCKET` is
+validated but never mutated: it must already be owned by the current eUID and
+have mode `0700`; on macOS it must also have no extended ACL.
 Before sending a request, `UnixChannel::connect` checks that the server peer has
 the current effective UID and the same canonical executable path as the current
 `sloosh` process. This is useful daemon authentication, but it is not a defense
@@ -90,12 +93,12 @@ The daemon obtains the client PID from kernel peer credentials:
 
 The daemon uses the PID for lease ancestry and self-approval checks. It does
 not require clients to be the `sloosh` executable. A same-UID process can open
-the socket, but must complete the protocol 2 `Hello` gate before ordinary
+the socket, but must complete the protocol 1 `Hello` gate before ordinary
 requests and remains subject to daemon-side capability checks.
 
-### Protocol 2
+### Protocol 1
 
-Protocol 2 is mixed framing, not pure NDJSON:
+Protocol 1 is mixed framing, not pure NDJSON:
 
 ```text
 ordinary request:  NDJSON request -> NDJSON response
@@ -110,9 +113,9 @@ has a 4-byte big-endian unsigned length and at most 1 MiB of payload. Length 0
 means stream EOF. A stream can contain any number of frames, so SFTP transfers
 have no application total-size cap.
 
-Protocol 2 uses a bidirectional gate. The CLI first sends `Status` and requires
-an exact `wire_protocol` match, then sends `Hello { wire_protocol: 2 }`. The
-daemon replies `ProtocolReady { wire_protocol: 2 }` and marks that connection
+Protocol 1 uses a bidirectional gate. The CLI first sends `Status` and requires
+an exact `wire_protocol` match, then sends `Hello { wire_protocol: 1 }`. The
+daemon replies `ProtocolReady { wire_protocol: 1 }` and marks that connection
 negotiated. Before this exchange, the daemon allows only `Status`, `Hello`, and
 `Shutdown`. Every ordinary request is rejected before request-specific side
 effects. A wrong-version `Hello` leaves the gate closed.
@@ -239,18 +242,27 @@ Reply output keeps roughly the final 30,000 characters. Spool is bounded
 retention, not a complete archive:
 
 - one run file retains at most 64 MiB of raw output and appends a visible limit
-  marker when persistence stops;
+  marker when that per-run cap is reached; global exhaustion may leave too
+  little room for a marker;
 - one session directory has a 64 MiB retention budget, with oldest files
   removed on best-effort cleanup;
 - the spool root has a 1 GiB hard application budget across every host and
-  session;
-- each active run reserves its full 64 MiB allowance up front, allowing at
-  most 16 concurrent reservations;
-- root cleanup protects active paths and deletes the oldest inactive files by
-  modification time across session directories;
-- file creation, reservation publication, and root cleanup share one registry
-  critical section, preventing cleanup from deleting a newly active spool;
-- command processing and the memory ring continue after the disk cap;
+  session, charged by actual persisted bytes;
+- active runs protect their current files but reserve no unused allowance;
+- one lazy root scan seeds a per-root ledger, then writes update it
+  incrementally instead of rescanning the full tree at every run boundary;
+- an incomplete scan pauses new persistence and retries after a 30-second
+  backoff rather than granting against unknown retained bytes;
+- when real output needs room, cleanup protects active paths and deletes the
+  oldest inactive files by modification time across session directories;
+- an unlink failure is logged and retried on a later pass. It may stop further
+  persistence at the cap, but is not returned as a command failure and never
+  deletes an active file;
+- command/ring logic remains available after the disk cap, but synchronous
+  append/eviction can still delay the PTY reader and other writers on a slow
+  spool filesystem;
+- run files use collision-safe `create_new`; reused sequence numbers get a
+  unique suffix instead of truncating retained history;
 - encoded host/session components prevent path traversal;
 - directories are `0700`, and spool files are `0600` with `O_NOFOLLOW`.
 
@@ -281,7 +293,8 @@ resume or remote atomic-replace layer.
 
 ### Get
 
-1. CLI creates a mode-`0600` temp file in the destination directory.
+1. CLI creates a temp file in the destination directory with requested mode
+   `0666`; the caller's umask determines its effective mode.
 2. Daemon checks the lease, opens the remote file, and returns `TransferReady`.
 3. Daemon reads remote SFTP data into bounded frames; CLI writes the temp file.
 4. Daemon sends raw EOF, then `Transfer` or `Error`.
@@ -298,18 +311,29 @@ lease. Total bytes remain unlimited while each raw frame remains at most 1 MiB.
 
 ## 7. Forwarding
 
-`src/daemon/forward.rs` currently implements local forwarding only:
+`src/daemon/forward.rs` implements local and remote forwarding:
 
 - `-L` binds only loopback IP addresses. Omitted bind address is
   `127.0.0.1`; non-loopback literals fail before network access.
+- `-R` asks the SSH server to create `[bind_addr:]remote_port` and routes each
+  accepted connection to `local_host:local_port`. Port `0` requests a
+  server-assigned port.
 - Each forward has a dedicated SSH connection and stable `LeaseGrant`.
+- Every accepted local or remote connection revalidates and touches that
+  grant. Remote exposure follows the server's `GatewayPorts` policy.
+- A remote route is monotonic `Pending -> Active -> Closed`; server-initiated
+  channels are rejected outside `Active`. Local target connection races route
+  closure and has a 10-second timeout, followed by a final grant/state check.
+- Stop or expiry marks the route `Closed` first, bounds remote cancellation to
+  2 seconds, then drops the dedicated SSH connection even if the server never
+  acknowledges cancellation.
 - Connection loss, explicit stop, or lease expiry closes the forward.
 - `forward ls` is read-only and `forward stop` only reduces access, so neither
   requires a lease.
 
-Remote `-R` specifications are parsed for accurate validation, but creation is
-always rejected. Both `-R` and non-loopback `-L` require a future
-capability-specific approval model; a general host lease is not sufficient.
+Non-loopback `-L` remains rejected. `-R` is deliberately covered by the host
+lease, but its server-side listener is a broader capability that callers must
+request intentionally.
 
 ## 8. Vault mutation and cache lifecycle
 
@@ -345,7 +369,7 @@ src/
     args.rs          clap surface
     client.rs        daemon connect/spawn, peer and protocol checks
     mod.rs           CLI behavior, local SFTP files, approval UI
-  proto.rs           protocol 2 request/response types and NDJSON limit
+  proto.rs           protocol 1 request/response types and NDJSON limit
   transport/
     mod.rs           Channel and raw-frame contract
     unix.rs          UDS, peer credentials, paths and permissions
@@ -355,7 +379,7 @@ src/
     vault.rs         encrypted vault, serialized mutation, cache
     ssh.rs           config resolution, ProxyJump, host-key verification
     session.rs       PTY state, sentinel framing, spool, SFTP handles
-    forward.rs       loopback-only -L and forward lifetime
+    forward.rs       local -L, remote -R, and forward lifetime
     audit.rs         best-effort audit append/read helpers
   procs/
     macos.rs         process ancestry via macOS APIs

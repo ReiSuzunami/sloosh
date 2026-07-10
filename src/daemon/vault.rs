@@ -86,7 +86,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VaultError> {
         }
     }
     let bytes = s.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() % 2 != 0 {
         return Err(VaultError::TamperedOrCorrupt);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

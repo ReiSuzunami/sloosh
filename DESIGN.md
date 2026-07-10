@@ -32,7 +32,7 @@ Coding Agent / human terminal
 +---------------------- sloosh daemon ---------------------+
 | peer PID, lease state, vault writer/cache, audit         |
 | SSH connections, PTY sessions, spool, remote SFTP       |
-| loopback-only local forwards                             |
+| local and remote port forwards                          |
 +--------------------------+-------------------------------+
                            |
                            v
@@ -43,16 +43,16 @@ CLI 和 daemon 是同一个二进制的不同子命令。普通 CLI 请求会连
 不存在，CLI 自动启动 `sloosh daemon run`。daemon 重启会终止会话、forward、pending
 request 和 active lease。
 
-## 3. 本地传输与 protocol 2
+## 3. 本地传输与 protocol 1
 
-当前线协议版本是 `2`：
+当前线协议版本是 `1`。项目仍处于首次正式发布前，版本只在发生不兼容 wire 变更时递增：
 
 - 控制消息为单行 NDJSON，包含结尾换行后最大 1 MiB。
 - `Put`/`Get` 在 `TransferReady` 后切换为 raw frame。
 - raw frame 为 4-byte big-endian `u32` 长度，加对应字节；长度 `0` 表示流结束。
 - 单个 raw frame 最大 1 MiB；一个流可包含任意数量 frame，所以协议不限制文件总大小。
-- 普通 CLI 先发送 `Status` 并要求 `wire_protocol == 2`，再发送
-  `Hello { wire_protocol: 2 }`；daemon 回复 `ProtocolReady { wire_protocol: 2 }` 后，该连接
+- 普通 CLI 先发送 `Status` 并要求 `wire_protocol == 1`，再发送
+  `Hello { wire_protocol: 1 }`；daemon 回复 `ProtocolReady { wire_protocol: 1 }` 后，该连接
   才能发送普通请求。
 - daemon 对每条连接维护协商状态。协商前仅允许 `Status`、`Hello`、`Shutdown`；其他请求
   在任何请求级副作用前返回错误。错误版本的 `Hello` 不会打开门禁。
@@ -131,14 +131,19 @@ Spool 是有界诊断保留，不是全量归档：
 
 - 每个 run 的 spool 文件最大 64 MiB raw output。达到上限后写入明确 marker，后续输出不再
   落盘，但 sentinel 解析、远端命令和内存 ring 继续工作。
-- 每个 session spool 目录保留预算为 64 MiB。打开/关闭 spool 时按最旧文件优先做
-  best-effort 清理；活跃文件和清理失败可造成短暂超预算。
-- 整个 spool root 跨所有 host/session 有 1 GiB 硬预算。每个 active run 启动时预留完整
-  64 MiB，因此最多同时保留 16 个 active reservation；预算不足时新 run 在执行远端命令前
-  失败。
-- root 清理保护 active spool，跨 session 目录按修改时间删除最旧的非活跃文件，并为全部
-  active reservation 留出空间。新文件创建、reservation 发布和 root 清理共用同一临界区，
-  清理器不会误删刚创建的 active spool。
+- 每个 session spool 目录保留预算为 64 MiB。run 结束时按最旧文件优先做 best-effort
+  清理，活跃文件不会被删除。
+- 整个 spool root 跨所有 host/session 有 1 GiB 硬预算，按实际已写入字节记账。active run
+  不预留尚未使用的 64 MiB，因此空输出或小输出 run 不会制造虚假占用，也没有 16 run
+  的并发上限。
+- daemon 对每个 spool root 首次使用时做一次 lazy 索引，之后随写入增量维护账本；不会在
+  每次 run 起止时全树扫描。索引不完整时暂停新的 spool 写入并在 30 秒后重试，不会让
+  run 返回失败。需要为真实输出腾空间时，跨 session 按修改时间删除最旧的非活跃文件。
+- 清理失败会记录警告，并可能使达到预算后的后续输出停止落盘；错误不向 run 传播，也不会
+  删除活跃 spool，后续记账轮次会重试。当前 append/淘汰仍是同步文件系统调用，因此慢速
+  spool 文件系统在预算压力下可能暂时拖慢 PTY reader；它已不再触发每次 run 的全树扫描。
+- run 文件用 `create_new` 创建；session 重建或 daemon 重启后若序号重用，会改用带随机后缀
+  的唯一文件名，绝不 truncate 已保留历史。
 - host/session 名称编码为单一安全路径组件，避免目录穿越。
 - spool 目录为 0700，文件为 0600，并以 `O_NOFOLLOW` 打开。
 
@@ -167,8 +172,8 @@ Spool 是有界诊断保留，不是全量归档：
 ### Get
 
 - daemon 从远端 SFTP 文件读取并逐 frame 发给 CLI。
-- CLI 在目标目录创建 0600 临时文件。只有收到 raw EOF 和最终 `Transfer` 成功响应后，才
-  原子提交到目标路径。
+- CLI 在目标目录以请求 mode `0666` 创建临时文件，由调用进程的 umask 原子决定实际权限。
+  只有收到 raw EOF 和最终 `Transfer` 成功响应后，才原子提交到目标路径。
 - 默认拒绝覆盖；`--force` 使用同目录 rename 替换。失败时既有目标保持不变；异常进程
   终止可能留下未提交 temp 文件。
 
@@ -178,15 +183,24 @@ Spool 是有界诊断保留，不是全量归档：
 
 - `-L [bind_addr:]local_port:remote_host:remote_port`。
 - bind address 必须是 loopback IP；省略时为 `127.0.0.1`。`0` 可请求 OS 分配监听端口。
+- `-R [bind_addr:]remote_port:local_host:local_port`。远端 listener 由 SSH server 创建；
+  `remote_port = 0` 可请求 server 分配端口。
 - 每个 forward 使用专用 SSH connection 和稳定 `LeaseGrant`。
+- `-R` 的每个入站连接都会重新验证并刷新该 grant，然后才连接本地 target。`GatewayPorts`
+  等 sshd 配置决定远端 bind address 是否对外可达。
+- `-R` route 使用单调 `Pending -> Active -> Closed` 状态；只有 server 已确认 listener 且
+  registry 已就绪后才进入 Active。Pending/Closed 的入站 channel 直接拒绝。
+- 本地 target connect 最长等待 10 秒，并与 Closed 状态竞速；accept 前再次检查 state 与
+  grant。stop/expiry 先切 Closed，再最多等待 2 秒取消远端 listener，之后无论 server 是否
+  回复都释放专用 SSH connection。
 - `forward ls` 只读，`forward stop` 只减少访问，因此不要求 lease。
 
 当前禁用：
 
-- `-R` 语法可解析以提供准确错误，但创建始终拒绝。
 - 非 loopback `-L` 始终拒绝。
 
-两者都需要未来的 capability-specific human approval，不能只复用“主机可访问”lease。
+`-R` 当前复用“主机可访问”lease；这是显式产品边界，调用者必须把远端 listener 视为
+主动网络暴露，而不是本地 `-L` 的等价形式。
 
 ## 8. Vault、状态文件与审计
 
@@ -203,9 +217,12 @@ KDF 参数派生 key、解密同一快照的 nonce/ciphertext，再一次性发�
 建立自己的只读 cache，用于完整 ProxyJump preview 和 routed host-key probe；流程结束必定
 清空。
 
-`~/.sloosh` 等私有目录创建/修复为 0700，拒绝 symlink、错误 owner 和非目录。socket、
-vault、daemon log、audit、known_hosts 与 spool 文件目标权限为 0600；不同文件使用的
-`O_NOFOLLOW`、`create_new` 和 ACL 清理细节见 `SECURITY.md`。
+`~/.sloosh` 与平台 fallback runtime dir 等 sloosh 自有目录创建/修复为 0700，拒绝
+symlink、错误 owner 和非目录。`SLOOSH_SOCKET` 指向非默认父目录时只做安全校验：目录必须
+已由当前 eUID 拥有且 mode 为 0700；macOS 上还必须无扩展 ACL。daemon 不会 chmod 或清理
+该目录的 ACL。
+socket、vault、daemon log、audit、known_hosts 与 spool 文件目标权限为 0600；不同文件
+使用的 `O_NOFOLLOW`、`create_new` 和 ACL 清理细节见 `SECURITY.md`。
 
 Audit 是 best-effort 诊断记录，不是防篡改安全控制。它记录授权、连接、命令文本、路径和
 结果元数据，不记录命令输出；同 UID owner 可读取、删除或替换它。
@@ -214,13 +231,13 @@ Audit 是 best-effort 诊断记录，不是防篡改安全控制。它记录授�
 
 | 能力 | 当前状态 | 当前边界 |
 |---|---|---|
-| macOS/Linux UDS | 已实现 | protocol 2，CLI peer 校验 + Status/Hello 双向门禁 |
+| macOS/Linux UDS | 已实现 | protocol 1，CLI peer 校验 + Status/Hello 双向门禁 |
 | 持久 PTY session | 已实现 | 8h idle 回收，不跨 daemon 重启 |
 | SFTP put/get | 已实现 | 单 frame 1 MiB，总量不限；开始时授权不截断当前大文件 |
 | Spool | 已实现 | 64 MiB/run，64 MiB/session，1 GiB/root；仅约束 PTY output |
 | ProxyJump | 已实现 | 递归最多 8 hop；批准列表双重解析；routed key probe |
 | `-L` forward | 已实现 | 仅 loopback listener |
-| `-R` forward | 禁用 | 等 capability-specific approval |
+| `-R` forward | 已实现 | 远端 listener；稳定 grant；暴露范围受 sshd `GatewayPorts` 影响 |
 | 非 loopback `-L` | 禁用 | 等 capability-specific approval |
 | Windows | 未来 | Named Pipe + PID reuse-safe ancestry |
 | resilient remote tmux | 未来 | 当前断线只报告 dead |

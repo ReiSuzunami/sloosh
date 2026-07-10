@@ -255,14 +255,19 @@ impl Drop for UnixListener {
 
 /// Bind the daemon socket at `path`.
 ///
-/// Ensures the parent directory exists, sets mode 0600, and cleans up a
-/// stale socket file left behind by an unclean shutdown: if the path
-/// already exists, we first try to *connect* to it — success means a live
-/// daemon owns it ([`BindOutcome::AlreadyRunning`]); failure means the file
-/// is stale, so we remove it and bind fresh.
+/// Creates or repairs sloosh-managed parents. Caller-selected parents must
+/// already be private and are validated without mutation. Sets socket mode
+/// 0600 and cleans up a stale socket left by an unclean shutdown: if the path
+/// already exists, connect success means a live daemon owns it
+/// ([`BindOutcome::AlreadyRunning`]); failure means the file is stale, so we
+/// remove it and bind fresh.
 pub fn bind(path: &Path) -> Result<BindOutcome<UnixListener>, TransportError> {
     if let Some(parent) = path.parent() {
-        ensure_private_dir(parent)?;
+        if socket_path_uses_managed_parent(path) {
+            ensure_private_dir(parent)?;
+        } else {
+            validate_private_dir(parent)?;
+        }
     }
 
     match std::os::unix::net::UnixListener::bind(path) {
@@ -288,6 +293,84 @@ pub fn bind(path: &Path) -> Result<BindOutcome<UnixListener>, TransportError> {
             source,
         }),
     }
+}
+
+fn socket_path_uses_managed_parent(path: &Path) -> bool {
+    if path != default_socket_path() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent == sloosh_home() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if linux_fallback_socket_path(effective_uid()).parent() == Some(parent) {
+        return true;
+    }
+    false
+}
+
+/// Validate a caller-selected socket parent without changing it.
+fn validate_private_dir(path: &Path) -> Result<(), TransportError> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| TransportError::OpenDirectory {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(TransportError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "path is a symbolic link",
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(TransportError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "path is not a directory",
+        });
+    }
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| TransportError::OpenDirectory {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = directory
+        .metadata()
+        .map_err(|source| TransportError::OpenDirectory {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let expected_uid = effective_uid();
+    let actual_uid = metadata.uid();
+    if actual_uid != expected_uid {
+        return Err(TransportError::WrongOwner {
+            path: path.to_path_buf(),
+            actual_uid,
+            expected_uid,
+        });
+    }
+    if metadata.mode() & 0o7777 != 0o700 {
+        return Err(TransportError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "caller-selected socket parent must already have mode 0700",
+        });
+    }
+    if has_extended_acl(&directory).map_err(|source| TransportError::OpenDirectory {
+        path: path.to_path_buf(),
+        source,
+    })? {
+        return Err(TransportError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "caller-selected socket parent has an extended ACL",
+        });
+    }
+    Ok(())
 }
 
 /// Create or repair a sloosh-owned directory to mode 0700.
@@ -390,8 +473,8 @@ pub(crate) fn clear_extended_acl(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn has_extended_acl_for_test(file: &File) -> io::Result<bool> {
+#[cfg(target_os = "macos")]
+pub(crate) fn has_extended_acl(file: &File) -> io::Result<bool> {
     type Acl = *mut libc::c_void;
     type AclEntry = *mut libc::c_void;
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
@@ -428,6 +511,16 @@ pub(crate) fn has_extended_acl_for_test(file: &File) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(get_result == 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn has_extended_acl(_file: &File) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn has_extended_acl_for_test(file: &File) -> io::Result<bool> {
+    has_extended_acl(file)
 }
 
 fn finish_bind(
@@ -578,9 +671,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_creates_parent_dir_and_mode_0600() {
+    async fn private_parent_creation_then_bind_sets_socket_mode_0600() {
         let dir = std::env::temp_dir().join(format!("sloosh-unix-test-{}", std::process::id()));
-        let sock = dir.join("nested").join("sloosh.sock");
+        let parent = dir.join("nested");
+        ensure_private_dir(&parent).expect("create private socket parent");
+        let sock = parent.join("sloosh.sock");
         let outcome = bind(&sock).expect("bind should succeed");
         let BindOutcome::Bound(listener) = outcome else {
             panic!("expected Bound, got AlreadyRunning");
@@ -601,6 +696,7 @@ mod tests {
     #[tokio::test]
     async fn connect_and_status_round_trip_over_socket() {
         let dir = std::env::temp_dir().join(format!("sloosh-unix-test2-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")
@@ -625,10 +721,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn bind_refuses_unsafe_custom_parent_without_mutating_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "sloosh-custom-parent-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create custom parent");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set HOME-like mode");
+        #[cfg(target_os = "macos")]
+        add_everyone_read_acl(&dir);
+
+        let error = match bind(&dir.join("sloosh.sock")) {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe custom parent must be rejected"),
+        };
+        assert!(error.to_string().contains("mode 0700"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "bind must not chmod a custom parent"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let directory = File::open(&dir).expect("open custom parent");
+            assert!(
+                has_extended_acl_for_test(&directory).expect("read custom parent ACL"),
+                "bind must not clear a custom parent ACL"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nondefault_socket_inside_sloosh_home_is_still_custom() {
+        let custom = sloosh_home().join("custom.sock");
+        if custom != default_socket_path() {
+            assert!(!socket_path_uses_managed_parent(&custom));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bind_refuses_custom_parent_acl_without_clearing_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "sloosh-custom-parent-acl-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create custom parent");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set private mode");
+        add_everyone_read_acl(&dir);
+
+        let error = match bind(&dir.join("sloosh.sock")) {
+            Err(error) => error,
+            Ok(_) => panic!("custom parent ACL must be rejected"),
+        };
+        assert!(error.to_string().contains("extended ACL"), "{error}");
+        let directory = File::open(&dir).expect("open custom parent");
+        assert!(
+            has_extended_acl_for_test(&directory).expect("read custom parent ACL"),
+            "bind must not clear a custom parent ACL"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn raw_frames_round_trip_after_json_without_total_limit() {
         let dir =
             std::env::temp_dir().join(format!("sloosh-raw-frame-roundtrip-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")
@@ -693,6 +860,7 @@ mod tests {
     async fn json_to_raw_transition_preserves_prefetched_frame_bytes() {
         let dir =
             std::env::temp_dir().join(format!("sloosh-raw-frame-prefetch-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")
@@ -731,6 +899,7 @@ mod tests {
     async fn raw_frames_reject_oversized_send_and_receive() {
         let dir =
             std::env::temp_dir().join(format!("sloosh-raw-frame-oversized-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")
@@ -803,6 +972,7 @@ mod tests {
     #[tokio::test]
     async fn verified_connect_rejects_wrong_expected_uid() {
         let dir = std::env::temp_dir().join(format!("sloosh-peer-uid-test-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")
@@ -827,6 +997,7 @@ mod tests {
     #[tokio::test]
     async fn verified_connect_rejects_wrong_expected_executable() {
         let dir = std::env::temp_dir().join(format!("sloosh-peer-exe-test-{}", std::process::id()));
+        ensure_private_dir(&dir).expect("create private socket parent");
         let sock = dir.join("sloosh.sock");
         let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
             panic!("expected Bound")

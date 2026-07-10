@@ -26,12 +26,7 @@ pub async fn connect_or_spawn(socket_path: &Path) -> anyhow::Result<UnixChannel>
     match UnixChannel::connect(socket_path).await {
         Ok(chan) => return verify_wire_protocol(chan, socket_path).await,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(e).with_context(|| {
-                format!(
-                    "refusing to use the daemon socket at {} because its server identity could not be verified",
-                    socket_path.display()
-                )
-            });
+            return Err(untrusted_daemon_error(socket_path, e));
         }
         Err(_) => {}
     }
@@ -48,12 +43,7 @@ pub async fn wait_for_daemon(socket_path: &Path) -> anyhow::Result<UnixChannel> 
         match UnixChannel::connect(socket_path).await {
             Ok(chan) => return verify_wire_protocol(chan, socket_path).await,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "refusing to use the daemon socket at {} because its server identity could not be verified",
-                        socket_path.display()
-                    )
-                });
+                return Err(untrusted_daemon_error(socket_path, e));
             }
             Err(e) => {
                 last_err = Some(e);
@@ -69,6 +59,13 @@ pub async fn wait_for_daemon(socket_path: &Path) -> anyhow::Result<UnixChannel> 
         last_err.map(|e| e.to_string()).unwrap_or_default(),
         log_path.display(),
     )
+}
+
+pub(super) fn untrusted_daemon_error(socket_path: &Path, source: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(source).context(format!(
+        "refusing to use the daemon socket at {} because its server identity could not be verified",
+        socket_path.display()
+    ))
 }
 
 /// Verify the daemon before this channel carries an ordinary request. Exact

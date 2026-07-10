@@ -12,7 +12,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rand::Rng;
@@ -43,10 +43,14 @@ const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
 /// persistence only: the in-memory ring, marker detection, and remote command
 /// keep running normally.
 const MAX_SPOOL_FILE_BYTES: u64 = 64 * 1024 * 1024;
-/// Global retained spool budget across every host/session. Active runs reserve
-/// their full per-run allowance up front, so concurrent session names cannot
-/// multiply disk use without bound.
+/// Global spool budget across every host/session, charged by bytes actually
+/// persisted. Active files are protected from retention cleanup but do not
+/// reserve their unused per-run allowance.
 const MAX_SPOOL_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Avoid hammering a slow or temporarily unreadable spool tree after a failed
+/// initial index. Until a complete retry succeeds, command output stays in the
+/// memory ring and new spool writers receive no disk budget.
+const SPOOL_SCAN_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Replace russh-sftp's 10-second request deadline with the maximum value.
 /// In the pinned Tokio release this maps to its roughly 30-year far-future
 /// timer: operationally disabled for NAS transfers, though not mathematical
@@ -632,18 +636,18 @@ struct SpoolWriter {
     limit: u64,
     bytes_written: u64,
     limited: bool,
-    spool_root: Option<PathBuf>,
+    ledger: Option<Arc<Mutex<SpoolLedger>>>,
 }
 
 impl SpoolWriter {
-    fn new_reserved(file: std::fs::File, path: PathBuf, spool_root: PathBuf) -> Self {
+    fn new_accounted(file: std::fs::File, path: PathBuf, ledger: Arc<Mutex<SpoolLedger>>) -> Self {
         Self {
             file,
             path,
             limit: MAX_SPOOL_FILE_BYTES,
             bytes_written: 0,
             limited: false,
-            spool_root: Some(spool_root),
+            ledger: Some(ledger),
         }
     }
 
@@ -655,7 +659,24 @@ impl SpoolWriter {
             limit,
             bytes_written: 0,
             limited: false,
-            spool_root: None,
+            ledger: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_accounting(
+        file: std::fs::File,
+        path: PathBuf,
+        limit: u64,
+        ledger: Arc<Mutex<SpoolLedger>>,
+    ) -> Self {
+        Self {
+            file,
+            path,
+            limit,
+            bytes_written: 0,
+            limited: false,
+            ledger: Some(ledger),
         }
     }
 
@@ -667,92 +688,354 @@ impl SpoolWriter {
         let marker_len = SPOOL_LIMIT_MARKER.len() as u64;
         let payload_limit = self.limit.saturating_sub(marker_len);
         let remaining = payload_limit.saturating_sub(self.bytes_written);
-        let keep = remaining.min(bytes.len() as u64) as usize;
-        if keep > 0 {
-            self.file.write_all(&bytes[..keep])?;
-            self.bytes_written += keep as u64;
+        let planned_payload = remaining.min(bytes.len() as u64);
+        let planned_marker = planned_payload < bytes.len() as u64 && self.limit >= marker_len;
+        let planned = planned_payload.saturating_add(if planned_marker { marker_len } else { 0 });
+        let granted = if let Some(ledger) = &self.ledger {
+            lock_spool_ledger(ledger).claim_bytes(&self.path, planned)
+        } else {
+            planned
+        };
+
+        let root_limited = granted < planned;
+        let (keep, write_marker) = if root_limited && granted >= marker_len {
+            ((granted - marker_len).min(planned_payload), true)
+        } else {
+            (
+                granted.min(planned_payload),
+                planned_marker && granted == planned,
+            )
+        };
+
+        let write_result = (|| {
+            if keep > 0 {
+                self.file.write_all(&bytes[..keep as usize])?;
+            }
+            if write_marker {
+                self.file.write_all(SPOOL_LIMIT_MARKER)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            self.reconcile_accounting();
+            return Err(error);
         }
 
-        if keep < bytes.len() {
-            if self.limit >= marker_len {
-                self.file.write_all(SPOOL_LIMIT_MARKER)?;
-                self.bytes_written += marker_len;
-            }
+        self.bytes_written = self
+            .bytes_written
+            .saturating_add(keep)
+            .saturating_add(if write_marker { marker_len } else { 0 });
+        if planned_marker || root_limited {
             self.limited = true;
             warn!(
                 spool_path = %self.path.display(),
-                limit_bytes = self.limit,
-                "spool file reached its per-run limit; further output remains in the memory ring only"
+                per_run_limit_bytes = self.limit,
+                root_persistence_unavailable = root_limited,
+                "spool persistence limit reached; further output remains in the memory ring only"
             );
         }
         Ok(())
+    }
+
+    fn reconcile_accounting(&mut self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        if let Ok(metadata) = self.file.metadata() {
+            self.bytes_written = metadata.len().min(self.limit);
+            lock_spool_ledger(ledger).set_actual_bytes(&self.path, metadata.len());
+        }
     }
 }
 
 impl Drop for SpoolWriter {
     fn drop(&mut self) {
         let _ = self.file.flush();
-        if let Some(root) = self.spool_root.as_deref() {
-            let mut active = lock_active_spool_reservations();
+        self.reconcile_accounting();
+        if let Some(ledger) = &self.ledger {
+            let mut ledger = lock_spool_ledger(ledger);
+            ledger.mark_inactive(&self.path);
             if let Some(dir) = self.path.parent() {
-                cleanup_spool_dir_preserving(dir, Some(&self.path));
+                ledger.enforce_dir_budget(dir);
             }
-            if let Err(error) = cleanup_spool_root_locked(root, &active) {
-                warn!(spool_root = %root.display(), %error, "could not enforce global spool budget");
-            }
-            active.remove(&self.path);
+            ledger.enforce_global_budget();
         } else if let Some(dir) = self.path.parent() {
             cleanup_spool_dir_preserving(dir, Some(&self.path));
         }
     }
 }
 
-type ActiveSpoolReservations = HashMap<PathBuf, (PathBuf, u64)>;
-
-fn active_spool_reservations() -> &'static Mutex<ActiveSpoolReservations> {
-    static ACTIVE: OnceLock<Mutex<ActiveSpoolReservations>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Debug)]
+struct SpoolEntry {
+    bytes: u64,
+    modified: std::time::SystemTime,
+    active: bool,
 }
 
-fn lock_active_spool_reservations() -> MutexGuard<'static, ActiveSpoolReservations> {
-    active_spool_reservations()
+#[derive(Debug)]
+struct SpoolLedger {
+    root: PathBuf,
+    max_bytes: u64,
+    initialized: bool,
+    next_scan_attempt: Option<Instant>,
+    total_bytes: u64,
+    entries: HashMap<PathBuf, SpoolEntry>,
+    #[cfg(test)]
+    scan_count: usize,
+}
+
+impl SpoolLedger {
+    fn new(root: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            root,
+            max_bytes,
+            initialized: false,
+            next_scan_attempt: None,
+            total_bytes: 0,
+            entries: HashMap::new(),
+            #[cfg(test)]
+            scan_count: 0,
+        }
+    }
+
+    fn initialize(&mut self) {
+        if self.initialized {
+            return;
+        }
+        if self
+            .next_scan_attempt
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.scan_count += 1;
+        }
+
+        let (mut entries, mut total_bytes) = match scan_spool_root(&self.root) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.next_scan_attempt = Some(Instant::now() + SPOOL_SCAN_RETRY_INTERVAL);
+                warn!(
+                    spool_root = %self.root.display(),
+                    %error,
+                    "could not completely index spool root; disk persistence is paused until a later retry"
+                );
+                return;
+            }
+        };
+
+        // A retry can run while writers opened after an earlier failed scan
+        // are still active. Preserve their claimed bytes rather than replacing
+        // them with a possibly smaller on-disk length observed mid-write.
+        for (path, active) in self.entries.iter().filter(|(_, entry)| entry.active) {
+            if let Some(scanned) = entries.remove(path) {
+                total_bytes = total_bytes.saturating_sub(scanned.bytes);
+            }
+            total_bytes = total_bytes.saturating_add(active.bytes);
+            entries.insert(
+                path.clone(),
+                SpoolEntry {
+                    bytes: active.bytes,
+                    modified: active.modified,
+                    active: true,
+                },
+            );
+        }
+
+        self.entries = entries;
+        self.total_bytes = total_bytes;
+        self.initialized = true;
+        self.next_scan_attempt = None;
+        self.enforce_global_budget();
+    }
+
+    fn register_active(&mut self, path: &std::path::Path) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+        }
+        self.entries.insert(
+            path.to_path_buf(),
+            SpoolEntry {
+                bytes: 0,
+                modified: std::time::SystemTime::now(),
+                active: true,
+            },
+        );
+    }
+
+    fn claim_bytes(&mut self, path: &std::path::Path, desired: u64) -> u64 {
+        if desired == 0 || !self.initialized {
+            return 0;
+        }
+        let target = self.max_bytes.saturating_sub(desired.min(self.max_bytes));
+        self.evict_global_until(target);
+        let granted = desired.min(self.max_bytes.saturating_sub(self.total_bytes));
+        let entry = self
+            .entries
+            .entry(path.to_path_buf())
+            .or_insert(SpoolEntry {
+                bytes: 0,
+                modified: std::time::SystemTime::now(),
+                active: true,
+            });
+        entry.bytes = entry.bytes.saturating_add(granted);
+        entry.modified = std::time::SystemTime::now();
+        self.total_bytes = self.total_bytes.saturating_add(granted);
+        granted
+    }
+
+    fn set_actual_bytes(&mut self, path: &std::path::Path, actual: u64) {
+        let Some(entry) = self.entries.get_mut(path) else {
+            return;
+        };
+        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+        entry.bytes = actual;
+        entry.modified = std::time::SystemTime::now();
+        self.total_bytes = self.total_bytes.saturating_add(actual);
+    }
+
+    fn mark_inactive(&mut self, path: &std::path::Path) {
+        let mut remove_zero_entry = false;
+        if let Some(entry) = self.entries.get_mut(path) {
+            entry.active = false;
+            entry.modified = std::time::SystemTime::now();
+            remove_zero_entry = entry.bytes == 0;
+        }
+        if remove_zero_entry {
+            self.entries.remove(path);
+        }
+    }
+
+    fn enforce_dir_budget(&mut self, dir: &std::path::Path) {
+        let mut attempted = HashSet::new();
+        loop {
+            let total: u64 = self
+                .entries
+                .iter()
+                .filter(|(path, _)| path.parent() == Some(dir))
+                .map(|(_, entry)| entry.bytes)
+                .sum();
+            if total <= MAX_SPOOL_DIR_BYTES || !self.evict_oldest(Some(dir), &mut attempted) {
+                break;
+            }
+        }
+    }
+
+    fn enforce_global_budget(&mut self) {
+        self.evict_global_until(self.max_bytes);
+    }
+
+    fn evict_global_until(&mut self, target: u64) {
+        let mut attempted = HashSet::new();
+        while self.total_bytes > target {
+            if !self.evict_oldest(None, &mut attempted) {
+                break;
+            }
+        }
+    }
+
+    fn evict_oldest(
+        &mut self,
+        dir: Option<&std::path::Path>,
+        attempted: &mut HashSet<PathBuf>,
+    ) -> bool {
+        let mut candidates: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(path, entry)| {
+                !entry.active
+                    && entry.bytes > 0
+                    && !attempted.contains(path.as_path())
+                    && dir.is_none_or(|candidate| path.parent() == Some(candidate))
+            })
+            .map(|(path, entry)| (path.clone(), entry.modified))
+            .collect();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        for (path, _) in candidates {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    if let Some(entry) = self.entries.remove(&path) {
+                        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+                    }
+                    return true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(entry) = self.entries.remove(&path) {
+                        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    attempted.insert(path.clone());
+                    warn!(spool_path = %path.display(), %error, "could not remove old spool file");
+                }
+            }
+        }
+        false
+    }
+}
+
+fn scan_spool_root(root: &std::path::Path) -> std::io::Result<(HashMap<PathBuf, SpoolEntry>, u64)> {
+    let mut entries = HashMap::new();
+    let mut total_bytes = 0_u64;
+    for session_dir in std::fs::read_dir(root)? {
+        let session_dir = session_dir?;
+        if !session_dir.file_type()?.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(session_dir.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let metadata = file.metadata()?;
+            let bytes = metadata.len();
+            if bytes == 0 {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(bytes);
+            entries.insert(
+                file.path(),
+                SpoolEntry {
+                    bytes,
+                    modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                    active: false,
+                },
+            );
+        }
+    }
+    Ok((entries, total_bytes))
+}
+
+type SpoolLedgers = HashMap<PathBuf, Arc<Mutex<SpoolLedger>>>;
+
+fn spool_ledgers() -> &'static Mutex<SpoolLedgers> {
+    static LEDGERS: OnceLock<Mutex<SpoolLedgers>> = OnceLock::new();
+    LEDGERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn spool_ledger(root: &std::path::Path) -> Arc<Mutex<SpoolLedger>> {
+    let mut ledgers = spool_ledgers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ledgers
+        .entry(root.to_path_buf())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(SpoolLedger::new(
+                root.to_path_buf(),
+                MAX_SPOOL_ROOT_BYTES,
+            )))
+        })
+        .clone()
+}
+
+fn lock_spool_ledger(ledger: &Mutex<SpoolLedger>) -> std::sync::MutexGuard<'_, SpoolLedger> {
+    ledger
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn reserve_active_spool_locked(
-    active: &mut ActiveSpoolReservations,
-    root: &std::path::Path,
-    path: &std::path::Path,
-    limit: u64,
-) -> std::io::Result<()> {
-    let reserved: u64 = active
-        .values()
-        .filter(|(candidate_root, _)| candidate_root == root)
-        .map(|(_, bytes)| *bytes)
-        .sum();
-    if reserved.saturating_add(limit) > MAX_SPOOL_ROOT_BYTES {
-        return Err(std::io::Error::other(format!(
-            "global spool budget is fully reserved by active runs ({} MiB max); wait for a run to finish or stop an unused session",
-            MAX_SPOOL_ROOT_BYTES / (1024 * 1024)
-        )));
-    }
-    active.insert(path.to_path_buf(), (root.to_path_buf(), limit));
-    Ok(())
-}
-
-#[cfg(test)]
-fn reserve_active_spool(
-    root: &std::path::Path,
-    path: &std::path::Path,
-    limit: u64,
-) -> std::io::Result<()> {
-    reserve_active_spool_locked(&mut lock_active_spool_reservations(), root, path, limit)
-}
-
-#[cfg(test)]
-fn release_active_spool(path: &std::path::Path) {
-    lock_active_spool_reservations().remove(path);
 }
 
 struct SessionState {
@@ -1091,9 +1374,9 @@ fn ingest(state: &mut SessionState, data: &[u8]) {
                 }
                 state.ring.push_slice(&bytes);
                 if let Some(writer) = state.spool_file.as_mut() {
-                    // Local disk writes are small and fast; a brief
-                    // synchronous write here is simpler and cheaper than
-                    // wiring up tokio::fs for this milestone.
+                    // The ledger avoids repeated tree scans; the actual
+                    // append remains synchronous and failures detach only
+                    // this spool while command/ring processing continues.
                     let path = writer.path.clone();
                     if let Err(error) = writer.write_payload(&bytes) {
                         warn!(
@@ -1181,31 +1464,13 @@ fn open_spool_file_under(
     ensure_private_dir(root)?;
     let dir = spool_dir_under(root, host, name);
     ensure_private_dir(&dir)?;
-    let path = dir.join(format!("{seq:08}.log"));
-    // Hold the reservation registry lock before the file appears and through
-    // global cleanup. This makes the filesystem view and the protected-path
-    // set one transaction, so a concurrent cleanup cannot delete a newly
-    // created active spool between its directory scan and delete pass.
-    let mut active = lock_active_spool_reservations();
-    reserve_active_spool_locked(&mut active, root, &path, MAX_SPOOL_FILE_BYTES)?;
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(error) => {
-            active.remove(&path);
-            return Err(error);
-        }
-    };
+    let ledger = spool_ledger(root);
+    let mut accounting = lock_spool_ledger(&ledger);
+    accounting.initialize();
+    let (path, file) = create_spool_file(&dir, seq)?;
     match file.metadata() {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
-            active.remove(&path);
             let _ = std::fs::remove_file(&path);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1213,25 +1478,49 @@ fn open_spool_file_under(
             ));
         }
         Err(error) => {
-            active.remove(&path);
             let _ = std::fs::remove_file(&path);
             return Err(error);
         }
     }
     if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        active.remove(&path);
         let _ = std::fs::remove_file(&path);
         return Err(error);
     }
-    cleanup_spool_dir_preserving(&dir, Some(&path));
-    if let Err(error) = cleanup_spool_root_locked(root, &active) {
-        active.remove(&path);
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    drop(active);
-    let writer = SpoolWriter::new_reserved(file, path.clone(), root.to_path_buf());
+    accounting.register_active(&path);
+    accounting.enforce_dir_budget(&dir);
+    accounting.enforce_global_budget();
+    drop(accounting);
+    let writer = SpoolWriter::new_accounted(file, path.clone(), ledger);
     Ok((path, writer))
+}
+
+fn create_spool_file(dir: &std::path::Path, seq: u64) -> std::io::Result<(PathBuf, std::fs::File)> {
+    const MAX_ATTEMPTS: usize = 16;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let filename = if attempt == 0 {
+            format!("{seq:08}.log")
+        } else {
+            format!("{seq:08}-{:016x}.log", rand::random::<u64>())
+        };
+        let path = dir.join(filename);
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not allocate a unique spool file for run sequence {seq}"),
+    ))
 }
 
 fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf, SpoolWriter)> {
@@ -1239,10 +1528,9 @@ fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf
 }
 
 /// Simple size-based retention: while the directory holds more than
-/// `MAX_SPOOL_DIR_BYTES`, delete the oldest files (by filename, which is a
-/// zero-padded sequence number so lexicographic order is chronological)
-/// until it doesn't. Best-effort — errors are logged, not propagated,
-/// since spool cleanup should never block a `run` from completing.
+/// `MAX_SPOOL_DIR_BYTES`, delete the oldest files by modification time until
+/// it doesn't. Best-effort — errors are logged, not propagated, since spool
+/// cleanup should never make a `run` fail.
 fn cleanup_spool_dir_preserving(dir: &std::path::Path, preserve: Option<&std::path::Path>) {
     let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -1280,64 +1568,10 @@ fn cleanup_spool_dir_preserving(dir: &std::path::Path, preserve: Option<&std::pa
 
 #[cfg(test)]
 fn cleanup_spool_root(root: &std::path::Path) -> std::io::Result<()> {
-    let active = lock_active_spool_reservations();
-    cleanup_spool_root_locked(root, &active)
-}
-
-fn cleanup_spool_root_locked(
-    root: &std::path::Path,
-    active: &ActiveSpoolReservations,
-) -> std::io::Result<()> {
-    let protected: HashSet<PathBuf> = active
-        .iter()
-        .filter(|(_, (candidate_root, _))| candidate_root == root)
-        .map(|(path, _)| path.clone())
-        .collect();
-    let reserved = active
-        .values()
-        .filter(|(candidate_root, _)| candidate_root == root)
-        .map(|(_, bytes)| *bytes)
-        .sum();
-    let retained_budget = MAX_SPOOL_ROOT_BYTES.saturating_sub(reserved);
-    let mut entries = Vec::new();
-    for session_entry in std::fs::read_dir(root)? {
-        let session_entry = session_entry?;
-        if !session_entry.file_type()?.is_dir() {
-            continue;
-        }
-        for file_entry in std::fs::read_dir(session_entry.path())? {
-            let file_entry = file_entry?;
-            if !file_entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = file_entry.path();
-            if protected.contains(&path) {
-                continue;
-            }
-            let metadata = file_entry.metadata()?;
-            entries.push((
-                path,
-                metadata.len(),
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-            ));
-        }
-    }
-
-    entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-    let mut retained: u64 = entries.iter().map(|(_, len, _)| *len).sum();
-    for (path, len, _) in entries {
-        if retained <= retained_budget {
-            break;
-        }
-        std::fs::remove_file(&path)?;
-        retained = retained.saturating_sub(len);
-    }
-    if retained > retained_budget {
-        return Err(std::io::Error::other(format!(
-            "could not reduce retained spool data to the {} MiB global budget",
-            MAX_SPOOL_ROOT_BYTES / (1024 * 1024)
-        )));
-    }
+    let ledger = spool_ledger(root);
+    let mut ledger = lock_spool_ledger(&ledger);
+    ledger.initialize();
+    ledger.enforce_global_budget();
     Ok(())
 }
 
@@ -1593,15 +1827,17 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
                 reason: reason.clone(),
             });
         }
-        if state.busy
-            && let Some(current) = state.current_run.as_mut()
-        {
-            // Re-arming on repeat interrupts replaces the probe sentinel;
-            // an older probe's marker (if its printf still runs) is
-            // scrubbed and swallowed as stale by `handle_marker`.
-            let resync_sentinel = make_sentinel();
-            current.resync = Some(resync_sentinel.clone());
-            Some(marker_printf(&resync_sentinel))
+        if state.busy {
+            if let Some(current) = state.current_run.as_mut() {
+                // Re-arming on repeat interrupts replaces the probe sentinel;
+                // an older probe's marker (if its printf still runs) is
+                // scrubbed and swallowed as stale by `handle_marker`.
+                let resync_sentinel = make_sentinel();
+                current.resync = Some(resync_sentinel.clone());
+                Some(marker_printf(&resync_sentinel))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1657,10 +1893,10 @@ pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
     let reg = registry().lock().await;
     let mut out = Vec::with_capacity(reg.len());
     for ((host, name), inner) in reg.iter() {
-        if let Some(hf) = &host_filter
-            && hf != host
-        {
-            continue;
+        if let Some(hf) = &host_filter {
+            if hf != host {
+                continue;
+            }
         }
         let state = inner.state.lock().await;
         out.push(summarize(host, name, &state));
@@ -2405,6 +2641,48 @@ mod tests {
     }
 
     #[test]
+    fn reused_run_sequence_never_truncates_retained_history() {
+        let root = temp_spool_root("sequence-collision");
+        ensure_private_dir(&root).unwrap();
+        let dir = spool_dir_under(&root, "host", "session");
+        ensure_private_dir(&dir).unwrap();
+        let history = dir.join("00000001.log");
+        std::fs::write(&history, b"retained history").unwrap();
+
+        let (new_path, writer) = open_spool_file_under(&root, "host", "session", 1).unwrap();
+
+        assert_ne!(new_path, history, "a reused sequence needs a unique path");
+        assert_eq!(std::fs::read(&history).unwrap(), b"retained history");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incomplete_initial_scan_pauses_persistence_until_a_complete_retry() {
+        let root = temp_spool_root("scan-retry");
+        ensure_private_dir(&root).unwrap();
+        let unreadable = root.join("unreadable");
+        ensure_private_dir(&unreadable).unwrap();
+        let history = unreadable.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(32).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut ledger = SpoolLedger::new(root.clone(), 64);
+        ledger.initialize();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!ledger.initialized);
+        assert_eq!(ledger.claim_bytes(&root.join("active.log"), 16), 0);
+
+        ledger.next_scan_attempt = None;
+        ledger.initialize();
+        assert!(ledger.initialized);
+        assert_eq!(ledger.total_bytes, 32);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn spool_limit_does_not_stop_ring_or_command_completion() {
         let root = temp_spool_root("limit");
         ensure_private_dir(&root).unwrap();
@@ -2495,52 +2773,201 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_spool_open_waits_until_cleanup_registry_is_unlocked() {
-        let root = temp_spool_root("concurrent-open");
-        let path = spool_dir_under(&root, "host", "session").join("00000001.log");
-        let active = lock_active_spool_reservations();
-        let thread_root = root.clone();
-        let worker = std::thread::spawn(move || {
-            open_spool_file_under(&thread_root, "host", "session", 1).unwrap()
-        });
+    fn more_than_sixteen_empty_spool_writers_can_run_concurrently() {
+        let root = temp_spool_root("many-empty-writers");
+        let mut writers = Vec::new();
 
-        let parent = path.parent().unwrap();
-        for _ in 0..100 {
-            if parent.exists() {
-                break;
+        for i in 0..17 {
+            let opened = open_spool_file_under(&root, "host", &format!("session-{i}"), 1);
+            match opened {
+                Ok((_, writer)) => writers.push(writer),
+                Err(error) => {
+                    panic!("empty run {i} must not consume a phantom 64 MiB reservation: {error}")
+                }
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(parent.exists(), "worker should reach the reservation lock");
-        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(writers.len(), 17);
+        assert_eq!(
+            lock_spool_ledger(&spool_ledger(&root)).scan_count,
+            1,
+            "root tree must be indexed once, not once per run"
+        );
+        drop(writers);
+        assert_eq!(
+            lock_spool_ledger(&spool_ledger(&root)).scan_count,
+            1,
+            "dropping writers must use the ledger, not rescan the root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_active_writer_does_not_evict_retained_history() {
+        let root = temp_spool_root("empty-writer-history");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(970 * 1024 * 1024).unwrap();
+
+        let (_, writer) = open_spool_file_under(&root, "host", "active", 1).unwrap();
         assert!(
-            !path.exists(),
-            "an active spool file must not appear outside the reservation/cleanup critical section"
+            history.exists(),
+            "zero-byte active writer must not evict real retained history"
         );
 
-        drop(active);
-        let (opened_path, writer) = worker.join().unwrap();
-        assert_eq!(opened_path, path);
-        assert!(path.exists());
         drop(writer);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn active_spool_reservations_cannot_exceed_global_budget() {
-        let root = temp_spool_root("global-reservations");
-        let slots = (MAX_SPOOL_ROOT_BYTES / MAX_SPOOL_FILE_BYTES) as usize;
-        let paths: Vec<PathBuf> = (0..slots)
-            .map(|i| root.join(format!("active-{i}.log")))
-            .collect();
-        for path in &paths {
-            reserve_active_spool(&root, path, MAX_SPOOL_FILE_BYTES).unwrap();
+    fn global_spool_ledger_charges_actual_bytes_and_evicts_oldest_inactive() {
+        let root = temp_spool_root("actual-byte-ledger");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(80).unwrap();
+
+        let active_dir = root.join("active");
+        ensure_private_dir(&active_dir).unwrap();
+        let active = active_dir.join("00000001.log");
+        let active_file = std::fs::File::create(&active).unwrap();
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 128)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&active);
+            assert_eq!(accounting.total_bytes, 80);
         }
-        let overflow = root.join("overflow.log");
-        assert!(reserve_active_spool(&root, &overflow, MAX_SPOOL_FILE_BYTES).is_err());
-        for path in &paths {
-            release_active_spool(path);
+        let mut writer = SpoolWriter::with_accounting(active_file, active.clone(), 256, ledger);
+
+        writer.write_payload(&[b'x'; 80]).unwrap();
+
+        assert!(
+            !history.exists(),
+            "oldest inactive history should make room"
+        );
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 80);
+        assert_eq!(
+            lock_spool_ledger(writer.ledger.as_ref().unwrap()).total_bytes,
+            80
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_spool_ledger_never_evicts_active_files() {
+        let root = temp_spool_root("active-protection");
+        ensure_private_dir(&root).unwrap();
+        let dir = root.join("sessions");
+        ensure_private_dir(&dir).unwrap();
+        let first_path = dir.join("00000001.log");
+        let second_path = dir.join("00000002.log");
+        let first_file = std::fs::File::create(&first_path).unwrap();
+        let second_file = std::fs::File::create(&second_path).unwrap();
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 100)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&first_path);
+            accounting.register_active(&second_path);
         }
+        let mut first =
+            SpoolWriter::with_accounting(first_file, first_path.clone(), 256, ledger.clone());
+        let mut second =
+            SpoolWriter::with_accounting(second_file, second_path.clone(), 256, ledger.clone());
+
+        first.write_payload(&[b'a'; 80]).unwrap();
+        second.write_payload(&[b'b'; 80]).unwrap();
+
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert_eq!(std::fs::metadata(&first_path).unwrap().len(), 80);
+        assert_eq!(std::fs::metadata(&second_path).unwrap().len(), 20);
+        assert_eq!(lock_spool_ledger(&ledger).total_bytes, 100);
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_delete_failure_does_not_block_new_spool_writer() {
+        let root = temp_spool_root("cleanup-failure");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("read-only-history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file
+            .set_len(MAX_SPOOL_ROOT_BYTES + MAX_SPOOL_FILE_BYTES)
+            .unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let opened = open_spool_file_under(&root, "host", "new-run", 1);
+
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, writer) = opened.expect("retention cleanup failure must not fail a remote run");
+        cleanup_spool_root(&root).unwrap();
+        assert!(
+            !history.exists(),
+            "a later cleanup pass must retry transient deletion failures"
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_failure_stops_persistence_but_not_ring_or_command() {
+        let root = temp_spool_root("cleanup-failure-ingest");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("read-only-history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(128).unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 64)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+        }
+        let active_dir = root.join("active");
+        ensure_private_dir(&active_dir).unwrap();
+        let active = active_dir.join("00000001.log");
+        let active_file = std::fs::File::create(&active).unwrap();
+        lock_spool_ledger(&ledger).register_active(&active);
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_accounting(
+            active_file,
+            active.clone(),
+            128,
+            ledger,
+        ));
+
+        ingest(
+            &mut state,
+            format!("{}\r\n\r\n{sentinel}0{sentinel}\r\n", "x".repeat(256)).as_bytes(),
+        );
+
+        assert!(!state.busy, "marker handling must survive cleanup failure");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(!ring_contents(&state).is_empty());
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

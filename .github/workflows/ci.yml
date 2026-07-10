@@ -34,16 +34,16 @@ jobs:
   # Keep Cargo.toml's rust-version honest. Stable-only CI cannot catch use
   # of language or standard-library features newer than the declared MSRV.
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (Rust 1.85)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.85.0
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-1.88
+          key: msrv-1.85
 
       - name: cargo check --all-targets --all-features
         run: cargo check --all-targets --all-features --locked
@@ -68,7 +68,7 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --all-targets --all-features --locked
 
   # Exercises tests/ssh_session.rs, tests/sftp_transfer.rs, and
   # tests/forward.rs against a real sshd, since they're skipped entirely by
@@ -137,7 +137,7 @@ jobs:
         run: SLOOSH_TEST_SSH_HOST=citest cargo test --features integration-test-hooks --test sftp_transfer -- --test-threads=1
 
       - name: Run live port-forward integration tests
-        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test forward -- --test-threads=1
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --features integration-test-hooks --test forward -- --test-threads=1
 
       # tests/proxy_jump.rs additionally requires password SSH auth. Keep it
       # out of hosted-runner CI until the job uses an isolated localhost-only

@@ -11,7 +11,7 @@ Sloosh handles these security-sensitive assets:
 - the vault master password and SSH passwords;
 - decrypted vault entries and the derived vault key while leases are active;
 - active lease host scopes and `SLOOSH_LEASE` bearer tokens;
-- authenticated SSH connections, persistent PTY sessions, and local forwards;
+- authenticated SSH connections, persistent PTY sessions, and port forwards;
 - local upload/download contents and remote SFTP contents;
 - trusted SSH host keys;
 - local state under `~/.sloosh`, including vault, socket, daemon log, audit log,
@@ -49,7 +49,8 @@ The design reduces risk from:
   executable path;
 - an agent asking the daemon to open an arbitrary local path during SFTP;
 - unbounded single-message, single-frame, or per-session spool allocation;
-- accidental exposure of a forward beyond local loopback;
+- accidental exposure of a local forward beyond loopback, or an unintended
+  remote listener;
 - approval-time ProxyJump scope changing between human preview and daemon
   activation.
 
@@ -98,13 +99,21 @@ Long-lived forwards store an opaque `LeaseGrant` scoped to one host and active
 lease. They do not retain a short-lived creator CLI PID. Real traffic refreshes
 the lease; background validation does not.
 
+Remote routes have a monotonic `Pending -> Active -> Closed` gate. A server-
+initiated channel can dial the local target only while the route is `Active`.
+The local connect is bounded to 10 seconds and races closure; authorization is
+checked again before accept. Stop and expiry close the route before awaiting a
+remote cancellation reply, bound that reply to 2 seconds, then drop the SSH
+connection regardless.
+
 ### 4.3 Local file authority
 
 For SFTP, the CLI alone opens local paths:
 
 - `put`: CLI opens a local regular file and sends its bytes over raw frames;
-- `get`: CLI creates a mode-`0600` temp file in the destination directory and
-  commits it only after a successful final daemon response.
+- `get`: CLI creates a temp file in the destination directory with requested
+  mode `0666`, allowing the caller's umask to determine its effective mode,
+  and commits it only after a successful final daemon response.
 
 The daemon receives `local_path` only as an audit/display label. It owns the
 remote SFTP handle but never opens that local path. This removes the prior
@@ -134,11 +143,18 @@ or explicit daemon/process termination remains the termination path.
 - Spool file: 64 MiB per run, then an explicit truncation marker.
 - Spool retention: 64 MiB budget per session directory, oldest first,
   best-effort.
-- Spool root: 1 GiB hard application budget across every host/session.
-- Active spool: each run reserves 64 MiB up front, so at most 16 active
-  reservations can coexist; cleanup deletes oldest inactive files across
-  directories while protecting active paths. File creation, reservation, and
-  cleanup are serialized under the same registry lock.
+- Spool root: 1 GiB hard application budget across every host/session, charged
+  by bytes actually persisted.
+- Active spool: active paths are protected but reserve no unused capacity.
+  One lazy root index seeds an incremental ledger; later run start/end paths do
+  not rescan the full tree. Cleanup deletes oldest inactive files when actual
+  output needs room. Delete failure is logged and may stop persistence at the
+  cap, but is not propagated as a command failure and never deletes active
+  files.
+- An incomplete initial index pauses new persistence and retries after a
+  backoff instead of granting against unknown bytes. Run files use
+  collision-safe `create_new`, so reused sequence numbers cannot truncate
+  retained history.
 - ProxyJump recursion: at most 8 hops, with cycle rejection.
 
 Spool limits cover PTY command output only. They never cap SFTP bytes or
@@ -152,18 +168,23 @@ Sloosh-owned private directories are created or repaired to `0700`.
 then opens with `O_DIRECTORY | O_NOFOLLOW`. On macOS it clears extended ACLs
 before applying mode `0700`.
 
+A non-default `$SLOOSH_SOCKET` parent is not owned by sloosh and is never
+repaired. It must already be a current-eUID-owned mode-`0700` directory; on
+macOS it must also have no extended ACL. Otherwise bind fails without changing
+its mode or ACL.
+
 Specific files use these controls:
 
 - daemon socket: `0600` inside a private directory;
 - daemon log and audit log: opened `0600` with `O_NOFOLLOW`; macOS extended
   ACLs are cleared;
-- spool files: encoded single-component host/session directories, `0600`, and
-  `O_NOFOLLOW`;
+- spool files: encoded single-component host/session directories,
+  collision-safe `create_new`, `0600`, and `O_NOFOLLOW`;
 - vault: random `create_new` temp file at `0600`, then atomic rename inside the
   private state directory;
 - sloosh known_hosts: set to `0600` after recording;
-- local download temp: random `create_new` file at `0600` in the destination
-  directory, then atomic commit.
+- local download temp: random `create_new` file requested at `0666`, reduced by
+  the caller's umask in the destination directory, then atomic commit.
 
 These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.
@@ -204,7 +225,7 @@ leaves the host unknown, and real SSH connection attempts remain fail closed.
 
 The daemon, not the CLI, is the authority for host operations. Current request
 classes are below. Except for `Status`, `Hello`, and `Shutdown`, every wire
-request first requires a negotiated protocol 2 connection; the table lists
+request first requires a negotiated protocol 1 connection; the table lists
 additional authority after that gate.
 
 | Request or command | Required authority | Notes |
@@ -213,7 +234,7 @@ additional authority after that gate.
 | `Open`, `Kill` | active lease for host | create/reuse or terminate session |
 | `Put`, `Get` | negotiated connection plus active lease at start | after `TransferReady`, current stream completes under the start-time grant |
 | `Forward -L` | active lease for host | loopback listener only; stable grant retained |
-| `Forward -R` | active host lease is checked first | creation then always rejected pending capability approval |
+| `Forward -R` | active lease for host | remote listener; stable grant retained; exposure follows sshd policy |
 | `Status` | no handshake or lease | protocol/version and read-only state disclosure |
 | `Hello` | exact protocol version | opens per-connection gate; wrong version leaves it closed |
 | `Ls`, `ForwardLs` | negotiated connection, no lease | read-only state disclosure to same UID |
@@ -239,6 +260,8 @@ password and state preconditions.
 - Lease reaper interval: 60 seconds. API use also prunes synchronously.
 - Forward grant check interval: 15 seconds without touching idle time.
 - Real accepted forward traffic revalidates and touches the lease.
+- Remote target connect timeout: 10 seconds.
+- Remote listener cancellation timeout: 2 seconds, followed by SSH teardown.
 - Session idle limit: 8 hours, checked every 5 minutes.
 
 Lease expiry does not terminate persistent PTY sessions or their remote
@@ -268,7 +291,7 @@ Sloosh does not guarantee protection from hostile same-UID code. Such code may:
 
 - connect as a raw UDS client because the daemon intentionally accepts
   same-user tools and derives authority from peer PID/ancestry, not client
-  executable identity; ordinary requests still require a correct protocol 2
+  executable identity; ordinary requests still require a correct protocol 1
   `Hello` first;
 - issue pre-handshake `Status` or `Shutdown`, then negotiate and issue unleased
   `Ls`, `ForwardLs`, `ForwardStop`, lease-request, and metadata requests;
@@ -289,8 +312,14 @@ of runtime injection.
 
 Human approval grants host capability, not command intent. Once authorized, an
 agent can run arbitrary remote commands, transfer files, and create allowed
-loopback forwards for that host. Sloosh does not inspect shell commands for
-safety.
+local or remote forwards for that host. A remote forward may expose a server-
+side listener according to sshd policy. Sloosh does not inspect shell commands
+for safety.
+
+Spool append and eviction still use synchronous filesystem calls. A slow or
+stalled spool filesystem can delay PTY consumption and other spool writers at
+budget pressure, although the ledger avoids per-run full-tree scans and keeps
+cleanup errors out of command results.
 
 Audit can be missing, partially written, deleted, or modified by the owner. Do
 not use it as the sole control for compliance or incident evidence.

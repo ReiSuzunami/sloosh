@@ -78,12 +78,16 @@ async fn cmd_daemon(action: DaemonAction) -> anyhow::Result<()> {
 }
 
 async fn cmd_daemon_start(socket_path: &Path) -> anyhow::Result<()> {
-    if UnixChannel::connect(socket_path).await.is_ok() {
-        println!(
-            "sloosh daemon is already running (socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
+    match UnixChannel::connect(socket_path).await {
+        Ok(_) => {
+            println!(
+                "sloosh daemon is already running (socket at {})",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        Err(error) if daemon_is_not_running_error(&error) => {}
+        Err(error) => return Err(daemon_connect_error(socket_path, error)),
     }
     client::spawn_daemon_detached(socket_path)?;
     client::wait_for_daemon(socket_path).await?;
@@ -95,12 +99,16 @@ async fn cmd_daemon_start(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 async fn cmd_daemon_stop(socket_path: &Path) -> anyhow::Result<()> {
-    let Ok(mut chan) = UnixChannel::connect(socket_path).await else {
-        println!(
-            "sloosh daemon is not running (no socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
+    let mut chan = match UnixChannel::connect(socket_path).await {
+        Ok(chan) => chan,
+        Err(error) if daemon_is_not_running_error(&error) => {
+            println!(
+                "sloosh daemon is not running (no socket at {})",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(daemon_connect_error(socket_path, error)),
     };
     chan.send(&Request::Shutdown).await?;
     // Best-effort: read the Ok ack, but a closed connection is also a valid
@@ -111,16 +119,38 @@ async fn cmd_daemon_stop(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 async fn cmd_daemon_status(socket_path: &Path) -> anyhow::Result<()> {
-    let Ok(mut chan) = UnixChannel::connect(socket_path).await else {
-        println!(
-            "sloosh daemon is not running (no socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
+    let mut chan = match UnixChannel::connect(socket_path).await {
+        Ok(chan) => chan,
+        Err(error) if daemon_is_not_running_error(&error) => {
+            println!(
+                "sloosh daemon is not running (no socket at {})",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(daemon_connect_error(socket_path, error)),
     };
     let reply = request_status(&mut chan).await?;
     print_status_human(&reply, socket_path);
     Ok(())
+}
+
+fn daemon_is_not_running_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn daemon_connect_error(socket_path: &Path, error: std::io::Error) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        client::untrusted_daemon_error(socket_path, error)
+    } else {
+        anyhow::Error::new(error).context(format!(
+            "could not connect to the daemon socket at {}",
+            socket_path.display()
+        ))
+    }
 }
 
 async fn request_status(chan: &mut UnixChannel) -> anyhow::Result<StatusReply> {
@@ -715,7 +745,7 @@ impl LocalDownload {
         let mut options = tokio::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        options.mode(0o600);
+        options.mode(0o666);
         let file = options
             .open(&temp)
             .await
@@ -883,7 +913,7 @@ async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// Port forwarding (DESIGN.md §6).
+// Port forwarding (DESIGN.md §7).
 // ---------------------------------------------------------------------
 
 async fn cmd_forward(action: ForwardAction) -> anyhow::Result<()> {
@@ -1046,6 +1076,7 @@ fn render_field_value(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     // These tests deliberately never call `std::env::set_current_dir` (that
     // mutates process-global state and would race with every other test
@@ -1081,6 +1112,32 @@ mod tests {
         let cwd = std::env::current_dir().expect("current dir");
         let expected = cwd.join("file.txt").to_string_lossy().into_owned();
         assert_eq!(resolve_local_path("file.txt").unwrap(), expected);
+    }
+
+    #[test]
+    fn daemon_identity_refusal_is_not_reported_as_not_running() {
+        let denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server identity could not be verified",
+        );
+        assert!(!daemon_is_not_running_error(&denied));
+        let message = daemon_connect_error(Path::new("/tmp/sloosh.sock"), denied).to_string();
+        assert!(message.contains("refusing to use the daemon socket"));
+        assert!(message.contains("server identity could not be verified"));
+
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(daemon_is_not_running_error(&std::io::Error::new(
+                kind,
+                "daemon absent"
+            )));
+        }
+        assert!(!daemon_is_not_running_error(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timed out"
+        )));
     }
 
     #[test]
@@ -1131,14 +1188,52 @@ mod tests {
         download.write_chunk(b"ment").await.unwrap();
         download.finish().await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn download_mode_follows_caller_umask() {
+        const CHILD_MARKER: &str = "SLOOSH_DOWNLOAD_UMASK_CHILD";
+        const DESTINATION: &str = "SLOOSH_DOWNLOAD_UMASK_DESTINATION";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(DESTINATION).expect("child destination path"),
             );
+            let mut download = LocalDownload::open(&path, false).await.unwrap();
+            download.write_chunk(b"umask").await.unwrap();
+            download.finish().await.unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "0666 creation mode under umask 027");
+
+            let force_path = path.with_extension("force");
+            std::fs::write(&force_path, b"old").unwrap();
+            std::fs::set_permissions(&force_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut forced = LocalDownload::open(&force_path, true).await.unwrap();
+            forced.write_chunk(b"new").await.unwrap();
+            forced.finish().await.unwrap();
+            let force_mode = std::fs::metadata(&force_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(force_mode, 0o640, "forced replacement follows umask");
+
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(force_path);
+            return;
         }
+
+        let path = transfer_test_path("download-umask");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 027; exec \"$@\"")
+            .arg("sh")
+            .arg(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("cli::tests::download_mode_follows_caller_umask")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(DESTINATION, &path)
+            .status()
+            .expect("run isolated-umask child test");
+        assert!(status.success(), "isolated-umask child test failed");
         let _ = std::fs::remove_file(path);
     }
 
