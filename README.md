@@ -249,9 +249,12 @@ including which areas of the codebase get extra review scrutiny.
 
 ## Platform support
 
-macOS and Linux today. Windows support (a Named Pipe transport in place of
-Unix domain sockets, plus a PID-reuse-aware process-ancestry check) is
-planned — see Roadmap below.
+Source builds target macOS and Linux. Linux requires a readable procfs for
+peer executable and process-ancestry checks. Hosted live-SSH coverage currently
+uses Ubuntu; Alpine/musl, additional Linux CPU architectures, and prebuilt
+binary distribution are not release-qualified yet. Windows support (a Named
+Pipe transport in place of Unix domain sockets, plus a PID-reuse-aware
+process-ancestry check) is planned — see Roadmap below.
 
 ## Roadmap
 
