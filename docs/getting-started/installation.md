@@ -1,5 +1,7 @@
 # Installation
 
+English | [简体中文](installation.zh-CN.md)
+
 GitHub Releases are the primary installation channel. They provide prebuilt
 binaries, so users do not need Rust or a C compiler. crates.io is a planned
 secondary source-install channel for Rust users and always compiles locally.

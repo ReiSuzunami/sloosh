@@ -30,11 +30,11 @@ use crate::daemon::ssh::{self, SshError};
 use crate::proto::{SessionSummary, TransferReply};
 use crate::transport::unix::{ensure_private_dir as ensure_sloosh_private_dir, sloosh_home};
 
-/// Bound on how much output we keep in memory per session (docs/internals/architecture.md).
+/// Bound on how much output we keep in memory per session (`SECURITY.md`).
 const RING_CAPACITY: usize = 256 * 1024;
 /// Cap on how much of a single run/peek reply's `output` field we send back
-/// (docs/internals/architecture.md "~30k 字符尾部"); spool persistence has separate bounded
-/// per-run and global budgets below.
+/// (`SECURITY.md`); spool persistence has separate bounded per-run and global
+/// budgets below.
 const MAX_OUTPUT_CHARS: usize = 30_000;
 /// Keep at most this many bytes per session's spool directory before
 /// deleting the oldest files (docs/internals/architecture.md, "simple size-based cleanup").

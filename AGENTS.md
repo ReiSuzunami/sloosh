@@ -31,7 +31,6 @@ Read only the documents relevant to the task, but treat these as the project
 contract:
 
 - `README.md`: user-visible behavior and command overview.
-- `docs/internals/design.md`: concise Chinese design intent and implementation status.
 - `docs/internals/architecture.md`: component boundaries, data ownership, and runtime behavior.
 - `SECURITY.md`: threat model, guarantees, and known limits.
 - `docs/internals/protocol.md`: exact CLI-daemon protocol and framing.

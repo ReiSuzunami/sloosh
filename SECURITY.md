@@ -142,6 +142,8 @@ or explicit daemon/process termination remains the termination path.
 - Raw transfer frame: at most 1 MiB. Total transfer size has no application
   cap because a stream may contain any number of frames.
 - Session ring: 256 KiB.
+- `run`/`peek` reply output: approximately 30,000 trailing Unicode characters;
+  the reply reports truncation and points to the bounded spool file.
 - Spool file: 64 MiB per run, then an explicit truncation marker.
 - Spool retention: 64 MiB budget per session directory, oldest first,
   best-effort.
@@ -257,6 +259,7 @@ password and state preconditions.
 
 ## 6. Lease and forward timing
 
+- Pending lease request: 15 minutes before approval must be requested again.
 - Lease idle limit: 2 hours.
 - Lease absolute limit: 8 hours.
 - Lease reaper interval: 60 seconds. API use also prunes synchronously.

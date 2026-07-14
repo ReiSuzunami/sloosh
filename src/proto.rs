@@ -375,7 +375,7 @@ pub struct RunReply {
     pub exit_code: Option<i32>,
     /// Shaped (ANSI-stripped unless `--raw`) tail of the command's output.
     pub output: String,
-    /// True if `output` was truncated to the ~30k char cap (docs/internals/architecture.md).
+    /// True if `output` was truncated to the ~30k character cap (`SECURITY.md`).
     #[serde(default)]
     pub truncated: bool,
     /// Total bytes produced by this run (before truncation), for sizing

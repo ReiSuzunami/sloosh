@@ -46,7 +46,7 @@ pub const MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A pending (unapproved) request older than this is dropped and must be
-/// re-requested (docs/internals/architecture.md).
+/// re-requested (`SECURITY.md`).
 const PENDING_EXPIRY: Duration = Duration::from_secs(15 * 60);
 
 /// Length (in characters) of generated request IDs.
