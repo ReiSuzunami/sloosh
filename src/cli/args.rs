@@ -246,6 +246,9 @@ pub struct GetArgs {
 /// `external_subcommand` escape hatch (see `Command::Forward`'s dispatch in
 /// `cli::mod`).
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Open a forward:\n  sloosh forward <host> -L <SPEC>\n  sloosh forward <host> -R <SPEC>\n\nManage active forwards with `sloosh forward ls` and `sloosh forward stop <ID>`."
+)]
 pub struct ForwardArgs {
     #[command(subcommand)]
     pub action: ForwardAction,
@@ -339,4 +342,29 @@ pub struct LogArgs {
     /// Print raw NDJSON lines instead of a human-readable summary.
     #[arg(long)]
     pub json: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn forward_help_documents_open_and_management_forms() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("forward")
+            .expect("forward subcommand")
+            .render_help()
+            .to_string();
+
+        assert!(help.contains("sloosh forward <host> -L <SPEC>"), "{help}");
+        assert!(help.contains("sloosh forward <host> -R <SPEC>"), "{help}");
+        assert!(
+            help.contains(
+                "Manage active forwards with `sloosh forward ls` and `sloosh forward stop <ID>`."
+            ),
+            "{help}"
+        );
+    }
 }
