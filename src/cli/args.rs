@@ -1,5 +1,5 @@
 //! Clap argument definitions for the implemented command surface
-//! (DESIGN.md §6). Keep this help aligned with enforced security limits.
+//! (docs/internals/architecture.md). Keep this help aligned with enforced security limits.
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 

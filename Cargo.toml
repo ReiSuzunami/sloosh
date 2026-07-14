@@ -9,6 +9,19 @@ repository = "https://github.com/ReiSuzunami/sloosh"
 readme = "README.md"
 keywords = ["ssh", "agent", "cli", "daemon", "remote"]
 categories = ["command-line-utilities", "network-programming"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/docs/**",
+    "/skills/sloosh/**",
+    "/src/**",
+    "/tests/**",
+]
 
 [features]
 integration-test-hooks = []

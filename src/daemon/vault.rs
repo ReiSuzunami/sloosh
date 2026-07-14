@@ -1,4 +1,4 @@
-//! Encrypted credential vault at `~/.sloosh/vault` (DESIGN.md §4).
+//! Encrypted credential vault at `~/.sloosh/vault` (docs/internals/architecture.md).
 //!
 //! On-disk format is a small versioned JSON envelope:
 //!
@@ -46,7 +46,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::transport::unix::{ensure_private_dir, sloosh_home};
 
-/// Argon2id memory cost in KiB (64 MiB). DESIGN.md §4 asks for "m=64MiB
+/// Argon2id memory cost in KiB (64 MiB). docs/internals/architecture.md asks for "m=64MiB
 /// t=3 p=4" as a reasonable starting point for a locally-run daemon.
 const KDF_M_COST: u32 = 64 * 1024;
 const KDF_T_COST: u32 = 3;
@@ -165,7 +165,7 @@ pub struct HostEntry {
     #[serde(default)]
     pub user: Option<String>,
     pub auth: AuthMethod,
-    /// Optional jump host alias (DESIGN.md §4), resolvable via the vault or
+    /// Optional jump host alias (docs/internals/architecture.md), resolvable via the vault or
     /// `~/.ssh/config` — same syntax as an `~/.ssh/config` `ProxyJump` entry
     /// (`user@host:port`, or a bare alias). `#[serde(default)]` so vault
     /// files written before this field existed (still version 1 — this is a
@@ -219,7 +219,7 @@ impl fmt::Debug for AuthMethod {
 }
 
 // ---------------------------------------------------------------------
-// Errors — self-teaching per DESIGN.md §7.
+// Errors — self-teaching per docs/internals/architecture.md.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -585,7 +585,7 @@ pub async fn rm_entry(alias: &str, password: &[u8]) -> Result<(), VaultError> {
 
 // ---------------------------------------------------------------------
 // In-memory cache: the derived key + decrypted entries are kept around
-// only while at least one lease is active (DESIGN.md §4). `daemon/lease.rs`
+// only while at least one lease is active (docs/internals/architecture.md). `daemon/lease.rs`
 // is responsible for calling `clear_cache()` when the last lease expires.
 // ---------------------------------------------------------------------
 
@@ -650,7 +650,7 @@ pub async fn has_entry(alias: &str) -> bool {
 /// operation when we already know a cache is populated. Deliberately not a
 /// constant-time comparison: this daemon only ever talks to same-user local
 /// callers over a 0600 socket, so a timing side-channel on an in-process
-/// memory compare isn't in the threat model DESIGN.md §4 is written
+/// memory compare isn't in the threat model docs/internals/architecture.md is written
 /// against (a remote attacker can't reach this code path at all).
 pub async fn verify_password(password: &[u8]) -> Result<bool, VaultError> {
     let guard = cache().lock().await;

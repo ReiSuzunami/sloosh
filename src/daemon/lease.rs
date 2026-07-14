@@ -1,5 +1,5 @@
 //! Authorization leases: process-ancestry anchoring, pending-request /
-//! approval flow, `SLOOSH_LEASE` escape hatch, idle timeout (DESIGN.md §4).
+//! approval flow, `SLOOSH_LEASE` escape hatch, idle timeout (docs/internals/architecture.md).
 //!
 //! Two kinds of state, both in-memory only (a daemon restart means every
 //! pending request and active lease is gone — re-approve; this is documented
@@ -9,7 +9,7 @@
 //!   for a human to run `sloosh approve <id>` in another terminal. Expire
 //!   after [`PENDING_EXPIRY`].
 //! - **Active leases**: created by `approve`, binding a set of hosts to an
-//!   "anchor" process (DESIGN.md §4's ancestry-anchoring scheme) so the
+//!   "anchor" process (docs/internals/architecture.md's ancestry-anchoring scheme) so the
 //!   agent process (and anything it spawns) can keep making requests without
 //!   re-approval, until [`IDLE_TIMEOUT`] of no matching calls.
 //!
@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex as AsyncMutex;
 
-/// A lease with no matching call for this long is dropped (DESIGN.md §4).
+/// A lease with no matching call for this long is dropped (docs/internals/architecture.md).
 /// TODO: make configurable; a bare constant is fine for milestone 3.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
@@ -46,7 +46,7 @@ pub const MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A pending (unapproved) request older than this is dropped and must be
-/// re-requested (DESIGN.md §4).
+/// re-requested (docs/internals/architecture.md).
 const PENDING_EXPIRY: Duration = Duration::from_secs(15 * 60);
 
 /// Length (in characters) of generated request IDs.
@@ -62,7 +62,7 @@ const SHELL_BASENAMES: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh"];
 const SLOOSH_BASENAME: &str = "sloosh";
 
 // ---------------------------------------------------------------------
-// Errors — self-teaching per DESIGN.md §7.
+// Errors — self-teaching per docs/internals/architecture.md.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -185,7 +185,7 @@ struct ActiveLease {
     created_at: Instant,
     last_used: Instant,
     /// Escape-hatch token (`SLOOSH_LEASE=...`), shown once in `approve`'s
-    /// confirmation output (DESIGN.md §4).
+    /// confirmation output (docs/internals/architecture.md).
     token: String,
 }
 
@@ -223,7 +223,7 @@ fn state() -> &'static AsyncMutex<LeaseState> {
 
 /// Drop stale pending requests plus active leases past either idle or absolute
 /// lifetime limits. If the last active lease is dropped, also clear the cached
-/// vault key (DESIGN.md §4: "the derived key is cached... zeroize + drop when
+/// vault key (docs/internals/architecture.md: "the derived key is cached... zeroize + drop when
 /// the last lease expires"). API entry points and [`spawn_reaper`] both use
 /// this one expiry decision.
 async fn prune_expired(st: &mut LeaseState) {
@@ -361,7 +361,7 @@ fn generate_lease_token() -> String {
 #[derive(Debug)]
 pub enum RequestOutcome {
     /// An already-active lease (bound to an anchor in the caller's current
-    /// ancestry) already covers every requested host — DESIGN.md §4's
+    /// ancestry) already covers every requested host — docs/internals/architecture.md's
     /// idempotency guarantee. No human action needed.
     AlreadyAuthorized,
     /// A new pending request was created; a human needs to `approve` it.
@@ -611,7 +611,7 @@ fn format_host_list(hosts: &[String]) -> String {
 
 /// Is `host` authorized for the caller at `caller_pid`, either via the
 /// `SLOOSH_LEASE` escape-hatch token or via ancestry-chain anchor matching?
-/// Touches `last_used` on the matching lease if so (DESIGN.md §4 idle-timeout
+/// Touches `last_used` on the matching lease if so (docs/internals/architecture.md idle-timeout
 /// clock).
 pub async fn check_authorized(caller_pid: u32, host: &str, lease_token: Option<&str>) -> bool {
     // The token check never needs the ancestry walk, but doing the walk

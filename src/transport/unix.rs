@@ -1,5 +1,5 @@
 //! Unix domain socket transport: the one active implementation of
-//! [`super::Channel`] for macOS + Linux (DESIGN.md §2, §8). All
+//! [`super::Channel`] for macOS + Linux (docs/internals/architecture.md). All
 //! platform-specific bytes (peer credential lookups, socket path
 //! conventions) live in this file, gated by `cfg(target_os = ...)`.
 
@@ -18,7 +18,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Errors from setting up the listening side of the socket. Kept distinct
 /// from plain `io::Error` so callers can render self-teaching messages
-/// (DESIGN.md §7) without re-parsing error text.
+/// (docs/internals/architecture.md) without re-parsing error text.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("failed to create directory {path}: {source}")]
@@ -64,7 +64,7 @@ pub fn daemon_log_path() -> PathBuf {
 
 /// Resolve the daemon socket path: `$SLOOSH_SOCKET` always wins (used by
 /// tests and anyone running multiple daemons side by side), otherwise the
-/// per-OS convention from DESIGN.md §2.
+/// per-OS convention from docs/internals/architecture.md.
 pub fn resolve_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("SLOOSH_SOCKET") {
         return PathBuf::from(p);

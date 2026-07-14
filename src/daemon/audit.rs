@@ -1,4 +1,4 @@
-//! Append-only audit log writer, `~/.sloosh/audit.jsonl` (DESIGN.md §4).
+//! Append-only audit log writer, `~/.sloosh/audit.jsonl` (docs/internals/architecture.md).
 //!
 //! One NDJSON line per event: `{"ts":"<RFC3339 UTC>","event":"<tag>", ...}`.
 //! The daemon is the only writer (created 0600, same-user, same posture as
@@ -12,7 +12,7 @@
 //! exit codes, byte counts, path names) — never a password, master
 //! password, vault content, or a command's *output*.
 //!
-//! **Best-effort, by design (DESIGN.md §4):** a write failure (disk full,
+//! **Best-effort, by design (docs/internals/architecture.md):** a write failure (disk full,
 //! permissions, `~/.sloosh` missing and uncreatable) is reported via
 //! `tracing::warn` and otherwise swallowed — it never fails, blocks, or even
 //! slows down the operation being logged. This project's same-user threat
@@ -46,7 +46,7 @@ pub fn record(event: &str, fields: Value) {
         warn!(
             error = %e, event,
             "failed to write audit log entry; continuing without it (availability of sloosh \
-             itself over completeness of the audit trail — DESIGN.md §4)"
+             itself over completeness of the audit trail — docs/internals/architecture.md)"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! sloosh: SSH-in-the-loop for coding agents (DESIGN.md).
+//! sloosh: SSH-in-the-loop for coding agents (docs/internals/architecture.md).
 //!
 //! Split into a library + thin binary so integration tests can drive the
 //! daemon and transport layers directly.

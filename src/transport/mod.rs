@@ -1,4 +1,4 @@
-//! Local IPC transport abstraction (DESIGN.md §2, §8).
+//! Local IPC transport abstraction (docs/internals/architecture.md).
 //!
 //! Platform differences in how a connected peer's identity is recovered
 //! (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS, `GetNamedPipeClientProcessId`
@@ -22,7 +22,7 @@ pub const MAX_RAW_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A connected local IPC channel, client or server side.
 ///
-/// Lease anchoring (DESIGN.md §4) depends on knowing which process is on the
+/// Lease anchoring (docs/internals/architecture.md) depends on knowing which process is on the
 /// other end of the socket, so `peer_pid` is the one operation every
 /// transport implementation must provide.
 pub trait Channel: Send {
@@ -58,7 +58,7 @@ pub enum BindOutcome<L> {
     /// This process now owns the socket and should run the accept loop.
     Bound(L),
     /// Another daemon already owns the socket; the caller should exit
-    /// quietly rather than treat this as an error (see DESIGN.md §1: bind
+    /// quietly rather than treat this as an error (see docs/internals/architecture.md: bind
     /// atomicity resolves the concurrent-auto-spawn race).
     AlreadyRunning,
 }

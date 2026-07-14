@@ -3,7 +3,8 @@
 //! Control messages are single JSON objects serialized one per line (NDJSON),
 //! so ordinary request/reply traffic stays inspectable without a schema
 //! compiler. SFTP payload bytes switch the same connection to bounded raw
-//! frames after `TransferReady`; see `docs/PROTOCOL.md`. Enums are internally
+//! frames after `TransferReady`; see `docs/internals/protocol.md`. Enums are
+//! internally
 //! tagged (`"type"` field). Unknown fields are ignored by serde by default,
 //! and `#[serde(default)]` lets old messages satisfy selected newly-added
 //! fields. New variants or sequencing changes are not inherently compatible,
@@ -27,7 +28,7 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
 /// remains equal.
 pub const WIRE_PROTOCOL_VERSION: u32 = 1;
 
-/// A password/secret that crosses the CLI<->daemon socket (DESIGN.md §4:
+/// A password/secret that crosses the CLI<->daemon socket (docs/internals/architecture.md:
 /// "passwords/keys crossing the socket is acceptable, same-user 0600" — but
 /// they must never leak into logs). Wraps a `String` with a `Debug` impl
 /// that always prints a fixed redacted placeholder, so deriving `Debug` on
@@ -88,7 +89,7 @@ pub enum Request {
     /// Ask the daemon to shut down gracefully after replying `Ok`.
     Shutdown,
     /// Run a command in a host's default (or named) session, auto-creating
-    /// it if needed (DESIGN.md §3 "隐式寻址"). Blocks until the sentinel is
+    /// it if needed (docs/internals/architecture.md "隐式寻址"). Blocks until the sentinel is
     /// seen or `timeout_secs` elapses.
     Run {
         host: String,
@@ -100,7 +101,7 @@ pub enum Request {
         #[serde(default)]
         raw: bool,
         /// `SLOOSH_LEASE` escape-hatch token, if the caller's environment
-        /// had one set (DESIGN.md §4). Checked before ancestry matching.
+        /// had one set (docs/internals/architecture.md). Checked before ancestry matching.
         #[serde(default)]
         lease_token: Option<String>,
     },
@@ -144,7 +145,7 @@ pub enum Request {
         lease_token: Option<String>,
     },
     /// List known sessions, optionally filtered by host. Not gated by a
-    /// lease (DESIGN.md §4: `status`/`ls`/`daemon *` remain open).
+    /// lease (docs/internals/architecture.md: `status`/`ls`/`daemon *` remain open).
     Ls {
         #[serde(default)]
         host: Option<String>,
@@ -158,7 +159,7 @@ pub enum Request {
         lease_token: Option<String>,
     },
     /// Request an access lease for one or more hosts (agent side of
-    /// DESIGN.md §4's out-of-band approval flow).
+    /// docs/internals/architecture.md's out-of-band approval flow).
     RequestLease { hosts: Vec<String> },
     /// Fetch details of a still-pending lease request, for the human about
     /// to `approve` it.
@@ -189,7 +190,7 @@ pub enum Request {
     /// be self-approved by inventing a master password on a fresh install.
     InitVault { master_password: SecretString },
     /// Add (or replace) a credential in the vault, creating the vault on
-    /// first use. Human-only, TTY-required on the CLI side (DESIGN.md §4 §2)
+    /// first use. Human-only and TTY-required on the CLI side.
     /// — the daemon does the KDF + file I/O so it stays the single writer
     /// and can refresh its cache.
     AddCred {
@@ -203,7 +204,7 @@ pub enum Request {
         master_password: SecretString,
         #[serde(default)]
         replace: bool,
-        /// Optional jump host alias (DESIGN.md §4), resolvable via the
+        /// Optional jump host alias (docs/internals/architecture.md), resolvable via the
         /// vault or `~/.ssh/config`. `#[serde(default)]` so older CLI/daemon
         /// builds exchanging this message without the field keep working.
         #[serde(default)]
@@ -215,7 +216,7 @@ pub enum Request {
         master_password: SecretString,
     },
     /// Upload a local file to a host over SFTP, reusing the target
-    /// session's existing SSH connection (DESIGN.md §5: "put/get 走既有连接
+    /// session's existing SSH connection (docs/internals/architecture.md: "put/get 走既有连接
     /// 的 SFTP channel" — no redial/reauth per transfer). The CLI resolves
     /// `local_path` to an absolute path before sending: the daemon's
     /// working directory is not the caller's, so a relative path here would
@@ -247,12 +248,12 @@ pub enum Request {
         lease_token: Option<String>,
     },
     /// Open a `-L` (local) or `-R` (remote/reverse) port forward through
-    /// `host` (DESIGN.md §7). `direction` carries the raw OpenSSH-style spec
+    /// `host` (docs/internals/architecture.md). `direction` carries the raw OpenSSH-style spec
     /// string exactly as typed (`[bind_addr:]port:host:port` shape); the
     /// daemon owns parsing it (`daemon::forward::parse_local_spec` /
     /// `parse_remote_spec`) so the error message stays daemon-side "teaching
     /// material rather than duplicated in the CLI. Gated by
-    /// the same lease as `Run`/`Open` (DESIGN.md §4) — creating a forward is
+    /// the same lease as `Run`/`Open` (docs/internals/architecture.md) — creating a forward is
     /// live network access to `host`.
     Forward {
         host: String,
@@ -260,10 +261,10 @@ pub enum Request {
         #[serde(default)]
         lease_token: Option<String>,
     },
-    /// List active forwards (DESIGN.md §7). Not gated by a lease, same as
+    /// List active forwards (docs/internals/architecture.md). Not gated by a lease, same as
     /// `Ls`/`Status` — read-only.
     ForwardLs,
-    /// Stop an active forward (DESIGN.md §7). Not gated by a lease:
+    /// Stop an active forward (docs/internals/architecture.md). Not gated by a lease:
     /// stopping only ever *reduces* access, never grants it.
     ForwardStop { id: String },
 }
@@ -301,7 +302,7 @@ impl Request {
 }
 
 /// Which side of a forward is doing the listening, carrying the raw spec
-/// string for that direction (DESIGN.md §7). A newtype-per-variant rather
+/// string for that direction (docs/internals/architecture.md). A newtype-per-variant rather
 /// than a shared `spec: String` + separate `is_remote: bool` field, so a
 /// malformed wire message can never claim both/neither direction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -367,21 +368,21 @@ pub enum Response {
 pub struct RunReply {
     pub host: String,
     pub session: String,
-    /// `"done"` | `"running"` | `"dead"` (DESIGN.md §3).
+    /// `"done"` | `"running"` | `"dead"` (docs/internals/architecture.md).
     pub state: String,
     /// Only set when `state == "done"`.
     #[serde(default)]
     pub exit_code: Option<i32>,
     /// Shaped (ANSI-stripped unless `--raw`) tail of the command's output.
     pub output: String,
-    /// True if `output` was truncated to the ~30k char cap (DESIGN.md §5).
+    /// True if `output` was truncated to the ~30k char cap (docs/internals/architecture.md).
     #[serde(default)]
     pub truncated: bool,
     /// Total bytes produced by this run (before truncation), for sizing
     /// follow-up `grep`/`tail` against the spool file.
     #[serde(default)]
     pub total_bytes: u64,
-    /// Path to the full, untruncated output on disk (DESIGN.md §5).
+    /// Path to the full, untruncated output on disk (docs/internals/architecture.md).
     pub spool_path: String,
     /// Only set when `state == "dead"`.
     #[serde(default)]
@@ -430,7 +431,7 @@ pub struct SessionSummary {
     pub host: String,
     /// `"idle"` | `"busy"` | `"dead"`.
     pub state: String,
-    /// Seconds since the session last saw a read or write (DESIGN.md §3
+    /// Seconds since the session last saw a read or write (docs/internals/architecture.md
     /// idle-reaping clock).
     #[serde(default)]
     pub idle_secs: u64,
@@ -449,7 +450,7 @@ pub struct LeaseSummary {
     pub anchor_name: Option<String>,
     pub anchor_pid: u32,
     /// Seconds remaining before this lease is dropped for inactivity
-    /// (DESIGN.md §4 idle timeout).
+    /// (docs/internals/architecture.md idle timeout).
     pub idle_remaining_secs: u64,
 }
 
@@ -472,7 +473,7 @@ pub struct LeaseRequestSummary {
 }
 
 /// A newly-activated lease, returned once from `sloosh approve`'s reply.
-/// `token` is the `SLOOSH_LEASE` escape-hatch value (DESIGN.md §4) — it is
+/// `token` is the `SLOOSH_LEASE` escape-hatch value (docs/internals/architecture.md) — it is
 /// deliberately surfaced ONLY here, in this one confirmation output, and
 /// nowhere else (not in `status`, not logged).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -492,7 +493,7 @@ pub struct LeaseActivatedInfo {
     pub unverified_hosts: Vec<UnverifiedHostKey>,
 }
 
-/// Reply to `Request::Put`/`Request::Get` (DESIGN.md §5-6).
+/// Reply to `Request::Put`/`Request::Get` (docs/internals/architecture.md).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransferReply {
     pub host: String,
@@ -504,7 +505,7 @@ pub struct TransferReply {
 
 /// Reply to `Request::Forward` once the daemon has bound the local listener
 /// (`-L`) or registered the remote listen request (`-R`) and the tunnel is
-/// live (DESIGN.md §7).
+/// live (docs/internals/architecture.md).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForwardOpened {
     /// Short `fwd-`-prefixed id (`daemon::forward`), used by `forward stop`.
@@ -517,7 +518,7 @@ pub struct ForwardOpened {
     /// Where traffic actually enters the tunnel: the local bind address for
     /// `-L`, or `bind_addr:remote_port` on `host` for `-R`. Reported instead
     /// of echoing the requested port because `local_port`/`remote_port` `0`
-    /// asks for an OS-assigned port (DESIGN.md §7).
+    /// asks for an OS-assigned port (docs/internals/architecture.md).
     pub listen_addr: String,
 }
 
@@ -711,7 +712,7 @@ mod tests {
             lease_token: None,
         });
         // An old client omitting the newer fields entirely must still parse
-        // and pick up the 60s default (DESIGN.md §5 / #[serde(default)] discipline).
+        // and pick up the 60s default (docs/internals/architecture.md / #[serde(default)] discipline).
         let json = r#"{"type":"Run","host":"box","command":"ls"}"#;
         let req: Request = serde_json::from_str(json).expect("deserialize");
         assert_eq!(

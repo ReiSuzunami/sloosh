@@ -1,19 +1,19 @@
 //! SSH connection establishment via `russh`, `~/.ssh/config` subset parsing
 //! (`Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`,
-//! `IdentityAgent`), and `known_hosts` handling (DESIGN.md §2, §3).
+//! `IdentityAgent`), and `known_hosts` handling (docs/internals/architecture.md).
 //!
-//! Authorization gate (DESIGN.md §4): lease enforcement for the *target* host
+//! Authorization gate (docs/internals/architecture.md): lease enforcement for the *target* host
 //! happens one layer up in `daemon/mod.rs`, before any of this module's
 //! connection logic runs — by the time `connect`/`connect_resolved` are
 //! reached, the caller has already proven a human approved access to the
 //! target. What lives here is purely mechanical: resolve connection
 //! parameters (vault entries take precedence over `~/.ssh/config` for a
-//! given alias — DESIGN.md §4), verify the host key, and authenticate
+//! given alias — docs/internals/architecture.md), verify the host key, and authenticate
 //! (ssh-agent, then unencrypted `IdentityFile` keys, then — only while the
 //! vault's derived key is cached, i.e. at least one lease is active — the
 //! vault's stored password).
 //!
-//! **ProxyJump chains** (DESIGN.md §2, §4): a `ProxyJump` spec may name
+//! **ProxyJump chains** (docs/internals/architecture.md): a `ProxyJump` spec may name
 //! several comma-separated hops, and any hop may itself have its own
 //! `ProxyJump` (vault `jump` field or `~/.ssh/config` directive), expanded
 //! recursively up to [`MAX_PROXY_JUMP_HOPS`] hops with cycle detection by
@@ -44,7 +44,7 @@ use crate::daemon::lease;
 use crate::daemon::vault;
 use crate::transport::unix::sloosh_home;
 
-/// Hard cap on ProxyJump chain length (DESIGN.md §2, §4), counting every hop
+/// Hard cap on ProxyJump chain length (docs/internals/architecture.md), counting every hop
 /// pulled in transitively by a jump host's own `ProxyJump` (vault `jump`
 /// field or `~/.ssh/config` directive). Matches OpenSSH's own default
 /// `MAX_PROXY_JUMP` bound in spirit — deep chains are almost always a
@@ -53,7 +53,7 @@ const MAX_PROXY_JUMP_HOPS: usize = 8;
 const FORWARD_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything that can go wrong establishing an SSH connection. Variants
-/// carry self-teaching messages (DESIGN.md §7): the human reading a CLI
+/// carry self-teaching messages (docs/internals/architecture.md): the human reading a CLI
 /// error should know what to do next without consulting docs.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
@@ -183,7 +183,7 @@ pub enum SshError {
 
     /// Catch-all for `russh` protocol errors on an already-established
     /// connection (channel opens, PTY/shell requests, writes). Never let
-    /// this be the bare underlying message (DESIGN.md §7): say what it
+    /// this be the bare underlying message (docs/internals/architecture.md): say what it
     /// means and what to try, with the raw error as parenthetical detail.
     #[error(
         "the SSH connection failed mid-operation and is no longer usable — retry the command \
@@ -207,7 +207,7 @@ pub enum IdentityAgentValue {
 }
 
 /// One `Host` block from `~/.ssh/config`, holding only the directives
-/// DESIGN.md §2 promises to understand.
+/// docs/internals/architecture.md promises to understand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HostBlock {
     /// Raw patterns as written after `Host` (may contain `*`/`?` globs and
@@ -230,9 +230,8 @@ pub struct SshConfig {
 }
 
 /// Resolved connection parameters for a host alias, after merging any
-/// matching `~/.ssh/config` blocks over the built-in defaults (DESIGN.md
-/// §2: "a host not in config is treated as a literal hostname, default user
-/// = local user, port 22").
+/// matching `~/.ssh/config` blocks over the built-in defaults documented in
+/// `docs/internals/architecture.md`: literal hostname, local user, port 22.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub alias: String,
@@ -245,7 +244,7 @@ pub struct HostConfig {
 }
 
 /// Warn once per unknown directive name for the lifetime of the process
-/// (DESIGN.md §2: "未知指令警告而非静默忽略" — warn, don't silently drop, but
+/// (docs/internals/architecture.md: "未知指令警告而非静默忽略" — warn, don't silently drop, but
 /// don't spam the log on every reconnect either).
 fn warned_directives() -> &'static Mutex<HashSet<String>> {
     static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -268,7 +267,7 @@ fn warn_unknown_directive_once(directive: &str) {
 }
 
 impl SshConfig {
-    /// Parse the subset of `~/.ssh/config` directives DESIGN.md §2 promises.
+    /// Parse the subset of `~/.ssh/config` directives docs/internals/architecture.md promises.
     /// Never fails: unparsable lines are warned about (see
     /// `warn_unknown_directive_once`) and skipped, matching real `ssh`'s
     /// tolerance for config quirks.
@@ -336,8 +335,8 @@ impl SshConfig {
         }
     }
 
-    /// Resolve `alias` against this config, falling back to the DESIGN.md
-    /// §2 defaults (literal hostname, local user, port 22) for anything no
+    /// Resolve `alias` against this config, falling back to the documented
+    /// defaults (literal hostname, local user, port 22) for anything no
     /// matching block sets.
     ///
     /// A `user@host` literal is split like an OpenSSH destination: the host
@@ -474,7 +473,7 @@ fn ssh_config_path() -> PathBuf {
     home_dir().join(".ssh").join("config")
 }
 
-/// sloosh's own known_hosts file (DESIGN.md §4): host keys for vault-backed
+/// sloosh's own known_hosts file (docs/internals/architecture.md): host keys for vault-backed
 /// hosts, auto-recorded during `sloosh approve` after the human confirms the
 /// fingerprint. Consulted only after `~/.ssh/known_hosts` comes up empty, so
 /// a host the user already trusts via plain `ssh` never needs re-confirming
@@ -483,7 +482,7 @@ fn sloosh_known_hosts_path() -> PathBuf {
     sloosh_home().join("known_hosts")
 }
 
-/// Resolve the local user for the "no config entry" default (DESIGN.md §2).
+/// Resolve the local user for the "no config entry" default (docs/internals/architecture.md).
 fn current_user() -> String {
     if let Ok(u) = std::env::var("USER") {
         if !u.is_empty() {
@@ -569,7 +568,7 @@ pub struct Connection {
 /// threaded down from `daemon/mod.rs` (where lease enforcement for the
 /// *target* host already happened) so that `connect_via_proxy_jump` can
 /// apply the same lease check to any vault-backed jump hop along the way
-/// (DESIGN.md §4).
+/// (docs/internals/architecture.md).
 #[derive(Debug, Clone)]
 pub struct LeaseContext {
     pub caller_pid: u32,
@@ -639,8 +638,8 @@ impl ForwardRouteLifecycle {
 }
 
 /// Where to dial locally when the remote end pushes a `forwarded-tcpip`
-/// channel back to us — the `-R` (remote/reverse) forward case (DESIGN.md
-/// §7). Only ever set on the one [`Connection`] a remote forward owns
+/// channel back to us — the `-R` (remote/reverse) forward case. Only ever set
+/// on the one [`Connection`] a remote forward owns
 /// (`daemon::forward`); a plain session/`-L`-forward connection's [`Handler`]
 /// has `route: None`, so [`Handler::server_channel_open_forwarded_tcpip`]
 /// falls back to rejecting rather than silently accepting and hanging.
@@ -692,9 +691,9 @@ where
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
-/// `~/.ssh/known_hosts` (DESIGN.md §2 "known_hosts hash 条目支持"), plus
+/// `~/.ssh/known_hosts` (docs/internals/architecture.md "known_hosts hash 条目支持"), plus
 /// (only when `route` is set) routing server-initiated `forwarded-tcpip`
-/// channels to a local target for `-R` forwards (DESIGN.md §7).
+/// channels to a local target for `-R` forwards (docs/internals/architecture.md).
 pub struct Handler {
     host: String,
     port: u16,
@@ -706,7 +705,7 @@ impl russh::client::Handler for Handler {
 
     /// Checked against `~/.ssh/known_hosts` first (so anything the user
     /// already trusts via plain `ssh` keeps working untouched), then against
-    /// sloosh's own `~/.sloosh/known_hosts` (DESIGN.md §4). A mismatch in
+    /// sloosh's own `~/.sloosh/known_hosts` (docs/internals/architecture.md). A mismatch in
     /// either file is a hard refusal — never silently fall through to the
     /// other file once a *different* key has been recorded for this host.
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
@@ -743,7 +742,7 @@ impl russh::client::Handler for Handler {
         }
     }
 
-    /// Handle a `-R` forward's incoming connection (DESIGN.md §7): only ever
+    /// Handle a `-R` forward's incoming connection (docs/internals/architecture.md): only ever
     /// invoked on the one connection a remote forward owns (`route.is_some()`
     /// — every other connection, including `ProxyJump` hops, rejects this
     /// outright rather than accepting a channel nothing will service). Dials
@@ -841,7 +840,7 @@ impl russh::client::Handler for Handler {
 
 /// Pump bytes between a `-R` forward's accepted `forwarded-tcpip` channel and
 /// the local TCP target already dialed for it, until either side is done or
-/// the owning forward is stopped (DESIGN.md §4: a live tunnel dies with its
+/// the owning forward is stopped (docs/internals/architecture.md: a live tunnel dies with its
 /// lease, even though it doesn't get a per-byte idle refresh — see
 /// `daemon::forward`'s module doc for why per-connection granularity is
 /// enough).
@@ -906,7 +905,7 @@ struct HostKeyProbeRoute {
 
 /// Whether *any* key is already recorded for `hostname:port` in either
 /// known_hosts file, regardless of whether it would actually match a live
-/// connection's key. Used by the `sloosh approve` flow (DESIGN.md §4) to
+/// connection's key. Used by the `sloosh approve` flow (docs/internals/architecture.md) to
 /// decide whether a host needs the fetch-fingerprint-confirm dance at all —
 /// real verification (which rejects a mismatch outright) still happens in
 /// `Handler::check_server_key` at actual connection time.
@@ -923,7 +922,7 @@ pub fn host_has_known_key(hostname: &str, port: u16) -> bool {
 
 /// Dial `hostname:port` far enough to receive its host key (key exchange
 /// only — no authentication attempted), for the `sloosh approve` fingerprint
-/// display (DESIGN.md §4). Used directly by the CLI process, not routed
+/// display (docs/internals/architecture.md). Used directly by the CLI process, not routed
 /// through the daemon: it's a plain read-only network probe with no secrets
 /// involved.
 pub async fn fetch_host_key(hostname: &str, port: u16) -> Result<PublicKey, SshError> {
@@ -1046,7 +1045,7 @@ async fn capture_host_key_via_hops(
 
 /// Record `key` as the trusted host key for `hostname:port` in sloosh's own
 /// known_hosts file (`~/.sloosh/known_hosts`, mode 0600), called after the
-/// human confirms the fingerprint during `sloosh approve` (DESIGN.md §4).
+/// human confirms the fingerprint during `sloosh approve` (docs/internals/architecture.md).
 pub fn record_sloosh_known_host(
     hostname: &str,
     port: u16,
@@ -1074,7 +1073,7 @@ pub async fn resolve_endpoint(alias: &str) -> (String, u16) {
 /// Connect to `alias`, resolving it through `~/.ssh/config`, dialing the full
 /// `ProxyJump` chain if configured (checking a lease for each vault-backed
 /// hop along the way), verifying the host key, and authenticating via
-/// ssh-agent then unencrypted `IdentityFile` keys (DESIGN.md §2, §3, §4).
+/// ssh-agent then unencrypted `IdentityFile` keys.
 /// `lease_ctx` identifies the caller a lease for the *target* host has
 /// already been confirmed for one layer up (`daemon/mod.rs`); it's reused
 /// here only to check jump hops, never the target itself.
@@ -1097,8 +1096,8 @@ pub(crate) async fn connect_with_route(
     connect_resolved(&config, host_cfg, lease_ctx, route).await
 }
 
-/// Resolve `alias`, preferring a vault entry over `~/.ssh/config` (DESIGN.md
-/// §4: "vault 别名优先于 ~/.ssh/config 中同名条目"). Only ever finds a vault
+/// Resolve `alias`, preferring a vault entry over `~/.ssh/config`. Only ever
+/// finds a vault
 /// entry while the vault's derived key is cached (i.e. at least one lease is
 /// active) — `vault::get_entry` returns `None` otherwise, so this quietly
 /// falls back to the plain config-file resolution, exactly like an alias
@@ -1110,7 +1109,7 @@ async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
             hostname: entry.hostname,
             port: entry.port.unwrap_or(22),
             user: entry.user.unwrap_or_else(current_user),
-            // Vault entries don't carry key-based identities (DESIGN.md §4
+            // Vault entries don't carry key-based identities (docs/internals/architecture.md
             // only specifies password auth for vault entries); a
             // vault-backed host that also needs one of those should keep
             // using ~/.ssh/config instead.
@@ -1146,7 +1145,7 @@ async fn connect_resolved(
 /// cycle errors surface before any network activity, then dialed hop by hop:
 /// TCP to the first hop, every later hop (and finally the target) over a
 /// `direct-tcpip` channel opened on the previous hop's connection. Every
-/// vault-backed hop must have its own active lease (DESIGN.md §4) — checked
+/// vault-backed hop must have its own active lease (docs/internals/architecture.md) — checked
 /// right before dialing it, via `ensure_hop_leased`.
 async fn connect_via_proxy_jump(
     config: &SshConfig,
@@ -1266,7 +1265,7 @@ async fn expand_proxy_jump_spec(
     Ok(())
 }
 
-/// Enforce DESIGN.md §4's chain lease invariant for a single hop: if `hop`'s
+/// Enforce docs/internals/architecture.md's chain lease invariant for a single hop: if `hop`'s
 /// credentials come from the vault, the requesting process needs its own
 /// active lease for it, same as the target host gets one layer up. A hop
 /// resolved purely from `~/.ssh/config` uses ambient user credentials and
@@ -1296,7 +1295,7 @@ async fn ensure_hop_leased(
 }
 
 /// Expand `hosts` (as requested via `Request::RequestLease`) to also include
-/// every alias in each host's `ProxyJump` chain (DESIGN.md §4), so the human
+/// every alias in each host's `ProxyJump` chain (docs/internals/architecture.md), so the human
 /// approving the request sees — and grants — coverage for the whole path,
 /// not just the final target. Order is preserved: each requested host first,
 /// then its jump hops, deduplicated overall. Resolution failures for a given
@@ -1449,7 +1448,7 @@ fn apply_proxy_jump_overrides(spec: &str, cfg: &mut HostConfig) {
 /// Resolve `host` and open a TCP connection, trying every resolved address
 /// (v4 and v6) like real `ssh` does. Failures are classified so the
 /// agent-facing message says what actually went wrong: DNS vs refused vs
-/// timeout vs anything else (DESIGN.md §7 — errors are teaching material).
+/// timeout vs anything else (docs/internals/architecture.md — errors are teaching material).
 async fn open_tcp(host: &str, port: u16) -> Result<TcpStream, SshError> {
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await
@@ -1524,8 +1523,8 @@ where
     Ok(handle)
 }
 
-/// Auth order (DESIGN.md §2, §3, §4): ssh-agent identities first, then
-/// unencrypted `IdentityFile` keys, then a vault-stored password (only
+/// Auth order: ssh-agent identities first, then unencrypted `IdentityFile`
+/// keys, then a vault-stored password (only
 /// available while the vault is unlocked, i.e. while a lease is active).
 async fn authenticate(
     handle: &mut russh::client::Handle<Handler>,
@@ -1568,7 +1567,7 @@ async fn authenticate(
         }
     }
 
-    // Vault password auth (DESIGN.md §4): only ever finds an entry while
+    // Vault password auth (docs/internals/architecture.md): only ever finds an entry while
     // the vault's derived key is cached, i.e. while at least one lease is
     // active — the credential never comes from a CLI argument or the
     // agent's context, only from the daemon's in-memory unlocked vault.
@@ -1600,7 +1599,7 @@ async fn authenticate(
 
 /// Try every identity ssh-agent offers. Returns `Ok(true)` on success,
 /// `Ok(false)` if the agent is unreachable/empty or rejected everything
-/// (not a hard error — DESIGN.md §2 says agent auth is tried first, not
+/// (not a hard error — docs/internals/architecture.md says agent auth is tried first, not
 /// that it's required), and `Err` only for a genuine signing failure that
 /// should stop the auth attempt. Connects to the host's `IdentityAgent`
 /// socket if configured (`none` disables agent auth for the host entirely),
@@ -1643,7 +1642,7 @@ async fn try_agent_auth(
     Ok(false)
 }
 
-/// Terminal modes requested for every session PTY: echo off (DESIGN.md §3
+/// Terminal modes requested for every session PTY: echo off (docs/internals/architecture.md
 /// "抑制回显" — primary mechanism; `session.rs` also defensively strips a
 /// leading echoed command line in case a server ignores this).
 pub fn quiet_pty_modes() -> Vec<(Pty, u32)> {
@@ -2070,7 +2069,7 @@ Host myhost
 
     // -- error Display formatting: every agent-facing message must say what
     //    failed AND what to do next, with the raw error only as detail
-    //    (DESIGN.md §7). -----------------------------------------------------
+    //    (docs/internals/architecture.md). -----------------------------------------------------
 
     #[test]
     fn dns_error_names_host_and_suggests_config_fix() {

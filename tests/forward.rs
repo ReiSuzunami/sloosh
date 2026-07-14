@@ -1,5 +1,4 @@
-//! Live-SSH integration tests for `-L` and `-R` port forwarding (DESIGN.md
-//! §6), gated
+//! Live-SSH integration tests for `-L` and `-R` port forwarding, gated
 //! behind `SLOOSH_TEST_SSH_HOST` exactly like `tests/ssh_session.rs` — see
 //! that file's module doc for the full rationale and the `--test-threads=1`
 //! requirement (each test points `$SLOOSH_HOME` at its own temp dir via a
@@ -64,7 +63,7 @@ fn set_test_home(tag: &str) -> std::path::PathBuf {
     home
 }
 
-/// Grant this test process itself a lease for `host` (DESIGN.md §4), same
+/// Grant this test process itself a lease for `host` (docs/internals/architecture.md), same
 /// approach as `tests/ssh_session.rs::grant_lease_for_test`.
 async fn grant_lease_for_test(host: &str) {
     if !vault::exists() {

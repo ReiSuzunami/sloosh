@@ -1,10 +1,10 @@
 //! Local (`-L`) and remote (`-R`) port forwarding through a leased host
-//! (DESIGN.md §7).
+//! (docs/internals/architecture.md).
 //!
 //! Each forward owns a dedicated [`ssh::Connection`], independent of any
 //! shell session's (`daemon::session`) — a tunnel's lifecycle is simpler
 //! (no PTY, no output framing) but its *fate on lease expiry* is different:
-//! a shell session survives its creator's lease expiring (DESIGN.md §4), but
+//! a shell session survives its creator's lease expiring (docs/internals/architecture.md), but
 //! a forward is live network access sitting open on a socket, so it MUST be
 //! torn down the moment the lease that justified it goes away.
 //!
@@ -24,7 +24,7 @@
 //! `peek_grant` — a poll that refreshed `last_used` would keep every
 //! forward-backed lease alive forever. Only real traffic winds the idle
 //! clock: each direction's per-connection `lease::check_grant` touches the
-//! lease, matching `run`'s idle-refresh behavior (DESIGN.md §4).
+//! lease, matching `run`'s idle-refresh behavior (docs/internals/architecture.md).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -46,12 +46,12 @@ use crate::daemon::ssh::{self, ForwardRoute, ForwardRouteLifecycle, LeaseContext
 use crate::proto::ForwardSummary;
 
 /// How often [`spawn_reaper`] re-checks every live forward's lease
-/// (DESIGN.md §4). Much tighter than `session`'s 5-minute idle sweep: a
+/// (docs/internals/architecture.md). Much tighter than `session`'s 5-minute idle sweep: a
 /// forward is live network access, not an idle PTY, so the exposure window
 /// after a lease expires/is revoked matters more than the sweep's overhead.
 const REAP_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// How often each forward's owner task polls its own SSH connection for
-/// liveness, to notice a network drop (DESIGN.md §7)
+/// liveness, to notice a network drop (docs/internals/architecture.md)
 /// even when no tunnel traffic is flowing to reveal it another way.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const REMOTE_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -319,7 +319,7 @@ impl StopReason {
 }
 
 /// Registry entry: only what `ls` needs to display plus the handle to ask
-/// the owner task to stop. No secrets — hosts/specs/ids only (DESIGN.md §7).
+/// the owner task to stop. No secrets — hosts/specs/ids only (docs/internals/architecture.md).
 struct ForwardEntry {
     host: String,
     direction: Direction,
@@ -723,7 +723,7 @@ async fn run_remote_forward(
 // Stop / list
 // ---------------------------------------------------------------------------
 
-/// Stop an active forward (DESIGN.md §7). No lease required: stopping only
+/// Stop an active forward (docs/internals/architecture.md). No lease required: stopping only
 /// ever reduces access.
 pub async fn stop(id: &str) -> Result<(), ForwardError> {
     let entry = registry().lock().await.remove(id);
@@ -742,7 +742,7 @@ pub async fn stop(id: &str) -> Result<(), ForwardError> {
     }
 }
 
-/// List active forwards (DESIGN.md §7). No lease required: read-only.
+/// List active forwards (docs/internals/architecture.md). No lease required: read-only.
 pub async fn ls() -> Vec<ForwardSummary> {
     let reg = registry().lock().await;
     let mut out: Vec<ForwardSummary> = reg
@@ -766,7 +766,7 @@ pub async fn ls() -> Vec<ForwardSummary> {
 // ---------------------------------------------------------------------------
 
 /// Spawn the background sweep that tears down any forward whose creator's
-/// lease for its host has expired or been revoked (DESIGN.md §4, and the
+/// lease for its host has expired or been revoked (docs/internals/architecture.md, and the
 /// module doc comment above for why this is a poll rather than a callback
 /// from `lease.rs`).
 pub fn spawn_reaper() {

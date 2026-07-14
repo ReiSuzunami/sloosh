@@ -31,10 +31,10 @@ Read only the documents relevant to the task, but treat these as the project
 contract:
 
 - `README.md`: user-visible behavior and command overview.
-- `DESIGN.md`: authoritative Chinese design and implementation status.
-- `docs/ARCHITECTURE.md`: component boundaries and data ownership.
+- `docs/internals/design.md`: concise Chinese design intent and implementation status.
+- `docs/internals/architecture.md`: component boundaries, data ownership, and runtime behavior.
 - `SECURITY.md`: threat model, guarantees, and known limits.
-- `docs/PROTOCOL.md`: exact CLI-daemon protocol and framing.
+- `docs/internals/protocol.md`: exact CLI-daemon protocol and framing.
 - `CONTRIBUTING.md`: development, CI, and live-test commands.
 
 When code, tests, and docs disagree, verify runtime behavior, fix the code or
@@ -184,15 +184,14 @@ or wire protocol.
 - Keep live SSH tests gated, isolated under temporary `SLOOSH_HOME`, and
   single-threaded.
 
-## Documentation Map
+## Documentation Ownership
 
-- User-visible command or behavior: `README.md` and relevant `--help` text.
-- Agent workflow: `skills/sloosh/SKILL.md`.
-- Architecture/ownership: `docs/ARCHITECTURE.md`.
-- Threat model or capability boundary: `SECURITY.md`.
-- Wire behavior: `docs/PROTOCOL.md` and `WIRE_PROTOCOL_VERSION` when needed.
-- Design/status: `DESIGN.md`.
-- Development or test workflow: `CONTRIBUTING.md` and CI.
+`docs/README.md` is the documentation map. Update the owner document rather
+than copying its contract into another file. User behavior belongs in README
+and `--help`; architecture in `docs/internals/architecture.md`; security in
+`SECURITY.md`; wire behavior in `docs/internals/protocol.md`; development in
+`CONTRIBUTING.md`; releases in `docs/maintainers/releasing.md`; operational
+agent usage in `skills/sloosh/SKILL.md`.
 
 Do not commit `target/`, credentials, local `.env*`, `.gh-config/`, real vaults,
 known-host data, daemon logs, audit logs, or spool output.

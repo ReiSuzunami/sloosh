@@ -1,6 +1,6 @@
 //! Persistent PTY session management: sentinel-based command/output framing,
 //! ring buffer + cursor `peek`, spool-to-disk, dead-session semantics, idle
-//! reaping (DESIGN.md §3, §5).
+//! reaping (docs/internals/architecture.md).
 //!
 //! Same interim trust posture as the rest of the daemon (see the note in
 //! `daemon/mod.rs`): any local caller can address any session. No
@@ -30,14 +30,14 @@ use crate::daemon::ssh::{self, SshError};
 use crate::proto::{SessionSummary, TransferReply};
 use crate::transport::unix::{ensure_private_dir as ensure_sloosh_private_dir, sloosh_home};
 
-/// Bound on how much output we keep in memory per session (DESIGN.md §5).
+/// Bound on how much output we keep in memory per session (docs/internals/architecture.md).
 const RING_CAPACITY: usize = 256 * 1024;
 /// Cap on how much of a single run/peek reply's `output` field we send back
-/// (DESIGN.md §5 "~30k 字符尾部"); spool persistence has separate bounded
+/// (docs/internals/architecture.md "~30k 字符尾部"); spool persistence has separate bounded
 /// per-run and global budgets below.
 const MAX_OUTPUT_CHARS: usize = 30_000;
 /// Keep at most this many bytes per session's spool directory before
-/// deleting the oldest files (DESIGN.md §5, "simple size-based cleanup").
+/// deleting the oldest files (docs/internals/architecture.md, "simple size-based cleanup").
 const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
 /// Bound one active run's disk footprint. Reaching this limit stops spool
 /// persistence only: the in-memory ring, marker detection, and remote command
@@ -64,7 +64,7 @@ const SPOOL_LIMIT_MARKER: &[u8] =
 /// usual 255-byte filesystem limit, even after fixed prefixes/separators.
 const MAX_ENCODED_SPOOL_NAME_BYTES: usize = 96;
 /// A session with no read or write activity for this long is reaped
-/// (DESIGN.md §3). Configurable only in the sense that it's one constant to
+/// (docs/internals/architecture.md). Configurable only in the sense that it's one constant to
 /// edit — no config surface for it in this milestone.
 const IDLE_REAP_AFTER: Duration = Duration::from_secs(8 * 60 * 60);
 /// How often the idle reaper wakes up to check.
@@ -87,7 +87,7 @@ const INIT_COMMANDS: &str = "stty -echo 2>/dev/null; set +o emacs 2>/dev/null; \
      PS1='' PROMPT_COMMAND=''";
 
 /// Everything that can go wrong operating on a session. Self-teaching
-/// messages per DESIGN.md §7.
+/// messages per docs/internals/architecture.md.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(
@@ -123,7 +123,7 @@ pub enum SessionError {
     )]
     Io(#[from] std::io::Error),
 
-    // -- put/get (DESIGN.md §5-6) -------------------------------------------
+    // -- put/get (docs/internals/architecture.md) -------------------------------------------
     #[error(
         "local file '{path}' does not exist or is not readable — check the path (`sloosh put` \
          resolves relative paths from the directory it's run in, since the daemon's own working \
@@ -235,7 +235,7 @@ impl RingBuffer {
     /// Bytes since absolute offset `cursor`. Returns `(bytes, dropped)`
     /// where `dropped` is true if `cursor` pointed at data that has already
     /// been evicted from the ring (the caller silently loses that history —
-    /// documented simplification, DESIGN.md §5 ring buffer is best-effort,
+    /// documented simplification, docs/internals/architecture.md ring buffer is best-effort,
     /// not a durable log; the spool file on disk is the durable copy).
     fn since(&self, cursor: u64) -> (Vec<u8>, bool) {
         let start = self.start_offset();
@@ -290,7 +290,7 @@ fn marker_printf(sentinel: &str) -> String {
 
 /// Build the literal line written to the PTY for one `run`: run the
 /// command, then print exit status bracketed by the sentinel so the reader
-/// can find where the command's own output ends (DESIGN.md §3).
+/// can find where the command's own output ends (docs/internals/architecture.md).
 fn frame_command(command: &str, sentinel: &str) -> String {
     format!("{command}; {}", marker_printf(sentinel))
 }
@@ -1040,7 +1040,7 @@ fn lock_spool_ledger(ledger: &Mutex<SpoolLedger>) -> std::sync::MutexGuard<'_, S
 
 struct SessionState {
     ring: RingBuffer,
-    /// Single global read cursor for `peek` (DESIGN.md §5 simplification:
+    /// Single global read cursor for `peek` (docs/internals/architecture.md simplification:
     /// two concurrent `peek` callers on the same session share one cursor,
     /// so the second caller only sees what's new since the *first*
     /// caller's peek, not since its own last peek — documented, not fixed,
@@ -1173,7 +1173,7 @@ async fn get_existing_session(host: &str, name: &str) -> Result<Arc<SessionInner
 
 /// Look up a session, creating it (opening a fresh SSH connection + PTY +
 /// shell) if none exists yet. If one exists but is dead, refuses to
-/// reconnect automatically (DESIGN.md §3) and instead returns a
+/// reconnect automatically (docs/internals/architecture.md) and instead returns a
 /// self-teaching error telling the caller to `kill` it first.
 async fn get_or_create_session(
     host: &str,
@@ -1253,7 +1253,7 @@ async fn create_session(
     let mut wake_rx = inner.wake_tx.subscribe();
     tokio::spawn(reader_loop(inner.clone(), read_half));
 
-    // Quiesce the shell for scripted use (DESIGN.md §3), framed with its
+    // Quiesce the shell for scripted use (docs/internals/architecture.md), framed with its
     // own sentinel: everything the shell prints before that marker — login
     // banner, MOTD, prompt residue, the init line's own echo — is discarded
     // by the `discard_until_ready` gate, so none of it can ever be
@@ -1581,12 +1581,12 @@ fn dead_reply_output(state: &SessionState, start_offset: u64, raw: bool) -> (Str
 }
 
 // ---------------------------------------------------------------------------
-// Public operations (backing the CLI command set, DESIGN.md §6)
+// Public operations (backing the CLI command set, docs/internals/architecture.md)
 // ---------------------------------------------------------------------------
 
 use crate::proto::{PeekReply, RunReply};
 
-/// `run <host> <command>` — DESIGN.md §3, §6.
+/// `run <host> <command>` — docs/internals/architecture.md.
 pub async fn run(
     host: &str,
     command: &str,
@@ -1737,7 +1737,7 @@ fn dead_run_reply(
     }
 }
 
-/// `peek <host>` — DESIGN.md §3, §6.
+/// `peek <host>` — docs/internals/architecture.md.
 pub async fn peek(
     host: &str,
     session: Option<String>,
@@ -1770,7 +1770,7 @@ pub async fn peek(
     })
 }
 
-/// `send <host> <keys>` — DESIGN.md §6.
+/// `send <host> <keys>` — docs/internals/architecture.md.
 pub async fn send(
     host: &str,
     keys: &str,
@@ -1801,7 +1801,7 @@ pub async fn send(
     Ok(())
 }
 
-/// `interrupt <host>` — sends Ctrl-C (0x03), DESIGN.md §6.
+/// `interrupt <host>` — sends Ctrl-C (0x03), docs/internals/architecture.md.
 ///
 /// If a run is in flight, Ctrl-C usually aborts the *whole* framed command
 /// line in the interactive shell — including the trailing marker `printf` —
@@ -1858,7 +1858,7 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
 }
 
 /// `open <host> <name>` — explicit create-or-reuse of a named session
-/// (DESIGN.md §6). Unlike `run`, never implicitly targets "default".
+/// (docs/internals/architecture.md). Unlike `run`, never implicitly targets "default".
 pub async fn open(
     host: &str,
     name: &str,
@@ -1869,7 +1869,7 @@ pub async fn open(
     Ok(summarize(host, name, &state))
 }
 
-/// `kill <host>` — DESIGN.md §6. Removes the session from the registry and
+/// `kill <host>` — docs/internals/architecture.md. Removes the session from the registry and
 /// closes its channel; never reconnects (this is the only way back from a
 /// `dead` session, or to end a healthy one).
 pub async fn kill(host: &str, session: Option<String>) -> Result<(), SessionError> {
@@ -1888,7 +1888,7 @@ pub async fn kill(host: &str, session: Option<String>) -> Result<(), SessionErro
     Ok(())
 }
 
-/// `ls [--host]` — DESIGN.md §6.
+/// `ls [--host]` — docs/internals/architecture.md.
 pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
     let reg = registry().lock().await;
     let mut out = Vec::with_capacity(reg.len());
@@ -1912,7 +1912,7 @@ pub async fn list_summaries() -> Vec<SessionSummary> {
 }
 
 // ---------------------------------------------------------------------------
-// `put`/`get` over SFTP (DESIGN.md §5-6)
+// `put`/`get` over SFTP (docs/internals/architecture.md)
 // ---------------------------------------------------------------------------
 
 fn sftp_client_config() -> SftpConfig {
@@ -1923,7 +1923,7 @@ fn sftp_client_config() -> SftpConfig {
 }
 
 /// Get (or create) the named session, then open a fresh SFTP-subsystem
-/// channel on its *existing* SSH connection (DESIGN.md §5: "put/get 走既有
+/// channel on its *existing* SSH connection (docs/internals/architecture.md: "put/get 走既有
 /// 连接的 SFTP channel" — reuse the authenticated connection, never redial or
 /// reauthenticate per transfer). Returns the resolved session name alongside
 /// the SFTP handle so callers can echo it back in their reply.
@@ -1955,7 +1955,7 @@ async fn sftp_session(
 
 /// Translate an SFTP protocol error on `path` into a self-teaching
 /// `SessionError` — `NoSuchFile`/`PermissionDenied` get a specific message
-/// (DESIGN.md §7); anything else falls back to the generic SFTP error.
+/// (docs/internals/architecture.md); anything else falls back to the generic SFTP error.
 fn remote_path_error(host: &str, path: &str, err: SftpClientError) -> SessionError {
     if let SftpClientError::Status(status) = &err {
         let reason = match status.status_code {

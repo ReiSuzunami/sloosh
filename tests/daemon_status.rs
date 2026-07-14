@@ -1,6 +1,6 @@
 //! Integration test: start the daemon against a temp socket path, connect
 //! as a client, send `Status`, check the reply — end-to-end proof the
-//! accept loop and NDJSON framing work together (DESIGN.md §8 milestone 1).
+//! accept loop and NDJSON framing work together (docs/internals/architecture.md milestone 1).
 //!
 //! The socket path is overridable via `SLOOSH_SOCKET` (checked here through
 //! `transport::unix::resolve_socket_path`, same code path the real CLI

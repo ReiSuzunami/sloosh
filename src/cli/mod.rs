@@ -1,5 +1,5 @@
 //! CLI: clap command definitions, client-side dispatch, daemon auto-spawn
-//! (DESIGN.md §6, §8).
+//! (docs/internals/architecture.md).
 
 mod args;
 mod client;
@@ -189,7 +189,7 @@ fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
 }
 
 /// `SLOOSH_LEASE` escape-hatch token from the environment, if this process
-/// has one set (DESIGN.md §4) — forwarded on every host-touching request so
+/// has one set (docs/internals/architecture.md) — forwarded on every host-touching request so
 /// the daemon can check it before falling back to ancestry matching.
 fn lease_token_from_env() -> Option<String> {
     std::env::var("SLOOSH_LEASE").ok()
@@ -371,11 +371,11 @@ fn print_session_summary_human(s: &SessionSummary) {
 }
 
 // ---------------------------------------------------------------------
-// Vault + lease authorization flow (DESIGN.md §4).
+// Vault + lease authorization flow (docs/internals/architecture.md).
 // ---------------------------------------------------------------------
 
-/// Refuse to run a human-only command outside a real terminal (DESIGN.md
-/// §2, §4): credential enrollment and lease approval are never meant to be
+/// Refuse to run a human-only command outside a real terminal: credential
+/// enrollment and lease approval are never meant to be
 /// driven by an agent, so a non-interactive caller gets a self-teaching
 /// error instead of a hung prompt or (worse) an ignored secret.
 fn require_tty(command: &str) -> anyhow::Result<()> {
@@ -384,7 +384,7 @@ fn require_tty(command: &str) -> anyhow::Result<()> {
     } else {
         anyhow::bail!(
             "`sloosh {command}` is a human-only command and refuses to run without a real \
-             terminal attached to stdin (DESIGN.md §4). If you are a coding agent: do not try to \
+             terminal attached to stdin (docs/internals/architecture.md). If you are a coding agent: do not try to \
              work around this — ask your user to run `sloosh {command}` themselves, in their own \
              terminal."
         )
@@ -549,8 +549,7 @@ async fn cmd_vault_init() -> anyhow::Result<()> {
 }
 
 /// Prompt for the master password: a single prompt if a vault already
-/// exists, or a "set + confirm twice" flow for first-time setup (DESIGN.md
-/// §1 "首次使用时提示设置主密码, 确认两次").
+/// exists, or a "set + confirm twice" flow for first-time setup.
 fn prompt_master_password(vault_exists: bool) -> anyhow::Result<SecretString> {
     if vault_exists {
         let pw = rpassword::prompt_password("Master password: ")?;
@@ -572,7 +571,7 @@ fn prompt_master_password(vault_exists: bool) -> anyhow::Result<SecretString> {
 
 /// Probe `host` through its configured ProxyJump route, show the human the
 /// final target's SHA256 fingerprint, and on confirmation record it in
-/// `~/.sloosh/known_hosts` (DESIGN.md §4). Intermediate hops retain normal
+/// `~/.sloosh/known_hosts` (docs/internals/architecture.md). Intermediate hops retain normal
 /// strict host-key verification and authentication; the final target only
 /// performs key exchange and is never authenticated to by this probe.
 async fn confirm_and_record_host_key(
@@ -676,7 +675,7 @@ async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// put/get over SFTP (DESIGN.md §5-6).
+// put/get over SFTP (docs/internals/architecture.md).
 // ---------------------------------------------------------------------
 
 /// Resolve a user-facing path against this CLI process's cwd. The CLI owns
@@ -913,7 +912,7 @@ async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// Port forwarding (DESIGN.md §7).
+// Port forwarding (docs/internals/architecture.md).
 // ---------------------------------------------------------------------
 
 async fn cmd_forward(action: ForwardAction) -> anyhow::Result<()> {
@@ -1001,7 +1000,7 @@ async fn cmd_forward_stop(args: ForwardStopArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// `sloosh log` (DESIGN.md §4) — reads ~/.sloosh/audit.jsonl directly, no
+// `sloosh log` (docs/internals/architecture.md) — reads ~/.sloosh/audit.jsonl directly, no
 // daemon round-trip needed: the CLI and daemon run as the same user.
 // ---------------------------------------------------------------------
 

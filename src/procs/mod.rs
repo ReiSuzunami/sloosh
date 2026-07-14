@@ -1,4 +1,4 @@
-//! Process tree introspection (DESIGN.md §4, §8).
+//! Process tree introspection (docs/internals/architecture.md).
 //!
 //! Lease anchoring walks the caller's process ancestry to find the
 //! human-meaningful "anchor" process (e.g. the `claude` agent process, not
@@ -46,7 +46,7 @@ pub trait ProcessInfo {
     fn parent_pid(pid: u32) -> Option<u32>;
 
     /// Process start time, used to disambiguate PID reuse when walking the
-    /// ancestor chain (DESIGN.md §4: lease binds to (PID, start time)).
+    /// ancestor chain (docs/internals/architecture.md: lease binds to (PID, start time)).
     fn start_time(pid: u32) -> Option<SystemTime>;
 
     /// Kernel-reported short process name (`p_comm` on macOS,

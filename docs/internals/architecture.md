@@ -1,9 +1,9 @@
 # Architecture
 
-This document describes the code as implemented. See
-[`../DESIGN.md`](../DESIGN.md) for the Chinese design/status document,
-[`../SECURITY.md`](../SECURITY.md) for the threat model, and
-[`PROTOCOL.md`](PROTOCOL.md) for the exact local wire framing.
+This document owns component boundaries, data ownership, and runtime behavior.
+See [`design.md`](design.md) for the concise Chinese intent/status document,
+[`../../SECURITY.md`](../../SECURITY.md) for the threat model, and
+[`protocol.md`](protocol.md) for the exact local wire framing.
 
 ## 1. Component and data ownership
 
@@ -84,7 +84,8 @@ have mode `0700`; on macOS it must also have no extended ACL.
 Before sending a request, `UnixChannel::connect` checks that the server peer has
 the current effective UID and the same canonical executable path as the current
 `sloosh` process. This is useful daemon authentication, but it is not a defense
-against hostile code already running as the same user; see `SECURITY.md`.
+against hostile code already running as the same user; see
+[`SECURITY.md`](../../SECURITY.md).
 
 The daemon obtains the client PID from kernel peer credentials:
 

@@ -97,46 +97,20 @@ and PRs there should explain their reasoning in more depth than usual:
   framing, spool retention, local filesystem authority, SFTP streaming, and
   atomic local downloads.
 
-Keep these contracts intact unless the change explicitly revises them:
+Do not copy their detailed contracts into a PR description. Link the owner
+document and explain the exact boundary being changed:
 
-- Protocol 1 control messages are bounded NDJSON. SFTP data uses raw frames
-  capped at 1 MiB each, with no total transfer-size cap.
-- Connection setup is bidirectional: the CLI validates `Status`, then sends
-  `Hello` and waits for `ProtocolReady`. The daemon rejects ordinary requests
-  before a successful handshake, without performing their side effects.
-- The CLI is the only process that opens a `put`/`get` local path. The daemon
-  treats that path as an audit/display label and owns only the remote SFTP
-  handle.
-- A transfer is lease-authorized once before `TransferReady`, with no per-frame
-  re-check. A finite transfer already in flight may finish after the two-hour
-  idle or eight-hour absolute lease expiry; expiry blocks new operations, not
-  bytes in that stream.
-- SFTP replaces `russh-sftp`'s 10-second request default with the pinned
-  Tokio far-future deadline (roughly 30 years); do not restore the short
-  default, which breaks slow NAS operations.
-- `get` requests mode `0666` for its temporary file, lets the caller's umask
-  determine the effective mode, and does not clobber by default. `put`
-  truncates the remote destination and is not atomic remotely.
-- Local forwards bind only loopback addresses. Remote (`-R`) forwarding is
-  supported under the host lease and may expose a listener according to the
-  SSH server's `GatewayPorts` policy.
-- Command-output spool persistence is bounded at 64 MiB per run, 64 MiB per
-  session directory, and 1 GiB globally by actual persisted bytes. Active runs
-  do not reserve their unused allowance, and cleanup failure must not fail a
-  command. Spool is separate from SFTP and is not an unlimited/complete
-  command-output archive. Synchronous append/eviction latency on a slow spool
-  filesystem remains a known limitation; do not add per-run full-tree scans.
+- [`SECURITY.md`](SECURITY.md) owns the threat model and capability boundary.
+- [`docs/internals/architecture.md`](docs/internals/architecture.md) owns
+  component boundaries and runtime behavior.
+- [`docs/internals/protocol.md`](docs/internals/protocol.md) owns wire shapes,
+  framing, and sequencing.
 
-Any incompatible request, response, framing, or sequencing change must bump
-`WIRE_PROTOCOL_VERSION`, update both client and daemon handling, and add a
-mismatch/upgrade test. User-visible behavior changes must update README,
-command help, and the agent skill where relevant.
-
-If you're proposing a change in one of these areas, please open an issue or
-draft PR early so the design can be discussed before you invest in a full
-implementation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-English overview of how these pieces fit together, and
-[`DESIGN.md`](DESIGN.md) for the full (Chinese) design document.
+Any incompatible wire change must bump `WIRE_PROTOCOL_VERSION`, update both
+client and daemon handling, and add mismatch/upgrade tests. User-visible
+behavior must update README, command help, and the agent skill where relevant.
+Open an issue or draft PR early for changes that move credential, filesystem,
+forwarding, or authorization authority.
 
 ## PR flow
 

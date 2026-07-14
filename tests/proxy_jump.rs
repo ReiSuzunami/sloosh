@@ -1,5 +1,5 @@
-//! Live-SSH integration test for vault-backed ProxyJump chains (DESIGN.md
-//! §4): a vault entry whose `jump` field routes the connection through
+//! Live-SSH integration test for vault-backed ProxyJump chains: a vault
+//! entry whose `jump` field routes the connection through
 //! another vault entry, with per-hop lease enforcement. Gated behind BOTH
 //! `SLOOSH_TEST_SSH_HOST` (a `user@host` literal or bare host) and
 //! `SLOOSH_TEST_SSH_PASSWORD` (that host's SSH password) — see

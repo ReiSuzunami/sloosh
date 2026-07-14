@@ -1,11 +1,11 @@
 //! Live-SSH integration tests for the milestone 2/3 session command set
 //! (`run`/`peek`/`send`/`interrupt`/`open`/`ls`/`kill`), now gated behind an
-//! active lease (DESIGN.md §4) same as any other caller.
+//! active lease (docs/internals/architecture.md) same as any other caller.
 //!
 //! These need a real, reachable SSH host to connect to, so they're gated
 //! behind the `SLOOSH_TEST_SSH_HOST` environment variable (an alias
 //! resolvable via `~/.ssh/config` or a literal `user@host`/`host`, per
-//! DESIGN.md §2). Unset in CI/sandboxes: the tests compile and pass
+//! docs/internals/architecture.md). Unset in CI/sandboxes: the tests compile and pass
 //! trivially by skipping, rather than failing or hanging waiting for
 //! network access nobody granted.
 //!
@@ -63,7 +63,7 @@ fn set_test_home(tag: &str) -> std::path::PathBuf {
     home
 }
 
-/// Grant this test process itself a lease for `host` (DESIGN.md §4), calling
+/// Grant this test process itself a lease for `host` (docs/internals/architecture.md), calling
 /// the lease/vault machinery directly in-process rather than going through
 /// `sloosh request`/`sloosh approve` — this test binary *is* the caller
 /// whose ancestry the daemon will check, so `std::process::id()` is the
@@ -121,7 +121,7 @@ async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
 
 /// Start a fresh daemon on its own temp socket and return a connected
 /// channel to it, having already granted this test process a lease for
-/// `host` (DESIGN.md §4) so the session commands below aren't refused.
+/// `host` (docs/internals/architecture.md) so the session commands below aren't refused.
 /// Each test gets an isolated daemon (and, via `set_test_home`, an isolated
 /// vault) so state never leaks between tests.
 async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf) {

@@ -1,5 +1,5 @@
 //! Client-side connection logic: connect to the daemon, and auto-spawn it
-//! detached when it isn't running (DESIGN.md §1).
+//! detached when it isn't running (docs/internals/architecture.md).
 //!
 //! Concurrent auto-spawn races are resolved by bind atomicity in
 //! `transport::unix::bind`: if two CLI invocations both fail to connect and

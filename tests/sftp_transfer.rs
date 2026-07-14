@@ -1,4 +1,4 @@
-//! Live-SSH integration tests for `put`/`get` over SFTP (DESIGN.md §5-6).
+//! Live-SSH integration tests for `put`/`get` over SFTP (docs/internals/architecture.md).
 //!
 //! Same gating and isolation story as `tests/ssh_session.rs`: these need a
 //! real, reachable SSH host, so they're gated behind `SLOOSH_TEST_SSH_HOST`

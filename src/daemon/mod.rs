@@ -1,7 +1,7 @@
-//! Daemon: accept loop and request routing (DESIGN.md §1, §8).
+//! Daemon: accept loop and request routing (docs/internals/architecture.md).
 //!
 //! The daemon is a plain subcommand of the same binary (`sloosh daemon
-//! run`), not a separate crate — see DESIGN.md §1 "single binary". It owns
+//! run`), not a separate crate — see docs/internals/architecture.md "single binary". It owns
 //! the Unix domain socket and answers the phase-1/phase-2 command surface:
 //! `Status`/`Shutdown`, SSH session management (`Run`/`Peek`/`Send`/
 //! `Interrupt`/`Open`/`Ls`/`Kill`), port forwarding (`Forward`/`ForwardLs`/
@@ -9,7 +9,7 @@
 //! (`RequestLease`/`DescribeLeaseRequest`/`ApproveLease`/`VaultExists`/
 //! `InitVault`/`AddCred`/`RmCred`).
 //!
-//! **Trust posture (DESIGN.md §4):** the Unix socket is still mode 0600
+//! **Trust posture (docs/internals/architecture.md):** the Unix socket is still mode 0600
 //! same-user-only (see `transport::unix`) — that's the outer perimeter. On
 //! top of it, every host-touching request (`Run`/`Peek`/`Send`/`Interrupt`/
 //! `Open`/`Kill`/`Forward`) additionally requires an active lease for that
@@ -53,7 +53,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 /// Self-teaching error for a host-touching request with no matching lease
-/// (DESIGN.md §4, §7).
+/// (docs/internals/architecture.md).
 fn no_lease_message(host: &str) -> String {
     format!(
         "no active lease for '{host}' — run `sloosh request {host}` and show your user the \
@@ -92,7 +92,7 @@ async fn require_lease(
 /// Run the daemon accept loop until SIGTERM or a `Shutdown` request.
 ///
 /// Binds `socket_path`; if another daemon already owns it (lost the
-/// concurrent-auto-spawn race, DESIGN.md §1), exits quietly and lets the
+/// concurrent-auto-spawn race, docs/internals/architecture.md), exits quietly and lets the
 /// winner serve — callers retry `connect`, they don't need this process to
 /// succeed.
 pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
@@ -306,7 +306,7 @@ async fn handle_connection(
                     Ok(()) => match session::send(&host, &keys, session, newline).await {
                         Ok(()) => {
                             // Never log `keys`: it can carry a password/answer
-                            // typed into an interactive prompt (DESIGN.md §4).
+                            // typed into an interactive prompt (docs/internals/architecture.md).
                             audit::record(
                                 "send",
                                 serde_json::json!({"host": host, "session": session_hint}),
@@ -555,7 +555,7 @@ async fn handle_connection(
                     .await?;
                     continue;
                 };
-                // DESIGN.md §4: expand every requested host's ProxyJump
+                // docs/internals/architecture.md: expand every requested host's ProxyJump
                 // chain so the human approving this request sees (and
                 // grants) coverage for the whole path, not just the target.
                 let expanded_hosts = ssh::expand_lease_hosts(&hosts).await;
@@ -618,7 +618,7 @@ async fn handle_connection(
                                 "anchor_pid": info.anchor_pid,
                             }),
                         );
-                        // DESIGN.md §4: with the vault now unlocked, resolve
+                        // docs/internals/architecture.md: with the vault now unlocked, resolve
                         // each granted host the same way a real connection
                         // will (vault entry first) and tell the CLI which
                         // endpoints still need a host-key confirmation.
