@@ -134,9 +134,11 @@ does not authenticate the daemon executable or automatically implement the
 
 `src/daemon/lease.rs` stores pending requests and active leases in memory. A
 request is anchored to a process instance identified by PID plus start time.
-Later callers inherit authorization when that exact anchor appears in their
-current ancestry. `SLOOSH_LEASE` is a bearer-token escape hatch for detached
-process trees.
+The platform readers retain Linux clock-tick or macOS microsecond precision so
+same-PID instances with distinct kernel timestamps remain distinct, including
+within one second. Later callers inherit authorization when that exact anchor
+appears in their current ancestry. `SLOOSH_LEASE` is a bearer-token escape hatch
+for detached process trees.
 
 An active lease grants a set of host aliases. It expires after either:
 

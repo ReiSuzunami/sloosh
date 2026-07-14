@@ -21,7 +21,7 @@
 //! - field 4: `ppid`
 //! - field 22: `starttime` (clock ticks since boot, per `sysconf(_SC_CLK_TCK)`)
 
-use super::ProcessInfo;
+use super::{ProcessInfo, system_time_from_ticks};
 use std::fs;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -97,7 +97,7 @@ fn boot_time() -> Option<SystemTime> {
         for line in contents.lines() {
             if let Some(rest) = line.strip_prefix("btime ") {
                 let secs: u64 = rest.trim().parse().ok()?;
-                return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+                return SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs));
             }
         }
         None
@@ -111,8 +111,7 @@ fn parse_stat(pid: u32) -> Option<StatFields> {
 
     let boot = boot_time()?;
     let ticks_per_sec = clock_ticks_per_sec() as u64;
-    let secs_since_boot = starttime_ticks / ticks_per_sec;
-    let start_time = boot + Duration::from_secs(secs_since_boot);
+    let start_time = system_time_from_ticks(boot, starttime_ticks, ticks_per_sec)?;
 
     Some(StatFields {
         ppid,

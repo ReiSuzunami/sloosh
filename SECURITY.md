@@ -82,8 +82,10 @@ and process check, not code signing or inode pinning.
 The daemon gets the peer PID from `SO_PEERCRED` on Linux or `LOCAL_PEERPID` on
 macOS. It never accepts a caller-supplied PID as identity.
 
-An active lease is anchored to a PID plus process start time. A later caller is
-authorized only when:
+An active lease is anchored to a PID plus process start time. The daemon keeps
+the kernel-provided subsecond resolution: Linux clock ticks and macOS `timeval`
+microseconds are not truncated to whole seconds. A later caller is authorized
+only when:
 
 - its current ancestry contains that exact anchor process instance; or
 - it presents the active lease's `SLOOSH_LEASE` token;

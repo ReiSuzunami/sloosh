@@ -71,8 +71,9 @@ CLI 连接后验证 socket 对端 eUID 与当前 `sloosh` 的 canonical executab
 
 `sloosh request <host>...` 创建 pending request。daemon 从 UDS peer PID 向上遍历进程树，
 选择一个 `(PID, process start time)` anchor。后续调用只要 ancestry 中包含该同一进程实例，
-即可继承 lease；PID start time 防止简单 PID 复用。`SLOOSH_LEASE` token 是进程树断裂时的
-bearer-token 逃生路径。
+即可继承 lease；PID start time 保留内核提供的亚秒精度（Linux clock tick、macOS
+`timeval` microsecond），避免把内核时间戳不同的同秒 PID 复用误认成原进程。
+`SLOOSH_LEASE` token 是进程树断裂时的 bearer-token 逃生路径。
 
 Lease 范围是主机别名集合，不是命令级权限。对一个 host 的 lease 可用于该 host 上的
 session 操作、SFTP 和当前允许的 forward。
