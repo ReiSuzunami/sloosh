@@ -6,7 +6,7 @@ user guides are maintained translations, not separate specifications.
 
 | Topic | English | 简体中文 | Authority |
 |---|---|---|---|
-| Product, quickstart, commands | [`README.md`](../README.md) | [`README.zh-CN.md`](../README.zh-CN.md) | CLI behavior and user entry |
+| Product and install/build entry | [`README.md`](../README.md) | [`README.zh-CN.md`](../README.zh-CN.md) | User entry |
 | Installation and upgrades | [`installation.md`](getting-started/installation.md) | [`installation.zh-CN.md`](getting-started/installation.zh-CN.md) | Distribution and platform requirements |
 | Security model | [`SECURITY.md`](../SECURITY.md) | — | Threat model, guarantees, and known limits |
 | Architecture | [`architecture.md`](internals/architecture.md) | — | Component boundaries, ownership, and runtime behavior |

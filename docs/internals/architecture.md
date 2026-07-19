@@ -58,10 +58,19 @@ Ownership is deliberate:
   never opens that caller-supplied local path.
 - Human CLI temporarily unlocks its own vault cache during approval. Daemon has
   a separate cache and independently validates the approved host scope.
+- On DMG-installed macOS, daemon may spawn bundled `Sloosh Approval.app` over
+  anonymous pipes. Helper alone owns Keychain/Touch ID, secure PIN/Master
+  Password entry, and native confirmation
+  UI; daemon still owns host expansion and lease activation. Helper never
+  listens on a socket and requesting process cannot send it approval messages.
 - `sloosh skill install/status` is CLI-only and never starts the daemon or
   accesses the vault. `sloosh init` requires a real TTY, installs/verifies the
   embedded Skill, then enters the existing vault initialization flow. These
   steps are deliberately restartable rather than transactional.
+- `gui/` is a Svelte 5 frontend inside a Tauri 2 desktop process. It owns only
+  presentation and fixed setup commands. It receives status DTOs without
+  secrets; daemon, vault, Skill filesystem, PIN policy, and native helper
+  remain Rust-owned. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
 
 ## 2. Local transport boundary
 
@@ -86,6 +95,12 @@ These checks authenticate daemon to CLI and identify client process to daemon.
 They do not isolate hostile code already running as the same UID. A same-UID
 process can open the socket, but ordinary requests still require protocol
 negotiation and daemon-side capability checks.
+
+The macOS DMG installer is a narrow additional local client during upgrades.
+It sends only the pre-negotiation `Shutdown` request to the default private
+socket before replacing an existing recognized app. It never negotiates,
+accesses credentials, or sends an ordinary request, and it never executes the
+old installed bundle.
 
 Protocol 1 uses bounded NDJSON control messages and bounded raw frames for SFTP
 payloads. CLI performs `Status -> Hello -> ProtocolReady`; daemon rejects
@@ -148,6 +163,29 @@ agent CLI       daemon                         human CLI
 Mismatch fails closed and leaves pending request available for corrected
 approval. Connection-time dialing also checks each vault-backed ProxyJump alias
 independently.
+
+DMG-installed macOS adds an internal adapter without changing wire protocol:
+
+```text
+agent CLI          daemon                    native helper
+    | Request        |                            |
+    +--------------->| create pending            |
+    |                 |---------- begin --------->|
+    |                 |<------ password ----------| login Keychain
+    |                 | unlock + expand exact list|
+    |                 |---------- list ---------->|
+    |                 |       human confirms      |
+    |                 |<-- Touch ID or PIN --------| native secure input
+    |                 | compare again + activate  |
+    |<------ Ok ------|                            |
+```
+
+PIN verification is a daemon-local state machine with persistent backoff. It
+does not alter the request's Master Password failure budget. Cancellation,
+missing enrollment, helper failure, or any unknown SSH host key
+keeps request pending and returns normal terminal-approval instructions. Native
+success uses existing `RequestLease -> Ok`; bearer lease token never returns to
+requesting process. Password approval remains supported on every platform.
 
 After activation, human CLI confirms missing host keys in dependency order.
 Each jump is trusted before targets reached through it. A target probe follows
@@ -245,6 +283,11 @@ src/
     session.rs       PTY state, sentinel framing, spool, SFTP handles
     forward.rs       local -L, remote -R, and forward lifetime
     audit.rs         best-effort audit append/read helpers
+  native_approval.rs daemon-side native approval port and helper protocol
+  local_approval.rs  PIN verifier, persistence, backoff, and disable policy
+gui/
+  src/               Svelte status and setup UI; no secret fields
+  src-tauri/         fixed desktop command allowlist and bundle configuration
   procs/
     macos.rs         process ancestry via macOS APIs
     linux.rs         process ancestry via /proc

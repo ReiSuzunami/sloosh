@@ -41,36 +41,19 @@ This is a bidirectional protocol gate:
   remains subject to later capability checks and strict framing.
 
 `sloosh daemon stop` intentionally connects without `Hello` and sends the
-pre-negotiation `Shutdown` request. This keeps an incompatible running daemon
-operable during upgrade.
+pre-negotiation `Shutdown` request. During a DMG upgrade, the native macOS
+installer sends that same fixed request directly to the private default socket
+before replacing the app; it never executes the old bundle. These paths keep
+an incompatible running daemon operable during upgrade.
 
 ### Upgrade procedure
 
-Installing a new binary does not replace a daemon already running in memory. If
-the new CLI reports a protocol mismatch:
-
-1. Finish or abandon any work that depends on active PTY sessions or forwards.
-2. Run `sloosh daemon stop` manually.
-3. Retry the desired command; the new CLI will auto-start a matching daemon.
-
-On Linux, replacing the binary in place can make the old process's
-`/proc/<pid>/exe` resolve as `(deleted)`. The new CLI then cannot authenticate
-that peer and `daemon status`, `start`, and `stop` deliberately return a
-"refusing to use the daemon socket" error instead of claiming it is absent or
-sending `Shutdown` to an unverified process. In that case, inspect the
-same-user process with `ps`/`/proc`, confirm it is the expected
-`sloosh daemon run`, terminate that PID manually, then retry:
-
-```sh
-pgrep -u "$(id -u)" -af 'sloosh daemon run'
-```
-
-After confirming the PID from that output, run `kill PID`. The next CLI
-invocation removes the stale socket and starts the installed binary.
-
-Stopping the daemon terminates active sessions and forwards and loses pending
-requests, active leases, and other in-memory state. It does not preserve or
-migrate live protocol state.
+An installed binary does not replace a running daemon. On mismatch, stop the
+old daemon, then retry so CLI starts a matching one. Stopping loses sessions,
+forwards, requests, leases, and other in-memory state. If Linux executable-path
+verification rejects an in-place-replaced daemon, confirm and terminate that
+same-user daemon process manually. Operational steps belong to the
+[installation guide](../getting-started/installation.md#upgrade).
 
 ## 2. Control messages
 
@@ -126,11 +109,9 @@ Rules:
 - Empty files are represented by the zero-length EOF frame with no data frame.
 - After raw EOF, framing returns to NDJSON for the final `Transfer` or `Error`.
 
-The PTY output spool budgets (64 MiB/run, 64 MiB/session, 1 GiB/root) do not
-apply to this raw SFTP stream. Lease duration also does not impose a byte or
-duration limit after `TransferReady`. The daemon replaces the SFTP library's
-default 10-second request deadline with the pinned Tokio far-future timer
-(roughly 30 years), which is operationally unbounded for NAS work.
+PTY spool budgets do not apply to raw SFTP. Lease expiry does not stop a stream
+after `TransferReady`. Exact resource and timeout guarantees belong to
+[`SECURITY.md`](../../SECURITY.md#44-bounded-local-resources).
 
 The same buffered reader handles NDJSON and raw frames. Bytes prefetched while
 reading `TransferReady` remain available to the raw-frame reader.
@@ -203,8 +184,8 @@ Behavior:
 - Retrying starts again with `CREATE|TRUNCATE|WRITE`.
 
 The CLI sends chunks no larger than 1 MiB. File total size is not limited by
-the protocol. If the 2-hour idle or 8-hour absolute lease boundary passes after
-`TransferReady`, this transfer continues; a later transfer needs a live lease.
+the protocol. Lease expiry after `TransferReady` does not stop this transfer;
+a later transfer needs a live lease.
 
 ## 6. Get state machine
 
@@ -329,43 +310,33 @@ Any omission, order difference, vault/config change, or older client that omits
 parsing, which cannot match a real non-empty grant. A mismatch returns `Error`
 and leaves the pending request available for a new preview/approval attempt.
 
+On a DMG-installed Mac, daemon may satisfy a newly created pending request via
+its bundled Touch ID or PIN helper before replying. Success returns the already-valid
+`Ok` response for `RequestLease`; failure returns `LeaseRequestPending` exactly
+as before. Helper traffic uses anonymous child-process pipes, is not part of
+this wire protocol, and never exposes the generated bearer lease token to the
+requesting connection. Therefore this optional path does not change protocol 1
+message shape or sequencing. PIN and Master Password entry use anonymous helper
+pipes and never become Tauri command arguments. Raw PIN never becomes a
+protocol field. GUI vault initialization uses the existing `InitVault`
+`SecretString` over the verified owner-only Unix socket, preserving the daemon
+as vault authority.
+
 The daemon also rejects approval from a process ancestry containing the pending
 request's anchor. Wrong-password attempts are limited, and pending requests
 expire independently.
 
 ## 9. Host-key confirmation after activation
 
-Host-key probing is not a raw wire subprotocol. It runs in the human CLI after
-lease activation while that process still has its temporary vault cache.
+Host-key probing happens in human CLI after activation; it is not a wire
+subprotocol. Component flow belongs to
+[`architecture.md`](architecture.md#4-approval-proxyjump-and-host-keys) and
+security guarantees to [`SECURITY.md`](../../SECURITY.md#47-host-key-bootstrap).
+Probe failure does not roll back lease activation or create trust.
 
-The CLI builds dependency-first work:
+## 10. Raw-client limit
 
-1. Probe and confirm the first jump directly.
-2. Probe later jumps through already trusted/authenticated earlier jumps.
-3. Probe the final target through the same resolved ProxyJump route.
-
-Intermediate hops use normal strict known-host verification and normal
-authentication. Only the final unknown endpoint accepts a key in a capture
-handler, and that connection stops after key exchange without authenticating to
-the target. The CLI records the key only after human confirmation.
-
-Failure to probe or refusal to trust does not roll back the active lease, but it
-does not create trust either. A later real SSH connection still rejects an
-unknown or mismatched key.
-
-## 10. Debugging limits
-
-Control JSON can be inspected with ordinary text tools. That does not make
-`nc -U` a complete client. A correct client must also implement:
-
-- daemon peer identity verification;
-- exact `Status`/`Hello`/`ProtocolReady` gate;
-- request capability rules;
-- mixed NDJSON/raw state transitions;
-- raw frame size and EOF rules;
-- final transfer response handling;
-- local temp-file and atomic-commit behavior.
-
-Manual raw protocol use is unsupported and can stop the daemon or mutate local
-state when the caller satisfies the relevant request preconditions. Use the CLI
-for operational access.
+Readable control JSON does not make text tools complete clients. Correct peers
+must implement identity verification, negotiation, capabilities, mixed framing,
+transfer completion, and CLI-owned local-file behavior. Manual raw use is
+unsupported; use CLI for operations.

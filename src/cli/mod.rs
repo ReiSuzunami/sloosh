@@ -2,7 +2,7 @@
 //! (docs/internals/architecture.md).
 
 mod args;
-mod client;
+pub mod client;
 mod skill;
 
 pub use args::Cli;
@@ -403,7 +403,7 @@ async fn cmd_request(args: RequestArgs) -> anyhow::Result<()> {
     match resp {
         Response::Ok => {
             println!(
-                "already authorized: an active lease already covers {}",
+                "authorized: an active lease covers {}",
                 display_host_list(&args.hosts)
             );
         }
@@ -528,10 +528,11 @@ fn display_host_list(hosts: &[String]) -> String {
 
 async fn cmd_vault_init() -> anyhow::Result<()> {
     require_tty("vault init")?;
-    cmd_vault_init_inner().await
+    let password = cmd_vault_init_inner().await?;
+    enroll_native_approval(password).await
 }
 
-async fn cmd_vault_init_inner() -> anyhow::Result<()> {
+async fn cmd_vault_init_inner() -> anyhow::Result<Option<SecretString>> {
     let vault_exists_resp =
         bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
     let Response::VaultExists { exists } = vault_exists_resp else {
@@ -542,17 +543,22 @@ async fn cmd_vault_init_inner() -> anyhow::Result<()> {
             "a credential vault already exists — nothing to do. Use `sloosh add`/`sloosh rm` to \
              manage its entries."
         );
-        return Ok(());
+        return Ok(None);
     }
 
     println!("Creating the sloosh credential vault (~/.sloosh/vault).");
     let master_password = prompt_master_password(false)?;
-    bail_on_error_or_unexpected(send_request(&Request::InitVault { master_password }).await?)?;
+    bail_on_error_or_unexpected(
+        send_request(&Request::InitVault {
+            master_password: master_password.clone(),
+        })
+        .await?,
+    )?;
     println!(
         "vault created. You can now approve lease requests (`sloosh approve <ID>`) and add \
          credentials (`sloosh add <alias> --hostname <host>`)."
     );
-    Ok(())
+    Ok(Some(master_password))
 }
 
 async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
@@ -561,7 +567,26 @@ async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
         agent: args.agent,
         force: args.force_skill,
     })?;
-    cmd_vault_init_inner().await
+    let password = cmd_vault_init_inner().await?;
+    enroll_native_approval(password).await
+}
+
+async fn enroll_native_approval(password: Option<SecretString>) -> anyhow::Result<()> {
+    if !crate::native_approval::is_available() {
+        return Ok(());
+    }
+    let password = match password {
+        Some(password) => password,
+        None => {
+            println!("Touch ID approval is available. Enter the vault password once to enable it.");
+            prompt_master_password(true)?
+        }
+    };
+    crate::native_approval::enroll(&password)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not enable Touch ID approval: {error}"))?;
+    println!("Touch ID approval enabled.");
+    Ok(())
 }
 
 fn cmd_skill(action: SkillAction) -> anyhow::Result<()> {
@@ -630,6 +655,24 @@ fn skill_targets(agent: SkillAgent) -> anyhow::Result<Vec<skill::SkillTarget>> {
             anyhow::anyhow!("HOME is not set; cannot locate the Agent Skill directory")
         })?;
     skill::resolve_targets_from_home(Path::new(&home), agent)
+}
+
+/// Read-only desktop seam for the embedded Skill's auto-detected targets.
+pub fn embedded_skill_ready() -> anyhow::Result<bool> {
+    Ok(skill_targets(SkillAgent::Auto)?.iter().all(|target| {
+        matches!(
+            skill::inspect_target(target),
+            Ok(skill::SkillStatus::CurrentManaged | skill::SkillStatus::CurrentExternal)
+        )
+    }))
+}
+
+/// Install/update the embedded Skill without exposing a general process API.
+pub fn install_embedded_skill() -> anyhow::Result<bool> {
+    for target in skill_targets(SkillAgent::Auto)? {
+        skill::install_target(&target, false)?;
+    }
+    embedded_skill_ready()
 }
 
 /// Prompt for the master password: a single prompt if a vault already

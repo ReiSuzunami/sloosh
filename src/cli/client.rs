@@ -7,40 +7,97 @@
 //! exits quietly and this retry loop just keeps polling `connect` until
 //! whichever one won is ready.
 
-use crate::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
+use crate::proto::{Request, Response, StatusReply, WIRE_PROTOCOL_VERSION};
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
 use anyhow::Context;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MAX_ATTEMPTS: u32 = 12;
 const INITIAL_DELAY: Duration = Duration::from_millis(50);
 const MAX_DELAY: Duration = Duration::from_millis(1000);
 
+/// Typed local-daemon client shared by CLI and desktop adapters.
+///
+/// The daemon executable is explicit because a bundled GUI authenticates and
+/// starts `Contents/Helpers/sloosh`, not its own Tauri executable.
+#[derive(Debug, Clone)]
+pub struct DaemonClient {
+    socket_path: PathBuf,
+    daemon_executable: PathBuf,
+}
+
+impl DaemonClient {
+    pub fn new(socket_path: PathBuf, daemon_executable: PathBuf) -> Self {
+        Self {
+            socket_path,
+            daemon_executable,
+        }
+    }
+
+    pub async fn request(&self, request: &Request) -> anyhow::Result<Response> {
+        let mut channel =
+            connect_or_spawn_with_executable(&self.socket_path, &self.daemon_executable).await?;
+        channel.send(request).await?;
+        channel
+            .recv::<Response>()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed connection without replying"))
+    }
+
+    pub async fn status(&self) -> anyhow::Result<StatusReply> {
+        match self.request(&Request::Status).await? {
+            Response::Status(status) => Ok(status),
+            Response::Error { message } => anyhow::bail!("daemon status failed: {message}"),
+            response => anyhow::bail!("daemon returned {response:?} instead of status"),
+        }
+    }
+}
+
 /// Connect to the daemon, auto-spawning it (detached, logging to
 /// `~/.sloosh/daemon.log`) if it isn't reachable yet.
 pub async fn connect_or_spawn(socket_path: &Path) -> anyhow::Result<UnixChannel> {
-    match UnixChannel::connect(socket_path).await {
+    let executable = std::env::current_exe().context(
+        "failed to resolve sloosh's own executable path (needed to authenticate the daemon)",
+    )?;
+    connect_or_spawn_with_executable(socket_path, &executable).await
+}
+
+async fn connect_or_spawn_with_executable(
+    socket_path: &Path,
+    daemon_executable: &Path,
+) -> anyhow::Result<UnixChannel> {
+    match UnixChannel::connect_verified(socket_path, daemon_executable).await {
         Ok(chan) => return verify_wire_protocol(chan, socket_path).await,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return Err(untrusted_daemon_error(socket_path, e));
         }
         Err(_) => {}
     }
-    spawn_daemon_detached(socket_path)?;
-    wait_for_daemon(socket_path).await
+    spawn_daemon_detached_with_executable(socket_path, daemon_executable)?;
+    wait_for_daemon_with_executable(socket_path, daemon_executable).await
 }
 
 /// Poll `connect` with exponential backoff until it succeeds or we give up.
 pub async fn wait_for_daemon(socket_path: &Path) -> anyhow::Result<UnixChannel> {
+    let executable = std::env::current_exe().context(
+        "failed to resolve sloosh's own executable path (needed to authenticate the daemon)",
+    )?;
+    wait_for_daemon_with_executable(socket_path, &executable).await
+}
+
+async fn wait_for_daemon_with_executable(
+    socket_path: &Path,
+    daemon_executable: &Path,
+) -> anyhow::Result<UnixChannel> {
     let mut delay = INITIAL_DELAY;
     let mut last_err = None;
     for _ in 0..MAX_ATTEMPTS {
         tokio::time::sleep(delay).await;
-        match UnixChannel::connect(socket_path).await {
+        match UnixChannel::connect_verified(socket_path, daemon_executable).await {
             Ok(chan) => return verify_wire_protocol(chan, socket_path).await,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 return Err(untrusted_daemon_error(socket_path, e));
@@ -155,13 +212,20 @@ pub fn spawn_daemon_detached(socket_path: &Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context(
         "failed to resolve sloosh's own executable path (needed to auto-start the daemon)",
     )?;
+    spawn_daemon_detached_with_executable(socket_path, &exe)
+}
+
+fn spawn_daemon_detached_with_executable(
+    socket_path: &Path,
+    executable: &Path,
+) -> anyhow::Result<()> {
     let log_path = unix::daemon_log_path();
     let log_file = open_daemon_log(&log_path)?;
     let stdout = log_file
         .try_clone()
         .context("failed to duplicate daemon log file handle")?;
 
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = std::process::Command::new(executable);
     cmd.arg("daemon").arg("run");
     // SLOOSH_SOCKET is inherited automatically, but set it explicitly too so
     // the spawned daemon binds the exact same path even if it was passed in
@@ -183,7 +247,7 @@ pub fn spawn_daemon_detached(socket_path: &Path) -> anyhow::Result<()> {
     }
 
     cmd.spawn()
-        .with_context(|| format!("failed to spawn `{} daemon run`", exe.display()))?;
+        .with_context(|| format!("failed to spawn `{} daemon run`", executable.display()))?;
     Ok(())
 }
 
@@ -261,6 +325,69 @@ mod tests {
                 .expect("send protocol-ready reply");
             }
         })
+    }
+
+    fn spawn_ready_status_server(socket_path: &Path) -> tokio::task::JoinHandle<()> {
+        let listener = match unix::bind(socket_path).expect("bind test socket") {
+            BindOutcome::Bound(listener) => listener,
+            BindOutcome::AlreadyRunning => panic!("test socket unexpectedly in use"),
+        };
+        tokio::spawn(async move {
+            let mut chan = listener.accept().await.expect("accept client");
+            assert_eq!(
+                chan.recv::<Request>().await.expect("receive Status"),
+                Some(Request::Status)
+            );
+            chan.send(&Response::Status(StatusReply {
+                pid: 4242,
+                version: "test-daemon".to_string(),
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+                uptime_secs: 17,
+                ..StatusReply::default()
+            }))
+            .await
+            .expect("send Status reply");
+            assert_eq!(
+                chan.recv::<Request>().await.expect("receive Hello"),
+                Some(Request::Hello {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
+            chan.send(&Response::ProtocolReady {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol-ready reply");
+            assert_eq!(
+                chan.recv::<Request>().await.expect("receive typed status"),
+                Some(Request::Status)
+            );
+            chan.send(&Response::Status(StatusReply {
+                pid: 4242,
+                version: "test-daemon".to_string(),
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+                uptime_secs: 17,
+                ..StatusReply::default()
+            }))
+            .await
+            .expect("send typed status reply");
+        })
+    }
+
+    #[tokio::test]
+    async fn daemon_client_returns_typed_status_from_selected_executable() {
+        let socket_path = temp_socket_path("ts");
+        let server = spawn_ready_status_server(&socket_path);
+        let daemon_executable = std::env::current_exe().expect("current executable");
+        let client = DaemonClient::new(socket_path.clone(), daemon_executable);
+
+        let status = client.status().await.expect("typed daemon status");
+
+        assert_eq!(status.pid, 4242);
+        assert_eq!(status.version, "test-daemon");
+        assert_eq!(status.uptime_secs, 17);
+        server.await.expect("server task");
+        let _ = std::fs::remove_dir_all(socket_path.parent().expect("socket parent"));
     }
 
     #[cfg(target_os = "macos")]

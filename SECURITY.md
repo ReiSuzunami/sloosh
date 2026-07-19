@@ -9,6 +9,7 @@ hostile code running under that user account.
 Sloosh handles these security-sensitive assets:
 
 - the vault master password and SSH passwords;
+- the approval PIN verifier, persistent failure count, and lockout state;
 - decrypted vault entries and the derived vault key while leases are active;
 - active lease host scopes and `SLOOSH_LEASE` bearer tokens;
 - authenticated SSH connections, persistent PTY sessions, and port forwards;
@@ -70,12 +71,10 @@ Every verified `UnixChannel::connect` checks both:
 - socket peer executable canonical path equals the current `sloosh`
   executable canonical path.
 
-The CLI refuses a peer that fails either check. Ordinary commands then send
-`Status`, require the exact wire protocol version, send `Hello` for that
-version, and require matching `ProtocolReady` before sending the business
-request. The daemon independently keeps a negotiated flag per connection.
-Before `Hello` succeeds it permits only `Status`, `Hello`, and `Shutdown`;
-ordinary requests fail before request-specific side effects.
+CLI refuses either mismatch. It then negotiates exact protocol version; daemon
+keeps a per-connection gate and rejects ordinary requests before side effects
+until negotiation succeeds. [`protocol.md`](docs/internals/protocol.md#1-version-rule)
+owns exact sequencing and pre-negotiation messages.
 
 This prevents simple socket squatting by a different executable. It is a path
 and process check, not code signing or inode pinning.
@@ -99,6 +98,33 @@ Vault-backed ProxyJump aliases need their own host coverage. Lease approval
 compares the human CLI's expanded `approved_hosts` list with an independent
 daemon-side expansion after unlock. A missing, reordered, stale, or changed
 list fails closed.
+
+The DMG-installed macOS path stores a copy of vault master password in local
+login Keychain. Bundled helper verifies its parent is the daemon helper or
+desktop executable,
+releases password only to that trusted parent over anonymous pipe so daemon can
+expand scope, then native UI confirms exact list. Only after confirmation does
+helper require Touch ID and compare LocalAuthentication biometric domain state
+with enrollment, or collect a 6-digit PIN through a native secure field. Raw
+PIN never enters Svelte, the WebView, Tauri command arguments, logs, or the
+daemon wire protocol. Master Password never enters Svelte, the WebView, Tauri
+command arguments, or logs; vault initialization sends the existing redacted
+`SecretString` over the verified owner-only Unix socket to the daemon, which
+remains the vault authority. Daemon independently verifies the PIN before
+activation. At runtime Sloosh rejects a native helper that is a symlink, has an
+unexpected owner, or is group- or other-writable; the installer separately
+validates the ad-hoc bundle signature.
+Cancellation or helper failure leaves request pending. Unknown SSH
+host keys force terminal approval so fingerprint trust remains human CLI-owned.
+Native success returns no bearer lease token to requester.
+
+The PIN verifier is Argon2id with a random salt and versioned parameters in
+`~/.sloosh/approval-pin.json`. The file is bounded, owner-only, symlink-refused,
+and atomically replaced at mode `0600`. Failed PIN attempts persist across
+process restart: attempts 5, 10, and 14 impose 30-second, 2-minute, and
+10-minute delays; attempt 15 disables PIN until the human re-enables it with
+the Master Password. PIN failures never increment or reset a pending request's
+Master Password attempt budget. Touch ID remains usable while PIN is locked.
 
 Long-lived forwards store an opaque `LeaseGrant` scoped to one host and active
 lease. They do not retain a short-lived creator CLI PID. Real traffic refreshes
@@ -214,6 +240,25 @@ changing ownership.
 These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.
 
+The macOS DMG contains an ad-hoc-signed native installer and a signed
+`Sloosh.app` payload. The installer writes only
+`/Applications/Sloosh.app` and, when available, the
+`~/.local/bin/sloosh` symlink. It rejects a symbolic-link, non-application, or
+unrecognized directory at the app target, validates the payload's ad-hoc code
+signature, stages it on the Applications filesystem, and keeps a
+same-directory backup until replacement succeeds. Before replacing a valid
+existing Sloosh bundle, it sends the fixed pre-handshake `Shutdown` request to
+the private daemon socket without executing the old bundle; the confirmation
+warns that active sessions and forwards end. An unrelated file or link at the
+CLI path is preserved rather than overwritten.
+
+After a successful install, a copied cleanup executable runs outside the disk
+image, ejects only the volume that contained the installer, and moves only the
+`.dmg` path reported for that mount by `hdiutil` to Trash after explicit user
+choice. Ejection or Trash failure leaves the installation intact and is
+reported. The installer has no privileged helper and does not bypass normal
+macOS filesystem permissions, Gatekeeper, or Privacy controls.
+
 ### 4.6 Secret and log handling
 
 The vault uses Argon2id and ChaCha20-Poly1305. A fresh salt and nonce are used
@@ -265,7 +310,7 @@ additional authority after that gate.
 | `Ls`, `ForwardLs` | negotiated connection, no lease | read-only state disclosure to same UID |
 | `ForwardStop` | no lease | only reduces access |
 | `Shutdown` / `daemon stop` | no handshake or lease | operational control; same-UID DoS surface |
-| `RequestLease` | peer PID, no active lease | creates pending request and anchor |
+| `RequestLease` | peer PID, no active lease | creates pending request and anchor; DMG macOS may complete it through Touch ID or PIN and return existing `Ok` |
 | `DescribeLeaseRequest` | no active lease | exposes pending request details |
 | `ApproveLease` | master password, separate ancestry, exact host list | CLI requires TTY; daemon cannot prove TTY from raw protocol |
 | `VaultExists` | no lease | metadata only |
@@ -277,6 +322,15 @@ additional authority after that gate.
 A TTY check is CLI policy, not a server-side protocol credential. A raw same-UID
 client can send the underlying vault requests, but still needs the relevant
 password and state preconditions.
+
+Touch ID and PIN are local helper policy, not proof carried on wire. Security property comes from
+trusted helper checking its parent executable, completing LocalAuthentication,
+matching enrolled biometric domain state or returning a daemon-verified PIN,
+and returning final approval only after exact scope confirmation. Helper is daemon-spawned outside requester
+process tree; pre-approval vault material goes only to trusted daemon and is
+cleared on failure. No
+Developer ID certificate or notarization is assumed. Ad-hoc signing and
+Gatekeeper limits are documented in installation guide.
 
 ## 6. Lease and forward timing
 
@@ -324,6 +378,8 @@ Sloosh does not guarantee protection from hostile same-UID code. Such code may:
 - inherit a lease when injected into or launched under the authorized anchor's
   process tree, or use a stolen `SLOOSH_LEASE` token;
 - replace or inject into a process at the expected canonical executable path;
+- replace bundled native helper or installed app as same UID; ad-hoc signing is
+  integrity structure for packaging, not protection from hostile owner writes;
 - delete, replace, or tamper with owner-writable vault, known_hosts, audit,
   spool, socket, or daemon state;
 - exhaust CPU, memory, descriptors, pending requests, sessions, connections,

@@ -1,0 +1,20 @@
+[package]
+name = "sloosh-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "Sloosh"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = "=2.6.3"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+sloosh = { path = "../.." }
+tauri = "=2.11.5"

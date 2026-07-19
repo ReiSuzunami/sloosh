@@ -4,7 +4,10 @@
 //! daemon and transport layers directly.
 
 pub mod cli;
+pub use cli::client;
 pub mod daemon;
+pub mod local_approval;
+pub mod native_approval;
 pub mod procs;
 pub mod proto;
 pub mod transport;

@@ -481,6 +481,7 @@ pub async fn approve_lease(
         id,
         master_password,
         Some(approved_hosts),
+        true,
     )
     .await
 }
@@ -498,7 +499,76 @@ pub async fn approve_lease_for_chain(
     id: &str,
     master_password: &[u8],
 ) -> Result<LeaseActivatedInfo, LeaseError> {
-    approve_lease_for_chain_checked(approver_chain, id, master_password, None).await
+    approve_lease_for_chain_checked(approver_chain, id, master_password, None, true).await
+}
+
+/// Unlock and resolve exact host scope before native UI asks for final
+/// confirmation. No lease is activated here.
+pub async fn preview_native_approval(
+    id: &str,
+    master_password: &[u8],
+) -> Result<Vec<String>, LeaseError> {
+    let hosts = {
+        let mut st = state().lock().await;
+        prune_expired(&mut st).await;
+        st.pending
+            .get(id)
+            .map(|pending| pending.hosts.clone())
+            .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
+    };
+    if !vault::exists() {
+        return Err(LeaseError::VaultRequired);
+    }
+    match vault::unlock_for_lease(master_password).await {
+        Ok(()) => {
+            let mut st = state().lock().await;
+            prune_expired(&mut st).await;
+            st.pending
+                .get_mut(id)
+                .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
+                .failed_attempts = 0;
+        }
+        Err(VaultError::WrongPassword) => {
+            let mut st = state().lock().await;
+            prune_expired(&mut st).await;
+            let pending = st
+                .pending
+                .get_mut(id)
+                .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?;
+            pending.failed_attempts += 1;
+            if pending.failed_attempts >= MAX_APPROVE_ATTEMPTS {
+                st.pending.remove(id);
+                return Err(LeaseError::TooManyFailedAttempts {
+                    attempts: MAX_APPROVE_ATTEMPTS,
+                });
+            }
+            return Err(LeaseError::WrongPassword {
+                remaining: MAX_APPROVE_ATTEMPTS - pending.failed_attempts,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(ssh::expand_lease_hosts(&hosts).await)
+}
+
+/// Activate after bundled native UI confirms daemon-resolved host scope.
+/// Helper is daemon-spawned, so CLI process-ancestry self-approval check does
+/// not apply; exact scope comparison and every other lease invariant remain.
+pub async fn approve_lease_native(
+    id: &str,
+    master_password: &[u8],
+    approved_hosts: &[String],
+) -> Result<LeaseActivatedInfo, LeaseError> {
+    approve_lease_for_chain_checked(&[], id, master_password, Some(approved_hosts), false).await
+}
+
+/// Drop cache populated only for an unsuccessful native preview. Preserve it
+/// when another active lease still owns cache lifetime.
+pub async fn discard_native_preview() {
+    let should_clear = state().lock().await.active.is_empty();
+    if should_clear {
+        vault::clear_cache().await;
+    }
 }
 
 /// Approval state machine shared by production and the synthetic-ancestry
@@ -510,6 +580,7 @@ async fn approve_lease_for_chain_checked(
     id: &str,
     master_password: &[u8],
     approved_hosts: Option<&[String]>,
+    enforce_self_approval: bool,
 ) -> Result<LeaseActivatedInfo, LeaseError> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
@@ -522,7 +593,7 @@ async fn approve_lease_for_chain_checked(
     // `approve` is a descendant of (or is) the very process this request is
     // anchored to, the "out-of-band human" property is violated — a
     // prompt-injected agent driving `approve` itself would land here.
-    if chain_contains_anchor(&pending.anchor, approver_chain) {
+    if enforce_self_approval && chain_contains_anchor(&pending.anchor, approver_chain) {
         return Err(LeaseError::SelfApproval {
             id: id.to_string(),
             anchor_pid: pending.anchor.pid,
@@ -1333,6 +1404,7 @@ mod tests {
             &info.id,
             b"pw",
             Some(&stale_approval),
+            true,
         )
         .await
         .unwrap_err();
@@ -1364,10 +1436,15 @@ mod tests {
         .await
         .unwrap();
 
-        let err =
-            approve_lease_for_chain_checked(&approver_chain(), &info.id, b"pw", Some(&preview))
-                .await
-                .unwrap_err();
+        let err = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&preview),
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LeaseError::ApprovedHostsMismatch { .. }),
             "{err}"
@@ -1392,6 +1469,7 @@ mod tests {
             &info.id,
             b"pw",
             Some(&exact_approval),
+            true,
         )
         .await
         .unwrap();
@@ -1503,6 +1581,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LeaseError::NoSuchRequest(_)), "{err}");
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_preview_then_activation_preserves_scope_and_authority() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(950, 110, Some("sloosh")),
+            ancestor(949, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"correct");
+
+        let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+        assert_eq!(preview, vec!["web".to_string()]);
+        let activated = approve_lease_native(&info.id, b"correct", &preview)
+            .await
+            .unwrap();
+        assert_eq!(activated.hosts, preview);
+        assert!(check_authorized_for_chain(&chain, "web", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_preview_wrong_password_counts_toward_attempt_limit() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(960, 110, Some("sloosh")),
+            ancestor(959, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) = request_lease_for_chain(chain, vec!["web".to_string()])
+            .await
+            .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"correct");
+
+        let err = preview_native_approval(&info.id, b"stale-keychain-password")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LeaseError::WrongPassword { remaining }
+                    if remaining == MAX_APPROVE_ATTEMPTS - 1
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            state()
+                .lock()
+                .await
+                .pending
+                .get(&info.id)
+                .expect("request remains pending")
+                .failed_attempts,
+            1
+        );
 
         reset_state().await;
     }

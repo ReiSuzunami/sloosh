@@ -42,11 +42,12 @@ git push origin "v$version"
 - `x86_64-apple-darwin` on an Intel runner;
 - `x86_64-unknown-linux-musl` on an x86_64 Linux runner.
 
-It combines the two native macOS slices into one ad-hoc-signed universal
-binary, packages both platforms, generates `SHA256SUMS`, records GitHub build
-provenance attestations for a public repository, and creates the GitHub
-Release. No publishing secret is required; GitHub's scoped workflow token
-creates the release.
+It combines CLI and Tauri desktop slices into two universal binaries, ad-hoc
+signs both binaries, the payload app, and native installer, and publishes both a CLI tarball
+and a one-click installer DMG. It packages Linux, generates `SHA256SUMS`,
+records GitHub build provenance attestations for a public repository, and
+creates the GitHub Release. No publishing secret is required; GitHub's scoped
+workflow token creates the release.
 
 After the workflow succeeds:
 
@@ -56,14 +57,40 @@ cd /tmp/sloosh-release
 sha256sum -c SHA256SUMS
 ```
 
-For a public repository, also verify both archives with
-`gh attestation verify <archive> --repo ReiSuzunami/sloosh`. Private repository
+For a public repository, also verify every archive and the DMG with
+`gh attestation verify <asset> --repo ReiSuzunami/sloosh`. Private repository
 attestation availability depends on the GitHub plan, so the workflow does not
 make private releases depend on it.
 
-Extract both archives and run `sloosh --version`. On macOS, also verify
-`lipo -archs` reports `x86_64 arm64`. Do not describe the macOS artifact as
-notarized until Developer ID signing and Apple notarization are configured.
+Extract both archives and run `sloosh --version`. On macOS, also verify the DMG
+and its app bundle:
+
+```sh
+dmg="Sloosh-$version-macos-universal.dmg"
+hdiutil verify "$dmg"
+mount_dir="$(mktemp -d)"
+hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "$dmg"
+installer="$mount_dir/Install Sloosh.app"
+payload="$installer/Contents/Helpers/Sloosh.app"
+codesign --verify --deep --strict "$installer"
+codesign --verify --deep --strict "$payload"
+test -s "$mount_dir/.DS_Store"
+test -s "$mount_dir/.background/background.png"
+lipo -archs "$installer/Contents/MacOS/install-sloosh"
+lipo -archs "$payload/Contents/MacOS/Sloosh"
+lipo -archs "$payload/Contents/Helpers/sloosh"
+"$payload/Contents/Helpers/sloosh" --version
+hdiutil detach "$mount_dir"
+rmdir "$mount_dir"
+```
+
+Both architecture checks must report `x86_64 arm64` in either order. Opening
+the DMG must show one large, centered `Install Sloosh` app. The package script
+also installs the payload twice in a temporary sandbox, verifies the CLI link
+and conflict-preservation behavior, and exercises the cleanup helper's volume
+ejection handoff. The payload must contain an independent GUI executable and
+CLI/daemon helper; the installed CLI link points to the latter. Do not describe the macOS artifact as notarized
+until Developer ID signing and Apple notarization are configured.
 
 ## crates.io
 

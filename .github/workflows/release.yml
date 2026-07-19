@@ -67,6 +67,12 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --locked
 
+      - name: Check desktop frontend
+        run: |
+          corepack enable
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui check
+
       - name: Check MSRV
         run: cargo +1.85.0 check --all-targets --all-features --locked
 
@@ -96,17 +102,30 @@ jobs:
         run: cargo test --all-targets --all-features --locked --target aarch64-apple-darwin
 
       - name: Build release slice
-        run: cargo build --release --locked --target aarch64-apple-darwin
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          corepack enable
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui build
+          cargo build --manifest-path gui/src-tauri/Cargo.toml \
+            --release --locked --features custom-protocol \
+            --target aarch64-apple-darwin
+          cargo test --manifest-path gui/src-tauri/Cargo.toml \
+            --locked --target aarch64-apple-darwin
 
       - name: Smoke test
         run: |
           test "$(target/aarch64-apple-darwin/release/sloosh --version)" = \
             "sloosh ${{ needs.preflight.outputs.version }}"
+          mkdir -p artifacts
+          cp target/aarch64-apple-darwin/release/sloosh artifacts/sloosh-cli
+          cp gui/src-tauri/target/aarch64-apple-darwin/release/Sloosh \
+            artifacts/sloosh-gui
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-arm64-slice
-          path: target/aarch64-apple-darwin/release/sloosh
+          path: artifacts
           if-no-files-found: error
           retention-days: 1
 
@@ -130,17 +149,30 @@ jobs:
         run: cargo test --all-targets --all-features --locked --target x86_64-apple-darwin
 
       - name: Build release slice
-        run: cargo build --release --locked --target x86_64-apple-darwin
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin
+          corepack enable
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui build
+          cargo build --manifest-path gui/src-tauri/Cargo.toml \
+            --release --locked --features custom-protocol \
+            --target x86_64-apple-darwin
+          cargo test --manifest-path gui/src-tauri/Cargo.toml \
+            --locked --target x86_64-apple-darwin
 
       - name: Smoke test
         run: |
           test "$(target/x86_64-apple-darwin/release/sloosh --version)" = \
             "sloosh ${{ needs.preflight.outputs.version }}"
+          mkdir -p artifacts
+          cp target/x86_64-apple-darwin/release/sloosh artifacts/sloosh-cli
+          cp gui/src-tauri/target/x86_64-apple-darwin/release/Sloosh \
+            artifacts/sloosh-gui
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-x86_64-slice
-          path: target/x86_64-apple-darwin/release/sloosh
+          path: artifacts
           if-no-files-found: error
           retention-days: 1
 
@@ -230,9 +262,12 @@ jobs:
           version="${{ needs.preflight.outputs.version }}"
           package="sloosh-$version-macos-universal"
           mkdir -p "dist/root/$package"
-          lipo -create slices/arm64/sloosh slices/x86_64/sloosh \
+          lipo -create slices/arm64/sloosh-cli slices/x86_64/sloosh-cli \
             -output "dist/root/$package/sloosh"
+          lipo -create slices/arm64/sloosh-gui slices/x86_64/sloosh-gui \
+            -output dist/sloosh-gui
           chmod 0755 "dist/root/$package/sloosh"
+          chmod 0755 dist/sloosh-gui
           codesign --force --sign - --timestamp=none "dist/root/$package/sloosh"
           codesign --verify --strict "dist/root/$package/sloosh"
           archs="$(lipo -archs "dist/root/$package/sloosh")"
@@ -242,11 +277,18 @@ jobs:
           install -m 0644 README.md LICENSE-APACHE LICENSE-MIT \
             "dist/root/$package/"
           tar -C dist/root -czf dist/sloosh-macos-universal.tar.gz "$package"
+          scripts/package-macos.sh \
+            "$version" \
+            "dist/root/$package/sloosh" \
+            dist/sloosh-gui \
+            dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-macos-universal
-          path: dist/sloosh-macos-universal.tar.gz
+          path: |
+            dist/sloosh-macos-universal.tar.gz
+            dist/Sloosh-*-macos-universal.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -269,7 +311,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: sha256sum *.tar.gz *.dmg > SHA256SUMS
 
       - name: Attest release assets
         if: github.event.repository.visibility == 'public'
@@ -277,6 +319,7 @@ jobs:
         with:
           subject-path: |
             dist/*.tar.gz
+            dist/*.dmg
             dist/SHA256SUMS
 
       - name: Create or refresh release

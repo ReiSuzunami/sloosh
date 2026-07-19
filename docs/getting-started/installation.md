@@ -11,14 +11,35 @@ secondary source-install channel for Rust users and always compiles locally.
 Download these files from the
 [latest release](https://github.com/ReiSuzunami/sloosh/releases/latest):
 
-| Platform | Archive |
+| Platform | File |
 |---|---|
-| macOS 11 or newer, Apple silicon or Intel | `sloosh-macos-universal.tar.gz` |
+| macOS 11 or newer, Apple silicon or Intel | `Sloosh-<version>-macos-universal.dmg` or `sloosh-macos-universal.tar.gz` |
 | Linux x86_64 with readable procfs | `sloosh-linux-x86_64-musl.tar.gz` |
 
-Download `SHA256SUMS` from the same release and verify the selected archive.
+Download `SHA256SUMS` from the same release and verify the selected file.
 
-macOS:
+macOS DMG:
+
+```sh
+version=0.1.0
+dmg="Sloosh-$version-macos-universal.dmg"
+grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
+open "$dmg"
+```
+
+Double-click `Install Sloosh`, review the confirmation, and choose Install. The
+installer copies `Sloosh.app` to Applications and creates
+`~/.local/bin/sloosh` when that path is available. It then ejects the disk
+image and asks whether to move the downloaded DMG to Trash. If the CLI path
+already contains an unrelated file or link, the installer preserves it and
+reports that the link was not changed.
+
+The app bundle contains a Tauri desktop executable at `Contents/MacOS/Sloosh`
+and the complete CLI/daemon at `Contents/Helpers/sloosh`. Keep the CLI link
+pointed at that helper instead of copying it out; desktop and CLI clients both
+verify that the daemon is the bundled helper executable.
+
+macOS archive alternative:
 
 ```sh
 grep '  sloosh-macos-universal.tar.gz$' SHA256SUMS | shasum -a 256 -c -
@@ -42,8 +63,11 @@ Add `$HOME/.local/bin` to `PATH` if needed, then verify the installation:
 sloosh --version
 ```
 
-The macOS binary is ad-hoc signed but is not currently Developer ID signed or
-notarized. Verify its checksum before approving any operating-system prompt.
+The macOS installer, app, and binaries are ad-hoc signed but are not currently
+Developer ID signed or notarized. On first use, macOS may block the installer.
+After verifying the checksum, double-click `Install Sloosh`, open System
+Settings > Privacy & Security, choose Open Anyway for Install Sloosh, then
+retry. This manual approval is expected for the unnotarized community build.
 
 The Linux binary is statically linked against musl for distribution across
 common Linux distributions. Sloosh still requires procfs at runtime for peer
@@ -59,9 +83,22 @@ sloosh init
 ```
 
 This human-only command first installs the Agent Skill embedded in the current
-binary, then creates the credential vault. It is safe to rerun: an existing
-vault is left alone. The two steps are not a transaction, so a Skill installed
-before a vault or daemon error remains installed and the command can be retried.
+binary, then creates the credential vault. A DMG installation also enrolls the
+vault password in local login Keychain, gated by Touch ID and biometric
+enrollment-state comparison. If the vault
+already exists, rerunning `sloosh init` asks for its password once and enables
+Touch ID. Source builds and the standalone CLI archive have no native helper
+and keep terminal approval behavior.
+
+Setup is safe to rerun: an existing vault is left alone. The steps are not a
+transaction, so a Skill installed before a vault, daemon, or Touch ID error
+remains installed and the command can be retried. Changing enrolled fingerprints
+invalidates the Keychain item; rerun `sloosh init` to enroll again.
+
+The DMG app exposes the same setup as focused native actions: Setup installs the
+embedded Skill and initializes the vault; Security enables Touch ID or an
+optional 6-digit PIN. Master Password and PIN entry stay in the bundled native
+helper and never enter the WebView. A device without Touch ID can use PIN.
 
 By default, `--agent auto` installs for every detected agent. It uses these
 locations:
@@ -101,9 +138,20 @@ sloosh --version
 sloosh skill install
 ```
 
+For a DMG installation, open the new DMG and run `Install Sloosh`. When
+replacing an existing valid installation, it stops the old daemon before the
+staged replacement and leaves a matching CLI link in place. The confirmation
+warns that stopping the daemon ends active sessions and forwards.
+
 This order also avoids the old daemon continuing from a replaced executable on
 Linux, where the new CLI correctly refuses an unverifiable `/proc/<pid>/exe`
 peer.
+
+If an in-place replacement already left the old Linux daemon shown as
+`(deleted)` and CLI refuses its socket, locate it with
+`pgrep -u "$(id -u)" -af 'sloosh daemon run'`. Confirm the process, run
+`kill <pid>`, then retry; CLI will remove the stale socket and start the new
+binary.
 
 ## Install from crates.io
 
@@ -117,12 +165,5 @@ cargo install sloosh --locked
 The installed binary normally lands in `$HOME/.cargo/bin`. crates.io is useful
 for Rust developers, but it is not the no-build installation path.
 
-## Build from a checkout
-
-```sh
-git clone https://github.com/ReiSuzunami/sloosh
-cd sloosh
-cargo build --release --locked
-```
-
-The binary is `target/release/sloosh`.
+For a repository checkout, follow the concise
+[source-build steps in the README](../../README.md#build-from-source).

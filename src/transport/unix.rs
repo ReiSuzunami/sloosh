@@ -115,16 +115,27 @@ impl UnixChannel {
     /// Connect to the daemon's socket and verify that the server is this
     /// user's current sloosh executable.
     pub async fn connect(path: &Path) -> io::Result<Self> {
+        let expected_exe = std::env::current_exe()?;
+        Self::connect_verified(path, &expected_exe).await
+    }
+
+    /// Connect to a daemon running from an explicitly selected executable.
+    /// GUI bundles use this to authenticate the CLI sidecar instead of the
+    /// Tauri executable that initiated the connection.
+    pub async fn connect_verified(path: &Path, expected_exe: &Path) -> io::Result<Self> {
         let channel = Self::connect_unverified(path).await?;
-        channel.verify_peer_identity().map_err(|source| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing untrusted sloosh daemon at {}: {source}",
-                    path.display()
-                ),
-            )
-        })?;
+        let expected_exe = std::fs::canonicalize(expected_exe)?;
+        channel
+            .verify_peer_identity_against(effective_uid(), &expected_exe)
+            .map_err(|source| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing untrusted sloosh daemon at {}: {source}",
+                        path.display()
+                    ),
+                )
+            })?;
         Ok(channel)
     }
 
@@ -135,11 +146,6 @@ impl UnixChannel {
     pub async fn connect_unverified(path: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(path).await?;
         Ok(Self::from_stream(stream))
-    }
-
-    fn verify_peer_identity(&self) -> io::Result<()> {
-        let expected_exe = std::fs::canonicalize(std::env::current_exe()?)?;
-        self.verify_peer_identity_against(effective_uid(), &expected_exe)
     }
 
     fn verify_peer_identity_against(
@@ -966,6 +972,29 @@ mod tests {
                 "private directory must not retain an extended ACL"
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_executable_connect_accepts_selected_daemon() {
+        let dir = std::env::temp_dir().join(format!(
+            "sloosh-peer-selected-exe-test-{}",
+            std::process::id()
+        ));
+        ensure_private_dir(&dir).expect("create private socket parent");
+        let sock = dir.join("sloosh.sock");
+        let BindOutcome::Bound(listener) = bind(&sock).expect("bind") else {
+            panic!("expected Bound")
+        };
+        let server = tokio::spawn(async move { listener.accept().await.expect("accept") });
+        let expected_exe = std::env::current_exe().expect("current executable");
+
+        let client = UnixChannel::connect_verified(&sock, &expected_exe)
+            .await
+            .expect("selected daemon executable should be trusted");
+
+        drop(client);
+        drop(server.await.expect("server task"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

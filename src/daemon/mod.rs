@@ -42,6 +42,7 @@ pub mod session;
 pub mod ssh;
 pub mod vault;
 
+use crate::native_approval;
 use crate::proto::{self, Request, Response};
 use crate::transport::unix;
 use crate::transport::{BindOutcome, Channel, MAX_RAW_FRAME_BYTES};
@@ -568,7 +569,30 @@ async fn handle_connection(
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
                             lease::RequestOutcome::Pending(info) => {
-                                Response::LeaseRequestPending(info)
+                                if info.vault_exists {
+                                    match native_approval::try_approve(&info).await {
+                                        Ok(activated) => {
+                                            audit::record(
+                                                "lease_approved_native",
+                                                serde_json::json!({
+                                                    "hosts": activated.hosts,
+                                                    "anchor_name": activated.anchor_name,
+                                                    "anchor_pid": activated.anchor_pid,
+                                                }),
+                                            );
+                                            // Native approval occurs on requesting
+                                            // connection. Return existing idempotent success
+                                            // shape, never bearer escape-hatch token.
+                                            Response::Ok
+                                        }
+                                        Err(error) => {
+                                            debug!(%error, request_id = %info.id, "native approval unavailable; keeping request pending");
+                                            Response::LeaseRequestPending(info)
+                                        }
+                                    }
+                                } else {
+                                    Response::LeaseRequestPending(info)
+                                }
                             }
                         }
                     }

@@ -54,8 +54,10 @@ sloosh status                                # daemon/lease/session overview —
 
 ## Fixed behavior rules
 
-- After `sloosh request <host>`, show the printed approval command to your
-  user and **stop and wait** — do not poll in a loop or re-request.
+- After `sloosh request <host>`, continue when it prints `authorized`. On a
+  pending fallback, show the printed approval command to your user and **stop
+  and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
+  Touch ID or an approval PIN may complete the request without another terminal.
 - If `run` returns `running` (it hit its timeout but the command is still
   going), use `sloosh peek <host>` to follow up incrementally — do not
   re-run the command.
@@ -68,13 +70,8 @@ sloosh status                                # daemon/lease/session overview —
   initialize the vault, or grant itself new authority.
 - Sessions keep their working directory and environment between calls; you
   don't need to `cd` back into place or re-`export` things every time.
-- `put`/`get` stream files in frames of at most 1 MiB with no total-size cap.
-  Command-output spool limits do not apply to SFTP, and the dependency's short
-  request timeout is raised to a far-future deadline. `put` truncates an
-  existing remote destination; check the remote path before starting it.
-- A file transfer is lease-authorized before streaming starts. Once started,
-  that finite transfer may finish even if the lease expires; lease expiry
-  still blocks new operations.
+- `put` truncates an existing remote destination; check the path first. A
+  transfer authorized before lease expiry may finish, but new operations fail.
 - `get` refuses to overwrite an existing local file. Use `--force` only when
   replacing that file is explicitly intended; completed downloads are
   committed atomically.
