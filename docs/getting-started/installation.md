@@ -50,6 +50,45 @@ common Linux distributions. Sloosh still requires procfs at runtime for peer
 executable and process-ancestry checks; a static binary does not remove that
 requirement. Other Linux architectures currently require a source build.
 
+## First-time setup
+
+Run the combined setup from your own terminal:
+
+```sh
+sloosh init
+```
+
+This human-only command first installs the Agent Skill embedded in the current
+binary, then creates the credential vault. It is safe to rerun: an existing
+vault is left alone. The two steps are not a transaction, so a Skill installed
+before a vault or daemon error remains installed and the command can be retried.
+
+By default, `--agent auto` installs for every detected agent. It uses these
+locations:
+
+| Agent | Skill directory |
+|---|---|
+| Codex and Agent Skills-compatible readers | `~/.agents/skills/sloosh` |
+| Claude Code | `~/.claude/skills/sloosh` |
+
+Detection treats either `~/.agents` or `~/.codex` as Codex and `~/.claude` as
+Claude Code. If no agent is detected, it uses the portable Codex-compatible
+path. Select explicitly with `--agent codex`, `--agent claude`, or
+`--agent all`.
+
+The standalone commands do not start the daemon or access the vault:
+
+```sh
+sloosh skill install --agent auto
+sloosh skill status --agent auto
+```
+
+An unchanged Skill previously installed by sloosh upgrades with the binary.
+An externally managed or locally modified Skill is preserved. Use `--force`
+with `skill install`, or `--force-skill` with `init`, only when replacing it is
+intentional. Sloosh never invokes `npx` or an agent marketplace; those remain
+optional Skill distribution channels.
+
 ## Upgrade
 
 Stop the running daemon before replacing the executable. Active sessions,
@@ -59,6 +98,7 @@ forwards, pending requests, and leases are in-memory and will be lost.
 sloosh daemon stop
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
 sloosh --version
+sloosh skill install
 ```
 
 This order also avoids the old daemon continuing from a replaced executable on

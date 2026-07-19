@@ -3,12 +3,14 @@
 
 mod args;
 mod client;
+mod skill;
 
 pub use args::Cli;
 use args::{
     AddArgs, ApproveArgs, Command, DaemonAction, ForwardAction, ForwardLsArgs, ForwardOpenArgs,
-    ForwardStopArgs, GetArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs, PeekArgs,
-    PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
+    ForwardStopArgs, GetArgs, InitArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs,
+    PeekArgs, PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, SkillAction, SkillAgent,
+    SkillInstallArgs, SkillStatusArgs, StatusArgs, VaultAction,
 };
 
 use crate::daemon::audit;
@@ -30,6 +32,8 @@ use zeroize::Zeroizing;
 /// exit non-zero; nothing in here panics or uses `todo!()`.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Command::Init(args) => cmd_init(args).await,
+        Command::Skill(args) => cmd_skill(args.action),
         Command::Status(args) => cmd_status(args).await,
         Command::Daemon(args) => cmd_daemon(args.action).await,
 
@@ -524,7 +528,10 @@ fn display_host_list(hosts: &[String]) -> String {
 
 async fn cmd_vault_init() -> anyhow::Result<()> {
     require_tty("vault init")?;
+    cmd_vault_init_inner().await
+}
 
+async fn cmd_vault_init_inner() -> anyhow::Result<()> {
     let vault_exists_resp =
         bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
     let Response::VaultExists { exists } = vault_exists_resp else {
@@ -546,6 +553,83 @@ async fn cmd_vault_init() -> anyhow::Result<()> {
          credentials (`sloosh add <alias> --hostname <host>`)."
     );
     Ok(())
+}
+
+async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
+    require_tty("init")?;
+    cmd_skill_install(SkillInstallArgs {
+        agent: args.agent,
+        force: args.force_skill,
+    })?;
+    cmd_vault_init_inner().await
+}
+
+fn cmd_skill(action: SkillAction) -> anyhow::Result<()> {
+    match action {
+        SkillAction::Install(args) => cmd_skill_install(args),
+        SkillAction::Status(args) => cmd_skill_status(args),
+    }
+}
+
+fn cmd_skill_install(args: SkillInstallArgs) -> anyhow::Result<()> {
+    for target in skill_targets(args.agent)? {
+        let outcome = skill::install_target(&target, args.force)?;
+        let path = target.directory.display();
+        match outcome {
+            skill::InstallOutcome::Installed => {
+                println!("installed sloosh Skill for {} at {path}", target.agent);
+            }
+            skill::InstallOutcome::Current => {
+                println!("sloosh Skill for {} is current at {path}", target.agent);
+            }
+            skill::InstallOutcome::CurrentExternal => {
+                println!(
+                    "externally managed Skill for {} already matches this sloosh version at {path}",
+                    target.agent
+                );
+            }
+            skill::InstallOutcome::Updated => {
+                println!("updated sloosh Skill for {} at {path}", target.agent);
+            }
+            skill::InstallOutcome::PreservedExternal => {
+                println!(
+                    "kept externally managed Skill for {} at {path}; use --force to replace it",
+                    target.agent
+                );
+            }
+            skill::InstallOutcome::PreservedModified => {
+                println!(
+                    "kept locally modified sloosh Skill for {} at {path}; use --force to replace it",
+                    target.agent
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_skill_status(args: SkillStatusArgs) -> anyhow::Result<()> {
+    for target in skill_targets(args.agent)? {
+        let state = match skill::inspect_target(&target)? {
+            skill::SkillStatus::Missing => "missing",
+            skill::SkillStatus::CurrentManaged => "current (managed by sloosh)",
+            skill::SkillStatus::CurrentExternal => "current (externally managed)",
+            skill::SkillStatus::UpgradeAvailable => "upgrade available",
+            skill::SkillStatus::Modified => "locally modified",
+            skill::SkillStatus::External => "externally managed",
+        };
+        println!("{}: {state} ({})", target.agent, target.directory.display());
+    }
+    Ok(())
+}
+
+fn skill_targets(agent: SkillAgent) -> anyhow::Result<Vec<skill::SkillTarget>> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("HOME is not set; cannot locate the Agent Skill directory")
+        })?;
+    skill::resolve_targets_from_home(Path::new(&home), agent)
 }
 
 /// Prompt for the master password: a single prompt if a vault already

@@ -1,7 +1,7 @@
 //! Clap argument definitions for the implemented command surface
 //! (docs/internals/architecture.md). Keep this help aligned with enforced security limits.
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +19,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Set up the Agent Skill and credential vault (interactive, human-only).
+    Init(InitArgs),
+    /// Install or inspect the embedded sloosh Agent Skill.
+    Skill(SkillArgs),
     /// Run a command in a host's default (or named) session, blocking until it finishes or times out.
     Run(RunArgs),
     /// Fetch output a session has produced since the last peek.
@@ -196,6 +200,59 @@ pub enum VaultAction {
     Init,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SkillAgent {
+    /// Detect installed agents; default to the portable Codex-compatible path.
+    Auto,
+    /// Install under ~/.agents/skills for Codex and other Agent Skills readers.
+    Codex,
+    /// Install under ~/.claude/skills for Claude Code.
+    Claude,
+    /// Install for both Codex-compatible agents and Claude Code.
+    All,
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Agent installation to configure.
+    #[arg(long, value_enum, default_value_t = SkillAgent::Auto)]
+    pub agent: SkillAgent,
+    /// Replace an externally managed or locally modified Skill.
+    #[arg(long = "force-skill")]
+    pub force_skill: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub action: SkillAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillAction {
+    /// Install or update the Skill embedded in this sloosh binary.
+    Install(SkillInstallArgs),
+    /// Report the installed Skill's source and update state.
+    Status(SkillStatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Agent installation to configure.
+    #[arg(long, value_enum, default_value_t = SkillAgent::Auto)]
+    pub agent: SkillAgent,
+    /// Replace an externally managed or locally modified Skill.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillStatusArgs {
+    /// Agent installation to inspect.
+    #[arg(long, value_enum, default_value_t = SkillAgent::Auto)]
+    pub agent: SkillAgent,
+}
+
 #[derive(Debug, Args)]
 #[command(
     long_about = "Upload a local file to a host over SFTP, reusing the session's existing SSH \
@@ -366,5 +423,32 @@ mod tests {
             ),
             "{help}"
         );
+    }
+
+    #[test]
+    fn onboarding_help_exposes_agents_and_force_boundaries() {
+        let mut command = Cli::command();
+        let init_help = command
+            .find_subcommand_mut("init")
+            .expect("init subcommand")
+            .render_help()
+            .to_string();
+        assert!(init_help.contains("--agent <AGENT>"), "{init_help}");
+        assert!(init_help.contains("--force-skill"), "{init_help}");
+
+        let skill = command
+            .find_subcommand_mut("skill")
+            .expect("skill subcommand");
+        let install_help = skill
+            .find_subcommand_mut("install")
+            .expect("skill install subcommand")
+            .render_help()
+            .to_string();
+        assert!(install_help.contains("--agent <AGENT>"), "{install_help}");
+        assert!(install_help.contains("auto"), "{install_help}");
+        assert!(install_help.contains("codex"), "{install_help}");
+        assert!(install_help.contains("claude"), "{install_help}");
+        assert!(install_help.contains("all"), "{install_help}");
+        assert!(install_help.contains("--force"), "{install_help}");
     }
 }

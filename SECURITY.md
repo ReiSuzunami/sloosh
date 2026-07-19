@@ -14,6 +14,7 @@ Sloosh handles these security-sensitive assets:
 - authenticated SSH connections, persistent PTY sessions, and port forwards;
 - local upload/download contents and remote SFTP contents;
 - trusted SSH host keys;
+- Agent instruction integrity under the configured Skill directories;
 - local state under `~/.sloosh`, including vault, socket, daemon log, audit log,
   known_hosts, and spool output.
 
@@ -48,6 +49,8 @@ The design reduces risk from:
 - a stale or malicious socket endpoint impersonating the daemon at a different
   executable path;
 - an agent asking the daemon to open an arbitrary local path during SFTP;
+- a local path or symlink redirecting Agent Skill installation outside its
+  selected directory;
 - unbounded single-message, single-frame, or per-session spool allocation;
 - accidental exposure of a local forward beyond loopback, or an unintended
   remote listener;
@@ -189,6 +192,24 @@ Specific files use these controls:
 - sloosh known_hosts: set to `0600` after recording;
 - local download temp: random `create_new` file requested at `0666`, reduced by
   the caller's umask in the destination directory, then atomic commit.
+
+Agent Skill installation is a CLI-only operation and never contacts the daemon
+or reads the vault. Targets are fixed beneath the current `HOME`:
+`~/.agents/skills/sloosh` for Codex-compatible readers and
+`~/.claude/skills/sloosh` for Claude Code. Each path component is opened
+relative to an already-open directory descriptor with
+`O_DIRECTORY | O_NOFOLLOW`; missing components are created at `0755` and then
+opened the same way. Directories and files must belong to the effective UID and
+must not be group- or other-writable. Skill and marker reads are bounded to 1
+MiB. Writes use a same-directory random `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`
+file at `0644`, fsync, and a descriptor-relative atomic commit.
+
+The adjacent `.sloosh-managed.json` marker records the embedded Skill hash.
+Sloosh automatically replaces only an unchanged, previously managed Skill.
+Externally managed, malformed-marker, or locally modified content is preserved
+unless the human explicitly uses `--force` or `--force-skill`. A Skill already
+matching the embedded content remains externally managed rather than silently
+changing ownership.
 
 These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.

@@ -66,6 +66,8 @@ sloosh run myhost "npm test"  # 获批后在持久 shell 中执行命令
 
 | 命令 | 用途 |
 |---|---|
+| `init` | 在人类终端中安装 Agent Skill 并初始化 vault。 |
+| `skill` | 不启动 daemon，安装或检查内嵌 Agent Skill。 |
 | `run` | 在主机默认或指定 session 中运行命令，等待完成或超时。 |
 | `peek` | 读取 session 自上次 peek 后产生的输出。 |
 | `send` | 向 session PTY 发送原始按键，例如回答交互式提示。 |
@@ -116,6 +118,17 @@ npx skills add ReiSuzunami/sloosh
 cp -r skills/sloosh ~/.claude/skills/sloosh # Claude Code
 cp -r skills/sloosh ~/.agents/skills/sloosh # Codex 及其它读取 .agents/skills 的 Agent
 ```
+
+Skill-first 路径会检查 `sloosh`、说明官方安装方式，并在建议安装二进制前先征得同意。
+如果先安装了二进制，请在人类自己的终端中运行组合初始化：
+
+```sh
+sloosh init
+```
+
+`sloosh init` 会安装或校验二进制内嵌的 Skill，再创建 vault。它自动检测 Codex 与
+Claude Code；可用 `sloosh skill status` 检查结果。二进制本身不会调用 `npx` 或任何
+Agent marketplace。
 
 ## 文档
 

@@ -74,6 +74,8 @@ reference on any of them.
 
 | Command | Description |
 |---|---|
+| `init` | Install the Agent Skill and initialize the vault in a human terminal. |
+| `skill` | Install or inspect the embedded Agent Skill without starting the daemon. |
 | `run` | Run a command in a host's default (or named) session, blocking until it finishes or times out. |
 | `peek` | Fetch output a session has produced since the last peek. |
 | `send` | Send raw keystrokes to a session's PTY (e.g. to answer an interactive prompt). |
@@ -130,6 +132,19 @@ npx skills add ReiSuzunami/sloosh
 cp -r skills/sloosh ~/.claude/skills/sloosh   # Claude Code
 cp -r skills/sloosh ~/.agents/skills/sloosh   # Codex (and other .agents/skills readers)
 ```
+
+The Skill-first path checks for `sloosh`, explains the official install, and
+asks before proposing any binary installation. If the binary is installed
+first, run the combined setup yourself in a human terminal:
+
+```sh
+sloosh init
+```
+
+`sloosh init` installs/verifies the Skill embedded in the binary, then creates
+the vault. It auto-detects Codex and Claude Code; use
+`sloosh skill status` to inspect the result. The binary never invokes `npx` or
+an agent marketplace itself.
 
 ## Documentation
 

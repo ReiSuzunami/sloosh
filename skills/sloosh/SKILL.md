@@ -10,6 +10,25 @@ daemon. It fixes two things plain `ssh`/subprocess calls don't: your shell
 state (cwd, env vars, background jobs) survives across calls, and you never
 touch a password or key — a human approves access to each host out of band.
 
+## Bootstrap
+
+Before the first SSH task, check whether the binary is available:
+
+```sh
+command -v sloosh && sloosh --version
+```
+
+If it is missing or too old to provide `sloosh init` and `sloosh skill`, explain
+the official release option for the user's OS and ask before installing
+anything. Prefer the verified GitHub Release described in the repository's
+installation guide. Do not use `curl | sh`, request credentials, bypass
+Gatekeeper/SmartScreen, or silently invoke a package manager.
+
+Once the binary is available, ask the user to run `sloosh init` themselves in
+their own terminal, then stop and wait. Never run it for them, fake a TTY, or
+enter a vault password. After they confirm completion, you may run
+`sloosh skill status` and `sloosh status` to verify Skill and daemon state.
+
 ## Mental model
 
 A `sloosh` session is a persistent remote shell, not a one-shot command —
@@ -29,6 +48,7 @@ sloosh put myhost ./build.tar.gz /srv/app/   # upload a local file over the same
 sloosh get myhost /var/log/app.log ./log.txt # download a remote file
 sloosh forward myhost -L 8080:127.0.0.1:80  # loopback-only local tunnel
 sloosh forward myhost -R 9000:127.0.0.1:3000 # remote listener to a local service
+sloosh skill status                          # Agent Skill install/update state
 sloosh status                                # daemon/lease/session overview — run this when lost
 ```
 
@@ -43,6 +63,9 @@ sloosh status                                # daemon/lease/session overview —
   (`sloosh add`) is something the user does themselves, interactively, in
   their own terminal. If a host isn't set up yet, tell them to run
   `sloosh add` and wait.
+- `sloosh init`, `sloosh approve`, and credential enrollment are human-only.
+  Never work around their TTY checks. The Agent Skill cannot approve leases,
+  initialize the vault, or grant itself new authority.
 - Sessions keep their working directory and environment between calls; you
   don't need to `cd` back into place or re-`export` things every time.
 - `put`/`get` stream files in frames of at most 1 MiB with no total-size cap.

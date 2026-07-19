@@ -47,6 +47,41 @@ Linux 二进制通过 musl 静态链接，以兼容常见 Linux 发行版。但 
 验证 peer executable 和进程 ancestry；静态链接不会消除这项运行时要求。其它 Linux
 架构目前需要源码构建。
 
+## 首次设置
+
+在人类自己的终端中运行组合初始化：
+
+```sh
+sloosh init
+```
+
+这个仅限人类交互的命令会先安装当前二进制内嵌的 Agent Skill，再创建凭据 vault。重复运行
+是安全的，已有 vault 不会改变。两个步骤不是事务：如果 vault 或 daemon 随后报错，已经安装
+的 Skill 会保留，修复问题后可直接重试。
+
+默认的 `--agent auto` 会为检测到的所有 Agent 安装，路径如下：
+
+| Agent | Skill 目录 |
+|---|---|
+| Codex 与兼容 Agent Skills 的读取器 | `~/.agents/skills/sloosh` |
+| Claude Code | `~/.claude/skills/sloosh` |
+
+存在 `~/.agents` 或 `~/.codex` 时视为 Codex，存在 `~/.claude` 时视为 Claude Code。
+如果没有检测到 Agent，则使用兼容 Codex 的通用路径。也可通过 `--agent codex`、
+`--agent claude` 或 `--agent all` 明确选择。
+
+以下独立命令不会启动 daemon，也不会访问 vault：
+
+```sh
+sloosh skill install --agent auto
+sloosh skill status --agent auto
+```
+
+由 sloosh 安装且未改动的旧 Skill 会随二进制升级。外部管理或本地修改过的 Skill 默认保留。
+只有确定要替换时，才对 `skill install` 使用 `--force`，或对 `init` 使用
+`--force-skill`。Sloosh 不会调用 `npx` 或 Agent marketplace；它们只是可选的 Skill
+分发渠道。
+
 ## 升级
 
 替换二进制前先停止 daemon。活跃 session、forward、pending request 和 lease 都在内存中，
@@ -56,6 +91,7 @@ Linux 二进制通过 musl 静态链接，以兼容常见 Linux 发行版。但 
 sloosh daemon stop
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
 sloosh --version
+sloosh skill install
 ```
 
 这个顺序也避免 Linux 上旧 daemon 继续从已替换的 executable 运行；新 CLI 会拒绝无法通过

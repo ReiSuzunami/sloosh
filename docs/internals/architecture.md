@@ -18,6 +18,7 @@ Agent process                         Human terminal
           | - argument/TTY policy  |
           | - protocol handshake   |
           | - local file access    |
+          | - Agent Skill setup    |
           | - approval preview     |
           | - routed key probes    |
           +-----------+------------+
@@ -48,14 +49,19 @@ forwards.
 
 Ownership is deliberate:
 
-- CLI owns argument policy, human prompts, approval preview, routed host-key
-  probes, and every local filesystem operation for SFTP.
+- CLI owns argument policy, human prompts, Agent Skill installation, approval
+  preview, routed host-key probes, and every local filesystem operation for
+  SFTP.
 - Daemon owns authorization, long-lived SSH state, remote SFTP handles, PTYs,
   spool, forwards, vault mutation/cache, and audit appends.
 - A transfer `local_path` crossing the socket is an audit/display label. Daemon
   never opens that caller-supplied local path.
 - Human CLI temporarily unlocks its own vault cache during approval. Daemon has
   a separate cache and independently validates the approved host scope.
+- `sloosh skill install/status` is CLI-only and never starts the daemon or
+  accesses the vault. `sloosh init` requires a real TTY, installs/verifies the
+  embedded Skill, then enters the existing vault initialization flow. These
+  steps are deliberately restartable rather than transactional.
 
 ## 2. Local transport boundary
 
@@ -225,7 +231,8 @@ src/
   cli/
     args.rs          clap surface
     client.rs        daemon connect/spawn, peer and protocol checks
-    mod.rs           CLI behavior, local SFTP files, approval UI
+    mod.rs           CLI behavior, local SFTP files, setup, approval UI
+    skill.rs         embedded Agent Skill, target detection, safe install/status
   proto.rs           protocol request/response types and NDJSON limit
   transport/
     mod.rs           Channel and raw-frame contract
