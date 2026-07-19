@@ -201,69 +201,257 @@ private func activateApplication() {
     NSApplication.shared.activate(ignoringOtherApps: true)
 }
 
-private func promptSecret(
-    title: String,
-    message: String,
-    confirmation: Bool
-) -> Response {
+private final class PINCodeInputView: NSView, NSTextFieldDelegate {
+    private static let digitCount = 6
+    private let fields: [NSSecureTextField]
+    private let autofocus: Bool
+    private var updating = false
+
+    weak var nextInput: PINCodeInputView?
+    var onChange: (() -> Void)?
+
+    var pin: String {
+        fields.map(\.stringValue).joined()
+    }
+
+    var isComplete: Bool {
+        fields.allSatisfy { $0.stringValue.count == 1 }
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 320, height: 68)
+    }
+
+    init(label: String, autofocus: Bool = false) {
+        self.autofocus = autofocus
+        fields = (0..<Self.digitCount).map { index in
+            let field = NSSecureTextField(frame: .zero)
+            field.tag = index
+            field.alignment = .center
+            field.font = .monospacedDigitSystemFont(ofSize: 20, weight: .medium)
+            field.focusRingType = .exterior
+            field.maximumNumberOfLines = 1
+            field.setAccessibilityLabel("\(label) digit \(index + 1) of \(Self.digitCount)")
+            return field
+        }
+        super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 68))
+
+        let labelField = NSTextField(labelWithString: label)
+        labelField.font = .systemFont(ofSize: 12, weight: .medium)
+        labelField.textColor = .secondaryLabelColor
+
+        let row = NSStackView(views: fields)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.distribution = .fillEqually
+        row.spacing = 8
+
+        let stack = NSStackView(views: [labelField, row])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.frame = bounds
+        stack.autoresizingMask = [.width, .height]
+        addSubview(stack)
+
+        for field in fields {
+            field.delegate = self
+            field.widthAnchor.constraint(equalToConstant: 46).isActive = true
+            field.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard autofocus, window != nil else {
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.focusField(at: 0)
+        }
+    }
+
+    func focusFirstField() {
+        focusField(at: 0)
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard !updating,
+              let field = notification.object as? NSSecureTextField,
+              fields.indices.contains(field.tag) else {
+            return
+        }
+
+        let index = field.tag
+        let digits = Self.asciiDigits(in: field.stringValue)
+        updating = true
+        if digits.count > 1 {
+            for target in index..<fields.count {
+                fields[target].stringValue = ""
+            }
+            for (offset, digit) in digits.prefix(fields.count - index).enumerated() {
+                fields[index + offset].stringValue = String(digit)
+            }
+        } else {
+            field.stringValue = digits.first.map(String.init) ?? ""
+        }
+        updating = false
+        onChange?()
+
+        guard !digits.isEmpty else {
+            return
+        }
+        let nextIndex = min(index + digits.count, fields.count)
+        if nextIndex < fields.count {
+            focusField(at: nextIndex)
+        } else if let nextInput {
+            nextInput.focusFirstField()
+        }
+    }
+
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        guard let field = control as? NSSecureTextField,
+              fields.indices.contains(field.tag) else {
+            return false
+        }
+        let index = field.tag
+
+        if commandSelector == #selector(NSResponder.deleteBackward(_:)) {
+            if field.stringValue.isEmpty, index > 0 {
+                fields[index - 1].stringValue = ""
+                focusField(at: index - 1)
+            } else {
+                field.stringValue = ""
+                focusField(at: index)
+            }
+            onChange?()
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertTab(_:)) {
+            if index + 1 < fields.count {
+                focusField(at: index + 1)
+            } else if let nextInput {
+                nextInput.focusFirstField()
+            }
+            return true
+        }
+        if commandSelector == #selector(NSResponder.insertBacktab(_:)), index > 0 {
+            focusField(at: index - 1)
+            return true
+        }
+        return false
+    }
+
+    private func focusField(at index: Int) {
+        guard fields.indices.contains(index) else {
+            return
+        }
+        window?.makeFirstResponder(fields[index])
+        fields[index].selectText(nil)
+    }
+
+    private static func asciiDigits(in value: String) -> [Character] {
+        value.unicodeScalars.compactMap { scalar in
+            guard (48...57).contains(scalar.value) else {
+                return nil
+            }
+            return Character(String(scalar))
+        }
+    }
+}
+
+private func promptPin(title: String, message: String) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
     alert.messageText = title
     alert.informativeText = message
 
-    let first = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-    first.placeholderString = confirmation ? "Master Password" : "6-digit PIN"
-    if confirmation {
-        let second = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        second.placeholderString = "Confirm Master Password"
-        let stack = NSStackView(views: [first, second])
-        stack.orientation = .vertical
-        stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return .error("cancelled", "Secure input was cancelled")
-        }
-        guard !first.stringValue.isEmpty, first.stringValue == second.stringValue else {
-            return .error("mismatch", "Master Password entries do not match")
-        }
-        return .masterPassword(first.stringValue)
-    }
-
-    alert.accessoryView = first
-    alert.addButton(withTitle: "Continue")
+    let input = PINCodeInputView(label: "PIN", autofocus: true)
+    alert.accessoryView = input
+    let continueButton = alert.addButton(withTitle: "Continue")
+    continueButton.isEnabled = false
     alert.addButton(withTitle: "Cancel")
+    input.onChange = { [weak input, weak continueButton] in
+        continueButton?.isEnabled = input?.isComplete == true
+    }
     guard alert.runModal() == .alertFirstButtonReturn else {
-        return .error("cancelled", "Secure input was cancelled")
+        return .error("cancelled", "Approval PIN input was cancelled")
     }
-    guard !first.stringValue.isEmpty else {
-        return .error("invalid_input", "Secure input cannot be empty")
+    guard input.isComplete else {
+        return .error("invalid_input", "Approval PIN must contain exactly 6 digits")
     }
-    return .pin(first.stringValue)
+    return .pin(input.pin)
+}
+
+private func labeledSecureField(
+    label: String,
+    placeholder: String
+) -> (view: NSStackView, field: NSSecureTextField) {
+    let labelField = NSTextField(labelWithString: label)
+    labelField.font = .systemFont(ofSize: 12, weight: .semibold)
+    labelField.textColor = .labelColor
+
+    let field = NSSecureTextField(frame: .zero)
+    field.placeholderString = placeholder
+    field.setAccessibilityLabel(label)
+    field.widthAnchor.constraint(equalToConstant: 320).isActive = true
+    field.heightAnchor.constraint(equalToConstant: 28).isActive = true
+
+    let stack = NSStackView(views: [labelField, field])
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 6
+    stack.frame = NSRect(x: 0, y: 0, width: 320, height: 52)
+    return (stack, field)
 }
 
 private func promptMasterPassword(purpose: String, confirmation: Bool) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
-    alert.messageText = purpose
+    alert.icon = NSImage(
+        systemSymbolName: "lock.shield.fill",
+        accessibilityDescription: "Master Password"
+    )
+    alert.messageText = confirmation ? "Create Master Password" : "Master Password required"
     alert.informativeText = confirmation
-        ? "Create the Master Password used to protect your Sloosh credential vault."
-        : "Enter your Master Password to authorize this security change."
-    let first = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-    first.placeholderString = "Master Password"
+        ? "Protect your Sloosh credential vault. This is separate from the 6-digit approval PIN."
+        : "Authorize \"\(purpose)\" with your vault Master Password, not your approval PIN."
+    let firstSection = labeledSecureField(
+        label: confirmation ? "New Master Password" : "Master Password",
+        placeholder: "Enter vault password"
+    )
+    let first = firstSection.field
     if confirmation {
-        let second = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        second.placeholderString = "Confirm Master Password"
-        let stack = NSStackView(views: [first, second])
+        let secondSection = labeledSecureField(
+            label: "Confirm Master Password",
+            placeholder: "Enter vault password again"
+        )
+        let second = secondSection.field
+        let stack = NSStackView(views: [firstSection.view, secondSection.view])
         stack.orientation = .vertical
-        stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.frame = NSRect(x: 0, y: 0, width: 320, height: 116)
+        firstSection.view.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        firstSection.view.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        secondSection.view.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        secondSection.view.heightAnchor.constraint(equalToConstant: 52).isActive = true
         alert.accessoryView = stack
-        alert.addButton(withTitle: "Continue")
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(first)
+        }
+        alert.addButton(withTitle: "Create Vault")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
             return .error("cancelled", "Master Password input was cancelled")
@@ -272,8 +460,11 @@ private func promptMasterPassword(purpose: String, confirmation: Bool) -> Respon
             return .error("mismatch", "Master Password entries do not match")
         }
     } else {
-        alert.accessoryView = first
-        alert.addButton(withTitle: "Continue")
+        alert.accessoryView = firstSection.view
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(first)
+        }
+        alert.addButton(withTitle: "Authorize")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
             return .error("cancelled", "Master Password input was cancelled")
@@ -291,24 +482,44 @@ private func promptNewPin() -> Response {
     alert.alertStyle = .informational
     alert.messageText = "Create approval PIN"
     alert.informativeText = "Choose a 6-digit PIN for local SSH approvals."
-    let first = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-    first.placeholderString = "6-digit PIN"
-    let second = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-    second.placeholderString = "Confirm PIN"
+    let first = PINCodeInputView(label: "New PIN", autofocus: true)
+    let second = PINCodeInputView(label: "Confirm PIN")
+    first.nextInput = second
     let stack = NSStackView(views: [first, second])
     stack.orientation = .vertical
-    stack.spacing = 8
-    stack.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
+    stack.alignment = .leading
+    stack.distribution = .fill
+    stack.spacing = 12
+    stack.frame = NSRect(x: 0, y: 0, width: 320, height: 148)
+    first.widthAnchor.constraint(equalToConstant: 320).isActive = true
+    first.heightAnchor.constraint(equalToConstant: 68).isActive = true
+    second.widthAnchor.constraint(equalToConstant: 320).isActive = true
+    second.heightAnchor.constraint(equalToConstant: 68).isActive = true
     alert.accessoryView = stack
-    alert.addButton(withTitle: "Enable PIN")
+    let enableButton = alert.addButton(withTitle: "Enable PIN")
+    enableButton.isEnabled = false
     alert.addButton(withTitle: "Cancel")
+    let updateButton = { [weak first, weak second, weak enableButton] in
+        guard let first, let second else {
+            enableButton?.isEnabled = false
+            return
+        }
+        enableButton?.isEnabled = first.isComplete
+            && second.isComplete
+            && first.pin == second.pin
+    }
+    first.onChange = updateButton
+    second.onChange = updateButton
     guard alert.runModal() == .alertFirstButtonReturn else {
         return .error("cancelled", "Approval PIN setup was cancelled")
     }
-    guard first.stringValue == second.stringValue else {
+    guard first.isComplete, second.isComplete else {
+        return .error("invalid_input", "Approval PIN must contain exactly 6 digits")
+    }
+    guard first.pin == second.pin else {
         return .error("mismatch", "Approval PIN entries do not match")
     }
-    return .pin(first.stringValue)
+    return .pin(first.pin)
 }
 
 private func confirm(
@@ -343,10 +554,9 @@ private func confirm(
         return .error("cancelled", "Native approval was cancelled")
     }
     if selectedPIN {
-        return promptSecret(
+        return promptPin(
             title: "Enter approval PIN",
-            message: "Enter your 6-digit Sloosh approval PIN.",
-            confirmation: false
+            message: "Enter your 6-digit Sloosh approval PIN."
         )
     }
 
