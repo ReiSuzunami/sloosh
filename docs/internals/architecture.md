@@ -301,7 +301,9 @@ src/
     mod.rs           accept loop and request routing
     lease.rs         pending requests, active leases, stable LeaseGrant
     vault.rs         encrypted vault, serialized mutation, cache
-    ssh.rs           config resolution, ProxyJump, host-key verification
+    ssh.rs           SSH transport/auth facade, ProxyJump, host-key verification
+    ssh/config.rs    OpenSSH config subset parsing and deterministic resolution
+    ssh/route.rs     remote-forward route lifecycle and byte-pump mechanics
     session.rs       PTY state, sentinel framing, spool, SFTP handles
     forward.rs       local -L, remote -R, and forward lifetime
     audit.rs         best-effort audit append/read helpers

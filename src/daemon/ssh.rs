@@ -28,21 +28,31 @@
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::Pty;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
 use tracing::{debug, warn};
 use zeroize::Zeroize;
 
 use crate::daemon::lease;
 use crate::daemon::vault;
 use crate::transport::unix::sloosh_home;
+
+mod config;
+mod route;
+
+pub use config::{HostConfig, IdentityAgentValue, SshConfig};
+use config::{current_user, expand_tilde, home_dir};
+#[cfg(test)]
+use config::{glob_match, host_patterns_match};
+#[cfg(test)]
+pub(crate) use route::ForwardRouteState;
+pub(crate) use route::{ForwardRoute, ForwardRouteLifecycle};
+use route::{ForwardTargetConnectError, pump_forwarded_tcpip, race_forward_target_connect};
 
 /// Hard cap on ProxyJump chain length (docs/internals/architecture.md), counting every hop
 /// pulled in transitively by a jump host's own `ProxyJump` (vault route
@@ -193,286 +203,6 @@ pub enum SshError {
     Russh(#[from] russh::Error),
 }
 
-// ---------------------------------------------------------------------------
-// `~/.ssh/config` subset parser
-// ---------------------------------------------------------------------------
-
-/// A resolved `IdentityAgent` directive value (ssh_config(5)): either a
-/// specific agent socket path to connect to instead of `$SSH_AUTH_SOCK`, or
-/// an explicit `none` to disable agent auth entirely for the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdentityAgentValue {
-    Path(PathBuf),
-    Disabled,
-}
-
-/// One `Host` block from `~/.ssh/config`, holding only the directives
-/// docs/internals/architecture.md promises to understand.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct HostBlock {
-    /// Raw patterns as written after `Host` (may contain `*`/`?` globs and
-    /// `!negated` entries).
-    patterns: Vec<String>,
-    hostname: Option<String>,
-    port: Option<u16>,
-    user: Option<String>,
-    identity_files: Vec<PathBuf>,
-    proxy_jump: Option<String>,
-    identity_agent: Option<IdentityAgentValue>,
-}
-
-/// A parsed `~/.ssh/config` subset: an ordered list of `Host` blocks. Order
-/// matters — like real `ssh_config`, the *first* matching block's value for
-/// a given directive wins.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SshConfig {
-    blocks: Vec<HostBlock>,
-}
-
-/// Resolved connection parameters for a host alias, after merging any
-/// matching `~/.ssh/config` blocks over the built-in defaults documented in
-/// `docs/internals/architecture.md`: literal hostname, local user, port 22.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostConfig {
-    pub alias: String,
-    pub hostname: String,
-    pub port: u16,
-    pub user: String,
-    pub identity_files: Vec<PathBuf>,
-    pub proxy_jump: Option<String>,
-    pub identity_agent: Option<IdentityAgentValue>,
-}
-
-/// Warn once per unknown directive name for the lifetime of the process
-/// (docs/internals/architecture.md: "未知指令警告而非静默忽略" — warn, don't silently drop, but
-/// don't spam the log on every reconnect either).
-fn warned_directives() -> &'static Mutex<HashSet<String>> {
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    WARNED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn warn_unknown_directive_once(directive: &str) {
-    let key = directive.to_ascii_lowercase();
-    let mut seen = warned_directives()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if seen.insert(key) {
-        warn!(
-            directive,
-            "unrecognized ~/.ssh/config directive; sloosh only understands Host/HostName/Port/User/\
-             IdentityFile/ProxyJump/IdentityAgent — ignoring this line rather than guessing what it \
-             means"
-        );
-    }
-}
-
-impl SshConfig {
-    /// Parse the subset of `~/.ssh/config` directives docs/internals/architecture.md promises.
-    /// Never fails: unparsable lines are warned about (see
-    /// `warn_unknown_directive_once`) and skipped, matching real `ssh`'s
-    /// tolerance for config quirks.
-    pub fn parse(contents: &str) -> Self {
-        let mut blocks = Vec::new();
-        let mut current: Option<HostBlock> = None;
-
-        for raw_line in contents.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some((directive, rest)) = split_directive(line) else {
-                continue;
-            };
-            let rest = rest.trim();
-
-            match directive.to_ascii_lowercase().as_str() {
-                "host" => {
-                    if let Some(block) = current.take() {
-                        blocks.push(block);
-                    }
-                    current = Some(HostBlock {
-                        patterns: rest.split_whitespace().map(str::to_string).collect(),
-                        ..Default::default()
-                    });
-                }
-                "hostname" => with_current(&mut current, |b| b.hostname = Some(rest.to_string())),
-                "port" => with_current(&mut current, |b| match rest.parse::<u16>() {
-                    Ok(p) => b.port = Some(p),
-                    Err(_) => warn!(value = rest, "ignoring unparsable Port directive"),
-                }),
-                "user" => with_current(&mut current, |b| b.user = Some(rest.to_string())),
-                "identityfile" => with_current(&mut current, |b| {
-                    b.identity_files.push(expand_tilde(rest));
-                }),
-                "proxyjump" => with_current(&mut current, |b| {
-                    if !rest.eq_ignore_ascii_case("none") {
-                        b.proxy_jump = Some(rest.to_string());
-                    }
-                }),
-                "identityagent" => with_current(&mut current, |b| {
-                    b.identity_agent = Some(parse_identity_agent_value(rest));
-                }),
-                other => warn_unknown_directive_once(other),
-            }
-        }
-        if let Some(block) = current.take() {
-            blocks.push(block);
-        }
-        SshConfig { blocks }
-    }
-
-    /// Load and parse `~/.ssh/config`. Missing file is not an error (most
-    /// hosts have none) — it just means every alias resolves to defaults.
-    pub fn load_default() -> Self {
-        let path = ssh_config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => Self::parse(&contents),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "failed to read ~/.ssh/config, proceeding as if empty");
-                Self::default()
-            }
-        }
-    }
-
-    /// Resolve `alias` against this config, falling back to the documented
-    /// defaults (literal hostname, local user, port 22) for anything no
-    /// matching block sets.
-    ///
-    /// A `user@host` literal is split like an OpenSSH destination: the host
-    /// part is what gets matched against `Host` patterns (and becomes the
-    /// default hostname), and the user part wins over any config `User` —
-    /// the same precedence real `ssh user@host` gives the command line.
-    /// `cfg.alias` keeps the full literal, since leases and sessions are
-    /// keyed by whatever string the caller used.
-    pub fn resolve(&self, alias: &str) -> HostConfig {
-        let (user_override, host_key) = match alias.rsplit_once('@') {
-            Some((user, host)) if !user.is_empty() && !host.is_empty() => (Some(user), host),
-            _ => (None, alias),
-        };
-        let mut cfg = HostConfig {
-            alias: alias.to_string(),
-            hostname: host_key.to_string(),
-            port: 22,
-            user: user_override
-                .map(str::to_string)
-                .unwrap_or_else(current_user),
-            identity_files: Vec::new(),
-            proxy_jump: None,
-            identity_agent: None,
-        };
-        let mut hostname_set = false;
-        let mut port_set = false;
-        let mut user_set = user_override.is_some();
-        let mut proxy_jump_set = false;
-        let mut identity_agent_set = false;
-
-        for block in &self.blocks {
-            if !host_patterns_match(&block.patterns, host_key) {
-                continue;
-            }
-            if !hostname_set {
-                if let Some(h) = &block.hostname {
-                    cfg.hostname = h.clone();
-                    hostname_set = true;
-                }
-            }
-            if !port_set {
-                if let Some(p) = block.port {
-                    cfg.port = p;
-                    port_set = true;
-                }
-            }
-            if !user_set {
-                if let Some(u) = &block.user {
-                    cfg.user = u.clone();
-                    user_set = true;
-                }
-            }
-            if !proxy_jump_set {
-                if let Some(pj) = &block.proxy_jump {
-                    cfg.proxy_jump = Some(pj.clone());
-                    proxy_jump_set = true;
-                }
-            }
-            if !identity_agent_set {
-                if let Some(ia) = &block.identity_agent {
-                    cfg.identity_agent = Some(ia.clone());
-                    identity_agent_set = true;
-                }
-            }
-            // IdentityFile is cumulative across matching blocks, like real ssh_config.
-            cfg.identity_files
-                .extend(block.identity_files.iter().cloned());
-        }
-        cfg
-    }
-}
-
-/// Parse an `IdentityAgent` value: `none` (disable agent auth), or a path
-/// (optionally double-quoted, tilde-expanded like `IdentityFile`).
-fn parse_identity_agent_value(raw: &str) -> IdentityAgentValue {
-    let unquoted = unquote(raw);
-    if unquoted.eq_ignore_ascii_case("none") {
-        IdentityAgentValue::Disabled
-    } else {
-        IdentityAgentValue::Path(expand_tilde(&unquoted))
-    }
-}
-
-/// Strip one layer of surrounding double quotes, if present — ssh_config(5)
-/// allows quoting any directive value that contains whitespace.
-fn unquote(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-fn with_current(current: &mut Option<HostBlock>, f: impl FnOnce(&mut HostBlock)) {
-    match current {
-        Some(block) => f(block),
-        None => warn!("directive outside any Host block in ~/.ssh/config; ignoring"),
-    }
-}
-
-/// Split `"Key value"` or `"Key=value"` (both are valid ssh_config syntax)
-/// into `(key, value)`.
-fn split_directive(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    if let Some(idx) = line.find(char::is_whitespace) {
-        Some((&line[..idx], line[idx..].trim_start()))
-    } else if let Some(idx) = line.find('=') {
-        Some((&line[..idx], line[idx + 1..].trim_start()))
-    } else if line.is_empty() {
-        None
-    } else {
-        // A bare keyword with no value (malformed) — still route it through
-        // the normal directive dispatch so unknown ones get warned about.
-        Some((line, ""))
-    }
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        home_dir().join(rest)
-    } else if path == "~" {
-        home_dir()
-    } else {
-        PathBuf::from(path)
-    }
-}
-
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-}
-
-fn ssh_config_path() -> PathBuf {
-    home_dir().join(".ssh").join("config")
-}
-
 fn ssh_known_hosts_path() -> PathBuf {
     home_dir().join(".ssh").join("known_hosts")
 }
@@ -524,70 +254,6 @@ fn verify_server_key_at_paths(
     }
 }
 
-/// Resolve the local user for the "no config entry" default (docs/internals/architecture.md).
-fn current_user() -> String {
-    if let Ok(u) = std::env::var("USER") {
-        if !u.is_empty() {
-            return u;
-        }
-    }
-    if let Ok(u) = std::env::var("LOGNAME") {
-        if !u.is_empty() {
-            return u;
-        }
-    }
-    // SAFETY: getuid/getpwuid are plain libc lookups with no preconditions;
-    // the returned pointer is a static/thread-local buffer we only read
-    // through immediately, matching libc's documented contract.
-    unsafe {
-        let uid = libc::getuid();
-        let pw = libc::getpwuid(uid);
-        if !pw.is_null() {
-            let name = std::ffi::CStr::from_ptr((*pw).pw_name);
-            if let Ok(s) = name.to_str() {
-                return s.to_string();
-            }
-        }
-    }
-    "root".to_string()
-}
-
-/// Does `alias` match this `Host` line's pattern list? Supports `*`/`?`
-/// globs and `!pattern` negation, per ssh_config(5).
-fn host_patterns_match(patterns: &[String], alias: &str) -> bool {
-    let mut matched = false;
-    for pattern in patterns {
-        if let Some(negated) = pattern.strip_prefix('!') {
-            if glob_match(negated, alias) {
-                return false;
-            }
-        } else if glob_match(pattern, alias) {
-            matched = true;
-        }
-    }
-    matched
-}
-
-/// Minimal shell-glob matcher for `*` (any run of chars, including none)
-/// and `?` (exactly one char). No brace/bracket expansion — ssh_config
-/// Host patterns don't use them.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    glob_match_inner(&p, &t)
-}
-
-fn glob_match_inner(p: &[char], t: &[char]) -> bool {
-    match p.first() {
-        None => t.is_empty(),
-        Some('*') => {
-            glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..]))
-        }
-        Some('?') => !t.is_empty() && glob_match_inner(&p[1..], &t[1..]),
-        Some(c) => !t.is_empty() && t[0] == *c && glob_match_inner(&p[1..], &t[1..]),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Connection establishment
 // ---------------------------------------------------------------------------
@@ -615,121 +281,6 @@ pub struct Connection {
 pub struct LeaseContext {
     pub caller_pid: u32,
     pub lease_token: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ForwardRouteState {
-    Pending,
-    Active,
-    Closed,
-}
-
-#[derive(Clone)]
-pub(crate) struct ForwardRouteLifecycle {
-    state: watch::Sender<ForwardRouteState>,
-}
-
-impl ForwardRouteLifecycle {
-    pub(crate) fn new() -> Self {
-        let (state, _receiver) = watch::channel(ForwardRouteState::Pending);
-        Self { state }
-    }
-
-    pub(crate) fn state(&self) -> ForwardRouteState {
-        *self.state.borrow()
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        self.state() == ForwardRouteState::Active
-    }
-
-    pub(crate) fn activate(&self) -> bool {
-        self.state.send_if_modified(|state| {
-            if *state == ForwardRouteState::Pending {
-                *state = ForwardRouteState::Active;
-                true
-            } else {
-                false
-            }
-        })
-    }
-
-    pub(crate) fn close(&self) -> bool {
-        self.state.send_if_modified(|state| {
-            if *state == ForwardRouteState::Closed {
-                false
-            } else {
-                *state = ForwardRouteState::Closed;
-                true
-            }
-        })
-    }
-
-    pub(crate) async fn wait_closed(&self) {
-        let mut receiver = self.state.subscribe();
-        loop {
-            let state = *receiver.borrow_and_update();
-            if state == ForwardRouteState::Closed {
-                return;
-            }
-            if receiver.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-/// Where to dial locally when the remote end pushes a `forwarded-tcpip`
-/// channel back to us — the `-R` (remote/reverse) forward case. Only ever set
-/// on the one [`Connection`] a remote forward owns
-/// (`daemon::forward`); a plain session/`-L`-forward connection's [`Handler`]
-/// has `route: None`, so [`Handler::server_channel_open_forwarded_tcpip`]
-/// falls back to rejecting rather than silently accepting and hanging.
-///
-/// Deliberately holds only plain, `Clone`-cheap data (no callback/trait
-/// object) so `ssh.rs` never needs to depend on `daemon::forward`'s types —
-/// `forward.rs` builds one of these and hands it to [`connect_with_route`];
-/// `ssh.rs` never looks inside `forward.rs` to construct or interpret it.
-#[derive(Clone)]
-pub(crate) struct ForwardRoute {
-    /// Local host/port to dial for each incoming forwarded connection.
-    pub(crate) local_host: String,
-    pub(crate) local_port: u16,
-    /// Stable authorization selected before the short-lived CLI exits.
-    /// Every incoming forwarded connection revalidates and touches it.
-    pub(crate) grant: lease::LeaseGrant,
-    /// Live tunnel count, shared with the forward's registry entry, for
-    /// `forward ls`'s connection-count column.
-    pub(crate) tunnel_count: Arc<AtomicUsize>,
-    /// Shared Pending -> Active -> Closed gate. Server callbacks may route
-    /// channels only while Active; Closed also wakes in-flight work.
-    pub(crate) lifecycle: ForwardRouteLifecycle,
-}
-
-#[derive(Debug)]
-enum ForwardTargetConnectError {
-    Closed,
-    TimedOut,
-    Io(std::io::Error),
-}
-
-async fn race_forward_target_connect<T, F>(
-    lifecycle: &ForwardRouteLifecycle,
-    timeout: Duration,
-    connect: F,
-) -> Result<T, ForwardTargetConnectError>
-where
-    F: std::future::Future<Output = std::io::Result<T>>,
-{
-    tokio::select! {
-        biased;
-        _ = lifecycle.wait_closed() => Err(ForwardTargetConnectError::Closed),
-        result = tokio::time::timeout(timeout, connect) => match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(ForwardTargetConnectError::Io(error)),
-            Err(_) => Err(ForwardTargetConnectError::TimedOut),
-        },
-    }
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
@@ -854,26 +405,6 @@ impl russh::client::Handler for Handler {
         }
         Ok(())
     }
-}
-
-/// Pump bytes between a `-R` forward's accepted `forwarded-tcpip` channel and
-/// the local TCP target already dialed for it, until either side is done or
-/// the owning forward is stopped (docs/internals/architecture.md: a live tunnel dies with its
-/// lease, even though it doesn't get a per-byte idle refresh — see
-/// `daemon::forward`'s module doc for why per-connection granularity is
-/// enough).
-async fn pump_forwarded_tcpip(channel: Channel, mut tcp: TcpStream, route: ForwardRoute) {
-    route
-        .tunnel_count
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut remote = channel.into_stream();
-    tokio::select! {
-        _ = tokio::io::copy_bidirectional(&mut tcp, &mut remote) => {}
-        _ = route.lifecycle.wait_closed() => {}
-    }
-    route
-        .tunnel_count
-        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A `Handler` that accepts whatever host key is presented and just records
