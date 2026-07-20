@@ -304,10 +304,13 @@ src/
     ssh.rs           SSH transport/auth facade, ProxyJump, host-key verification
     ssh/config.rs    OpenSSH config subset parsing and deterministic resolution
     ssh/route.rs     remote-forward route lifecycle and byte-pump mechanics
-    session.rs       PTY state, sentinel framing, spool, SFTP handles
+    session.rs       PTY state, sentinel framing, registry, SFTP facade
+    session/spool.rs bounded spool writer, actual-byte ledger, retention
     forward.rs       local -L, remote -R, and forward lifetime
     audit.rs         best-effort audit append/read helpers
-  native_approval.rs daemon-side native approval port and helper protocol
+  native_approval.rs daemon-side native approval policy and cache cleanup
+  native_approval/
+    helper.rs        validated helper process and bounded anonymous-pipe IPC
   local_approval.rs  PIN verifier, persistence, backoff, and disable policy
 gui/
   src/               Svelte status and setup UI; no secret fields

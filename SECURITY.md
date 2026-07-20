@@ -301,7 +301,10 @@ envelope's nonce/ciphertext, then publishes the cache as one unit. This prevents
 mixed disk snapshots and an older unlock/cache refresh overwriting a newer
 mutation. The daemon cache is cleared and zeroized after the last active lease
 expires. Approval creates a separate temporary cache in the human CLI, which is
-cleared after preview and host-key confirmation.
+cleared after preview and host-key confirmation. Native approval previews in
+the daemon use one explicit post-preview cleanup boundary: every error path
+discards that preview cache exactly once when no active lease owns its
+lifetime; successful activation transfers cache lifetime to the active lease.
 
 `SecretString` redacts `Debug` and zeroizes on drop. The daemon logs request
 type, not complete request fields. Audit does not record credentials or command

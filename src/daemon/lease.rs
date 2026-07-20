@@ -486,6 +486,7 @@ pub async fn approve_lease(
         master_password,
         Some(approved_hosts),
         true,
+        true,
     )
     .await
 }
@@ -503,7 +504,7 @@ pub async fn approve_lease_for_chain(
     id: &str,
     master_password: &[u8],
 ) -> Result<LeaseActivatedInfo, LeaseError> {
-    approve_lease_for_chain_checked(approver_chain, id, master_password, None, true).await
+    approve_lease_for_chain_checked(approver_chain, id, master_password, None, true, true).await
 }
 
 /// Unlock and resolve exact host scope before native UI asks for final
@@ -563,7 +564,8 @@ pub async fn approve_lease_native(
     master_password: &[u8],
     approved_hosts: &[String],
 ) -> Result<LeaseActivatedInfo, LeaseError> {
-    approve_lease_for_chain_checked(&[], id, master_password, Some(approved_hosts), false).await
+    approve_lease_for_chain_checked(&[], id, master_password, Some(approved_hosts), false, false)
+        .await
 }
 
 /// Drop cache populated only for an unsuccessful native preview. Preserve it
@@ -578,13 +580,16 @@ pub async fn discard_native_preview() {
 /// Approval state machine shared by production and the synthetic-ancestry
 /// integration-test seam. Production always supplies `approved_hosts`; the
 /// compatibility seam passes `None` so existing live tests can approve the
-/// daemon-computed list without emulating an interactive human CLI.
+/// daemon-computed list without emulating an interactive human CLI. Native
+/// approval owns its one outer preview cleanup boundary, while terminal
+/// approval asks this function to clean its daemon-side cache on failure.
 async fn approve_lease_for_chain_checked(
     approver_chain: &[AncestorInfo],
     id: &str,
     master_password: &[u8],
     approved_hosts: Option<&[String]>,
     enforce_self_approval: bool,
+    cleanup_failed_preview: bool,
 ) -> Result<LeaseActivatedInfo, LeaseError> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
@@ -638,7 +643,7 @@ async fn approve_lease_for_chain_checked(
     let resolved_hosts = match ssh::expand_lease_hosts(&pending.hosts).await {
         Ok(hosts) => hosts,
         Err(error) => {
-            if st.active.is_empty() {
+            if cleanup_failed_preview && st.active.is_empty() {
                 vault::clear_cache().await;
             }
             return Err(error.into());
@@ -648,7 +653,7 @@ async fn approve_lease_for_chain_checked(
         if approved_hosts != resolved_hosts {
             let approved = format_host_list(approved_hosts);
             let resolved = format_host_list(&resolved_hosts);
-            let clear_cache = st.active.is_empty();
+            let clear_cache = cleanup_failed_preview && st.active.is_empty();
             if clear_cache {
                 vault::clear_cache().await;
             }
@@ -1442,6 +1447,7 @@ mod tests {
             b"pw",
             Some(&stale_approval),
             true,
+            true,
         )
         .await
         .unwrap_err();
@@ -1479,6 +1485,7 @@ mod tests {
             b"pw",
             Some(&preview),
             true,
+            true,
         )
         .await
         .unwrap_err();
@@ -1506,6 +1513,7 @@ mod tests {
             &info.id,
             b"pw",
             Some(&exact_approval),
+            true,
             true,
         )
         .await
@@ -1541,6 +1549,7 @@ mod tests {
             b"pw",
             Some(&["web".to_string()]),
             true,
+            true,
         )
         .await
         .unwrap_err();
@@ -1556,6 +1565,43 @@ mod tests {
         assert!(!check_authorized_for_chain(&chain, "web", None).await);
         assert!(!vault::is_cached().await);
 
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_approval_defers_failed_preview_cleanup_to_its_outer_owner() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let RequestOutcome::Pending(info) = request_lease_for_chain(
+            vec![
+                ancestor(785, 110, Some("sloosh")),
+                ancestor(784, 100, Some("claude")),
+            ],
+            vec!["web".to_string()],
+        )
+        .await
+        .unwrap() else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_jump_cycle(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &[],
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, LeaseError::Route(_)), "{error}");
+        assert!(vault::is_cached().await);
+        assert!(describe_pending(&info.id).await.is_ok());
+
+        discard_native_preview().await;
+        assert!(!vault::is_cached().await);
         reset_state().await;
     }
 
