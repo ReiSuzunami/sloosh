@@ -37,7 +37,7 @@ use spool::{
     encode_spool_name, ensure_private_dir, lock_spool_ledger, open_spool_file_under,
     spool_dir_under, spool_ledger,
 };
-use spool::{SpoolWriter, open_spool_file};
+use spool::{SpoolWriter, open_spool_file_best_effort};
 
 /// Bound on how much output we keep in memory per session (`SECURITY.md`).
 const RING_CAPACITY: usize = 256 * 1024;
@@ -1003,9 +1003,9 @@ pub async fn run(
         }
         state.run_seq += 1;
         start_offset = state.ring.total_written;
-        let (path, file) = open_spool_file(host, &name, state.run_seq)?;
+        let (path, file) = open_spool_file_best_effort(host, &name, state.run_seq);
         spool_path = path;
-        state.spool_file = Some(file);
+        state.spool_file = file;
         state.busy = true;
         state.current_run = Some(CurrentRun {
             sentinel: sentinel.clone(),

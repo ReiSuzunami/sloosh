@@ -533,12 +533,32 @@ fn create_spool_file(dir: &Path, seq: u64) -> std::io::Result<(PathBuf, std::fs:
     ))
 }
 
-pub(super) fn open_spool_file(
+fn open_spool_file_under_best_effort(
+    root: &Path,
     host: &str,
     name: &str,
     seq: u64,
-) -> std::io::Result<(PathBuf, SpoolWriter)> {
-    open_spool_file_under(&sloosh_home().join("spool"), host, name, seq)
+) -> (PathBuf, Option<SpoolWriter>) {
+    match open_spool_file_under(root, host, name, seq) {
+        Ok((path, writer)) => (path, Some(writer)),
+        Err(error) => {
+            warn!(
+                %host,
+                session = %name,
+                %error,
+                "spool open failed; command and in-memory output continue"
+            );
+            (PathBuf::new(), None)
+        }
+    }
+}
+
+pub(super) fn open_spool_file_best_effort(
+    host: &str,
+    name: &str,
+    seq: u64,
+) -> (PathBuf, Option<SpoolWriter>) {
+    open_spool_file_under_best_effort(&sloosh_home().join("spool"), host, name, seq)
 }
 
 pub(super) fn cleanup_spool_dir_preserving(dir: &Path, preserve: Option<&Path>) {
@@ -587,4 +607,25 @@ pub(super) fn cleanup_spool_root(root: &Path) -> std::io::Result<()> {
     ledger.initialize();
     ledger.enforce_global_budget();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spool_open_failure_degrades_to_no_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "sloosh-spool-open-failure-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::write(&root, b"not a directory").unwrap();
+
+        let (path, writer) = open_spool_file_under_best_effort(&root, "host", "session", 1);
+
+        assert!(path.as_os_str().is_empty());
+        assert!(writer.is_none());
+        let _ = std::fs::remove_file(root);
+    }
 }

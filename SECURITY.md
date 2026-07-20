@@ -205,7 +205,9 @@ or explicit daemon/process termination remains the termination path.
   not rescan the full tree. Cleanup deletes oldest inactive files when actual
   output needs room. Delete failure is logged and may stop persistence at the
   cap, but is not propagated as a command failure and never deletes active
-  files.
+  files. Failure to create or write the current run's spool is likewise logged;
+  the command and bounded in-memory ring continue, and `spool_path` is empty if
+  no run file was created.
 - An incomplete initial index pauses new persistence and retries after a
   backoff instead of granting against unknown bytes. Run files use
   collision-safe `create_new`, so reused sequence numbers cannot truncate

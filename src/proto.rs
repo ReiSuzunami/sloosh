@@ -450,7 +450,8 @@ pub struct RunReply {
     /// follow-up `grep`/`tail` against the spool file.
     #[serde(default)]
     pub total_bytes: u64,
-    /// Path to the full, untruncated output on disk (docs/internals/architecture.md).
+    /// Path to the full, untruncated output on disk, or empty when best-effort
+    /// spool persistence was unavailable (docs/internals/architecture.md).
     pub spool_path: String,
     /// Only set when `state == "dead"`.
     #[serde(default)]

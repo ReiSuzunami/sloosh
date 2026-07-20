@@ -222,7 +222,10 @@ protects active files, creates retained files collision-safely, and avoids
 full-tree scans at each run boundary. Incomplete initial indexing pauses new
 persistence until retry rather than granting against unknown disk use. Cleanup
 failure can stop further persistence but must not fail command or erase active
-output. Synchronous spool I/O may still delay PTY consumption on slow storage.
+output. Initial spool-open or later write failure detaches persistence for that
+run, leaves `spool_path` empty when no file was created, and still allows the
+command and bounded in-memory ring to proceed. Synchronous spool I/O may still
+delay PTY consumption on slow storage.
 Exact memory/disk limits and file guarantees belong to `SECURITY.md`.
 
 ## 6. SFTP ownership
