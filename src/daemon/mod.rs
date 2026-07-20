@@ -559,7 +559,16 @@ async fn handle_connection(
                 // docs/internals/architecture.md: expand every requested host's ProxyJump
                 // chain so the human approving this request sees (and
                 // grants) coverage for the whole path, not just the target.
-                let expanded_hosts = ssh::expand_lease_hosts(&hosts).await;
+                let expanded_hosts = match ssh::expand_lease_hosts(&hosts).await {
+                    Ok(hosts) => hosts,
+                    Err(error) => {
+                        chan.send(&Response::Error {
+                            message: error.to_string(),
+                        })
+                        .await?;
+                        continue;
+                    }
+                };
                 let resp = match lease::request_lease(caller_pid, expanded_hosts.clone()).await {
                     Ok(outcome) => {
                         audit::record(

@@ -114,6 +114,8 @@ per-request host approval and the 8-hour absolute lease limit remain separate.
 Aliases are stable lease and ProxyJump identities, so editing cannot rename an
 alias. Existing `sloosh add` and `sloosh rm` commands remain available for
 compatibility. None of these commands prints authentication material.
+ProxyJump cycles and routes deeper than eight hops fail before approval; Sloosh
+never asks a human to approve a silently truncated host list.
 
 ## Build from source
 

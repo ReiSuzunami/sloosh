@@ -69,6 +69,8 @@ sloosh status                                # daemon/lease/session overview —
   pending fallback, show the printed approval command to your user and **stop
   and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
   Touch ID or an approval PIN may complete the request without another terminal.
+- If `request` reports an invalid ProxyJump cycle or depth, show that error to
+  the user and stop. Never retry with a subset of hosts or bypass the route.
 - Active leases idle out according to the human's shared vault timeout
   (1, 5, 15, or 30 minutes; default 15). Do not assume a prior lease remains
   active; use `sloosh status` and request approval again when needed.

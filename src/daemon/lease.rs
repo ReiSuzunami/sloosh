@@ -133,6 +133,9 @@ pub enum LeaseError {
     },
 
     #[error(transparent)]
+    Route(#[from] ssh::SshError),
+
+    #[error(transparent)]
     Vault(#[from] VaultError),
 }
 
@@ -549,7 +552,7 @@ pub async fn preview_native_approval(
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(ssh::expand_lease_hosts(&hosts).await)
+    Ok(ssh::expand_lease_hosts(&hosts).await?)
 }
 
 /// Activate after bundled native UI confirms daemon-resolved host scope.
@@ -632,7 +635,15 @@ async fn approve_lease_for_chain_checked(
     // list the human confirmed in the separate CLI process. Any config or
     // vault change between preview and activation fails closed and leaves
     // the pending request intact.
-    let resolved_hosts = ssh::expand_lease_hosts(&pending.hosts).await;
+    let resolved_hosts = match ssh::expand_lease_hosts(&pending.hosts).await {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            if st.active.is_empty() {
+                vault::clear_cache().await;
+            }
+            return Err(error.into());
+        }
+    };
     if let Some(approved_hosts) = approved_hosts {
         if approved_hosts != resolved_hosts {
             let approved = format_host_list(approved_hosts);
@@ -1000,6 +1011,15 @@ mod tests {
         let mut data = vault::VaultData::default();
         data.hosts.insert("web".to_string(), test_vault_entry(jump));
         vault::create(&data, password).expect("create test vault with jump host");
+    }
+
+    fn create_test_vault_with_jump_cycle(password: &[u8]) {
+        let mut data = vault::VaultData::default();
+        data.hosts
+            .insert("web".to_string(), test_vault_entry("bastion"));
+        data.hosts
+            .insert("bastion".to_string(), test_vault_entry("web"));
+        vault::create(&data, password).expect("create test vault with jump cycle");
     }
 
     /// Each `#[tokio::test]` gets its own OS thread by default, but they all
@@ -1441,7 +1461,7 @@ mod tests {
         // vault before the daemon sees ApproveLease. Exact comparison must
         // catch this TOCTOU and keep the request pending again.
         vault::unlock_for_lease(b"pw").await.unwrap();
-        let preview = ssh::expand_lease_hosts(&info.hosts).await;
+        let preview = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
         vault::clear_cache().await;
         assert!(preview.iter().any(|h| h == "sloosh-test-bastion-before"));
         vault::add_entry(
@@ -1474,7 +1494,7 @@ mod tests {
         assert!(!vault::is_cached().await);
 
         vault::unlock_for_lease(b"pw").await.unwrap();
-        let exact_approval = ssh::expand_lease_hosts(&info.hosts).await;
+        let exact_approval = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
         vault::clear_cache().await;
         assert!(
             exact_approval
@@ -1493,6 +1513,48 @@ mod tests {
         assert_eq!(activated.hosts, exact_approval);
         assert!(check_authorized_for_chain(&chain, "web", None).await);
         assert!(check_authorized_for_chain(&chain, "sloosh-test-bastion-after", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_invalid_vault_route_without_consuming_request() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(775, 110, Some("sloosh")),
+            ancestor(774, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_jump_cycle(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                LeaseError::Route(ssh::SshError::ProxyJumpCycle { ref alias }) if alias == "web"
+            ),
+            "{error}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
 
         reset_state().await;
     }

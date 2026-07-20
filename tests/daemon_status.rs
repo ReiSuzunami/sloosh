@@ -36,11 +36,19 @@ async fn status_round_trip_against_running_daemon() {
         .parent()
         .expect("test socket has a parent")
         .join("home");
+    let ssh_dir = test_home.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).expect("create isolated OpenSSH config directory");
+    std::fs::write(
+        ssh_dir.join("config"),
+        "Host cycle-a\n    ProxyJump cycle-b\nHost cycle-b\n    ProxyJump cycle-a\n",
+    )
+    .expect("write isolated cyclic OpenSSH config");
     // SAFETY: this test process does not read SLOOSH_SOCKET concurrently
     // from another thread in a way that would race with this write.
     unsafe {
         std::env::set_var("SLOOSH_SOCKET", &socket_path);
         std::env::set_var("SLOOSH_HOME", &test_home);
+        std::env::set_var("HOME", &test_home);
     }
     assert_eq!(
         sloosh::transport::unix::resolve_socket_path(),
@@ -107,6 +115,20 @@ async fn status_round_trip_against_running_daemon() {
         Some(Response::ProtocolReady {
             wire_protocol: WIRE_PROTOCOL_VERSION,
         })
+    );
+
+    chan.send(&Request::RequestLease {
+        hosts: vec!["cycle-a".to_string()],
+    })
+    .await
+    .expect("send cyclic RequestLease");
+    let invalid_route = chan
+        .recv::<Response>()
+        .await
+        .expect("recv cyclic RequestLease response");
+    assert!(
+        matches!(invalid_route, Some(Response::Error { ref message }) if message.contains("ProxyJump") && message.contains("cycle") && message.contains("cycle-a")),
+        "{invalid_route:?}"
     );
 
     chan.send(&Request::InitVault {

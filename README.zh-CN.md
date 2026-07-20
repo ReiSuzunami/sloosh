@@ -97,6 +97,7 @@ lease 会共用该值；逐请求主机审批与 8 小时绝对 lease 上限仍�
 
 alias 是稳定的 lease 与 ProxyJump 身份，因此编辑时不能改名。旧的 `sloosh add` 与
 `sloosh rm` 仍为兼容保留。所有管理命令都不会输出认证材料。
+ProxyJump 循环和超过 8 跳的路由会在审批前失败；Sloosh 不会让人类审批被静默截断的主机列表。
 
 ## 从源码构建
 

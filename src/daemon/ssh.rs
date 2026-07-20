@@ -27,7 +27,7 @@
 
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -473,6 +473,10 @@ fn ssh_config_path() -> PathBuf {
     home_dir().join(".ssh").join("config")
 }
 
+fn ssh_known_hosts_path() -> PathBuf {
+    home_dir().join(".ssh").join("known_hosts")
+}
+
 /// sloosh's own known_hosts file (docs/internals/architecture.md): host keys for vault-backed
 /// hosts, auto-recorded during `sloosh approve` after the human confirms the
 /// fingerprint. Consulted only after `~/.ssh/known_hosts` comes up empty, so
@@ -480,6 +484,44 @@ fn ssh_config_path() -> PathBuf {
 /// here.
 fn sloosh_known_hosts_path() -> PathBuf {
     sloosh_home().join("known_hosts")
+}
+
+/// Verify a presented server key against the two trust stores in strict
+/// precedence order. Explicit paths keep this fail-closed policy testable
+/// without mutating process-global HOME or touching a developer's real keys.
+fn verify_server_key_at_paths(
+    host: &str,
+    port: u16,
+    server_public_key: &PublicKey,
+    openssh_path: &Path,
+    sloosh_path: &Path,
+) -> Result<bool, SshError> {
+    match russh::keys::check_known_hosts_path(host, port, server_public_key, openssh_path) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(russh::keys::Error::KeyChanged { line }) => {
+            return Err(SshError::HostKeyMismatch {
+                host: host.to_string(),
+                port,
+                line,
+            });
+        }
+        Err(error) => return Err(SshError::KnownHosts(error)),
+    }
+
+    match russh::keys::check_known_hosts_path(host, port, server_public_key, sloosh_path) {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(SshError::UnknownHostKey {
+            host: host.to_string(),
+            port,
+        }),
+        Err(russh::keys::Error::KeyChanged { line }) => Err(SshError::HostKeyMismatch {
+            host: host.to_string(),
+            port,
+            line,
+        }),
+        Err(error) => Err(SshError::KnownHosts(error)),
+    }
 }
 
 /// Resolve the local user for the "no config entry" default (docs/internals/architecture.md).
@@ -709,37 +751,13 @@ impl russh::client::Handler for Handler {
     /// either file is a hard refusal — never silently fall through to the
     /// other file once a *different* key has been recorded for this host.
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
-        match russh::keys::check_known_hosts(&self.host, self.port, server_public_key) {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
-            Err(russh::keys::Error::KeyChanged { line }) => {
-                return Err(SshError::HostKeyMismatch {
-                    host: self.host.clone(),
-                    port: self.port,
-                    line,
-                });
-            }
-            Err(e) => return Err(SshError::KnownHosts(e)),
-        }
-
-        match russh::keys::check_known_hosts_path(
+        verify_server_key_at_paths(
             &self.host,
             self.port,
             server_public_key,
-            sloosh_known_hosts_path(),
-        ) {
-            Ok(true) => Ok(true),
-            Ok(false) => Err(SshError::UnknownHostKey {
-                host: self.host.clone(),
-                port: self.port,
-            }),
-            Err(russh::keys::Error::KeyChanged { line }) => Err(SshError::HostKeyMismatch {
-                host: self.host.clone(),
-                port: self.port,
-                line,
-            }),
-            Err(e) => Err(SshError::KnownHosts(e)),
-        }
+            &ssh_known_hosts_path(),
+            &sloosh_known_hosts_path(),
+        )
     }
 
     /// Handle a `-R` forward's incoming connection (docs/internals/architecture.md): only ever
@@ -1299,12 +1317,17 @@ async fn ensure_hop_leased(
 /// every alias in each host's `ProxyJump` chain (docs/internals/architecture.md), so the human
 /// approving the request sees — and grants — coverage for the whole path,
 /// not just the final target. Order is preserved: each requested host first,
-/// then its jump hops, deduplicated overall. Resolution failures for a given
-/// host's chain (e.g. a cycle) are logged and skipped rather than failing
-/// the whole request — `RequestLease` should never become unusable because
-/// of a misconfigured jump host the caller didn't even ask to touch directly.
-pub async fn expand_lease_hosts(hosts: &[String]) -> Vec<String> {
+/// then its jump hops, deduplicated overall. Invalid routes fail instead of
+/// showing a truncated scope that the human could mistake for the full path.
+pub async fn expand_lease_hosts(hosts: &[String]) -> Result<Vec<String>, SshError> {
     let config = SshConfig::load_default();
+    expand_lease_hosts_with_config(&config, hosts).await
+}
+
+async fn expand_lease_hosts_with_config(
+    config: &SshConfig,
+    hosts: &[String],
+) -> Result<Vec<String>, SshError> {
     let mut seen = HashSet::new();
     let mut expanded = Vec::new();
 
@@ -1314,21 +1337,13 @@ pub async fn expand_lease_hosts(hosts: &[String]) -> Vec<String> {
         }
     }
     for host in hosts {
-        match jump_chain_aliases(&config, host).await {
-            Ok(aliases) => {
-                for alias in aliases {
-                    if seen.insert(alias.clone()) {
-                        expanded.push(alias);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(host, error = %e, "could not expand ProxyJump chain for lease request; \
-                       requesting only the host itself");
+        for alias in jump_chain_aliases(config, host).await? {
+            if seen.insert(alias.clone()) {
+                expanded.push(alias);
             }
         }
     }
-    expanded
+    Ok(expanded)
 }
 
 /// Build host-key confirmation work in dependency order: every target's
@@ -1702,6 +1717,134 @@ pub use russh::ChannelMsg as SessionChannelMsg;
 mod tests {
     use super::*;
 
+    const TEST_KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const TEST_KEY_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+
+    struct KnownHostsFixture {
+        root: PathBuf,
+        openssh: PathBuf,
+        sloosh: PathBuf,
+    }
+
+    impl KnownHostsFixture {
+        fn new(tag: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "sloosh-known-hosts-{tag}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create known-hosts fixture");
+            Self {
+                openssh: root.join("openssh_known_hosts"),
+                sloosh: root.join("sloosh_known_hosts"),
+                root,
+            }
+        }
+
+        fn write(&self, openssh_key: Option<&str>, sloosh_key: Option<&str>) {
+            let line = |key: &str| format!("example.com ssh-ed25519 {key}\n");
+            std::fs::write(&self.openssh, openssh_key.map(line).unwrap_or_default())
+                .expect("write OpenSSH known_hosts fixture");
+            std::fs::write(&self.sloosh, sloosh_key.map(line).unwrap_or_default())
+                .expect("write sloosh known_hosts fixture");
+        }
+    }
+
+    impl Drop for KnownHostsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_public_key(encoded: &str) -> PublicKey {
+        russh::keys::parse_public_key_base64(encoded).expect("valid test public key")
+    }
+
+    #[test]
+    fn server_key_verification_accepts_openssh_match() {
+        let fixture = KnownHostsFixture::new("openssh-match");
+        fixture.write(Some(TEST_KEY_A), None);
+
+        assert!(
+            verify_server_key_at_paths(
+                "example.com",
+                22,
+                &test_public_key(TEST_KEY_A),
+                &fixture.openssh,
+                &fixture.sloosh,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn server_key_verification_never_falls_through_openssh_mismatch() {
+        let fixture = KnownHostsFixture::new("openssh-mismatch");
+        fixture.write(Some(TEST_KEY_B), Some(TEST_KEY_A));
+
+        let error = verify_server_key_at_paths(
+            "example.com",
+            22,
+            &test_public_key(TEST_KEY_A),
+            &fixture.openssh,
+            &fixture.sloosh,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SshError::HostKeyMismatch { line: 1, .. }));
+    }
+
+    #[test]
+    fn server_key_verification_accepts_sloosh_match_after_openssh_miss() {
+        let fixture = KnownHostsFixture::new("sloosh-match");
+        fixture.write(None, Some(TEST_KEY_A));
+
+        assert!(
+            verify_server_key_at_paths(
+                "example.com",
+                22,
+                &test_public_key(TEST_KEY_A),
+                &fixture.openssh,
+                &fixture.sloosh,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn server_key_verification_rejects_sloosh_mismatch() {
+        let fixture = KnownHostsFixture::new("sloosh-mismatch");
+        fixture.write(None, Some(TEST_KEY_B));
+
+        let error = verify_server_key_at_paths(
+            "example.com",
+            22,
+            &test_public_key(TEST_KEY_A),
+            &fixture.openssh,
+            &fixture.sloosh,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SshError::HostKeyMismatch { line: 1, .. }));
+    }
+
+    #[test]
+    fn server_key_verification_rejects_unknown_host() {
+        let fixture = KnownHostsFixture::new("unknown");
+        fixture.write(None, None);
+
+        let error = verify_server_key_at_paths(
+            "example.com",
+            22,
+            &test_public_key(TEST_KEY_A),
+            &fixture.openssh,
+            &fixture.sloosh,
+        )
+        .unwrap_err();
+        assert!(matches!(error, SshError::UnknownHostKey { .. }));
+    }
+
     #[test]
     fn remote_forward_route_lifecycle_is_monotonic() {
         let lifecycle = ForwardRouteLifecycle::new();
@@ -2060,6 +2203,22 @@ Host bastion
         let mut seen = HashSet::new();
         seen.insert("target".to_string());
         let err = expand_proxy_jump_spec(&config, "bastion", &mut chain, &mut seen)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SshError::ProxyJumpCycle { alias } if alias == "target"));
+    }
+
+    #[tokio::test]
+    async fn lease_scope_rejects_a_proxy_jump_cycle() {
+        let config = SshConfig::parse(
+            "\
+Host target
+    ProxyJump bastion
+Host bastion
+    ProxyJump target
+",
+        );
+        let err = expand_lease_hosts_with_config(&config, &["target".to_string()])
             .await
             .unwrap_err();
         assert!(matches!(err, SshError::ProxyJumpCycle { alias } if alias == "target"));

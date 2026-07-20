@@ -276,7 +276,7 @@ last control message:
 ```text
 UNNEGOTIATED
   | Status -> Status                 (stay UNNEGOTIATED)
-  | Hello(2) -> ProtocolReady(2)
+  | Hello(3) -> ProtocolReady(3)
   v
 CONTROL
   | Put/Get accepted
@@ -330,10 +330,13 @@ Approval sequence:
    envelope before publishing cache state.
 5. Activation occurs only if the vectors are exactly equal.
 
-Any omission, order difference, vault/config change, or older client that omits
-`approved_hosts` fails closed. The missing field defaults to an empty vector for
-parsing, which cannot match a real non-empty grant. A mismatch returns `Error`
-and leaves the pending request available for a new preview/approval attempt.
+Any omission, order difference, vault/config change, invalid ProxyJump route,
+or older client that omits `approved_hosts` fails closed. The missing field
+defaults to an empty vector for parsing, which cannot match a real non-empty
+grant. A mismatch or route-resolution error returns `Error` and leaves an
+existing pending request available for a new preview/approval attempt. If an
+invalid route is visible before `RequestLease` creates pending state, the
+request itself returns `Error` instead.
 
 On a DMG-installed Mac, daemon may satisfy a newly created pending request via
 its bundled Touch ID or PIN helper before replying. Success returns the already-valid

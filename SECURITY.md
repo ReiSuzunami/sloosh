@@ -97,7 +97,10 @@ and the lease includes the requested host alias.
 Vault-backed ProxyJump aliases need their own host coverage. Lease approval
 compares the human CLI's expanded `approved_hosts` list with an independent
 daemon-side expansion after unlock. A missing, reordered, stale, or changed
-list fails closed.
+list fails closed. ProxyJump cycles and over-depth chains are errors at every
+scope-expansion boundary: Sloosh never warns and presents a partial host list
+as though it were complete. A route failure after unlock preserves the pending
+request and clears a preview-only vault cache when no active lease owns it.
 
 The DMG-installed macOS path stores a copy of vault master password in local
 login Keychain. Bundled helper verifies its parent is the daemon helper or

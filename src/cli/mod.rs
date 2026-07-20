@@ -500,7 +500,11 @@ async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     // second password prompt. Always clear it before returning, including
     // cancellation and daemon rejection paths.
     let approval_result: anyhow::Result<LeaseActivatedInfo> = async {
-        let approved_hosts = ssh::expand_lease_hosts(&info.hosts).await;
+        let approved_hosts = ssh::expand_lease_hosts(&info.hosts)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("could not resolve full ProxyJump approval scope: {error}")
+            })?;
         confirm_approved_hosts(&approved_hosts)?;
 
         let approve_req = Request::ApproveLease {

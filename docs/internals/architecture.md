@@ -168,9 +168,11 @@ agent CLI       daemon                         human CLI
     |              |---------- result ------------>|
 ```
 
-Mismatch fails closed and leaves pending request available for corrected
-approval. Connection-time dialing also checks each vault-backed ProxyJump alias
-independently.
+Mismatch or invalid route resolution fails closed and leaves an existing
+pending request available for corrected approval. If a cycle or over-depth
+route is visible before pending state is created, `RequestLease` fails instead
+of presenting a truncated approval scope. Connection-time dialing also checks
+each vault-backed ProxyJump alias independently.
 
 DMG-installed macOS adds an internal adapter without changing wire protocol:
 
