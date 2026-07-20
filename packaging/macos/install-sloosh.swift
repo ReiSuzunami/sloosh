@@ -111,6 +111,70 @@ private func validatedSlooshBundle(at url: URL) throws {
     try validateCodeSignature(at: url)
 }
 
+private func canonicalPath(_ url: URL) -> String {
+    url.standardizedFileURL.resolvingSymlinksInPath().path
+}
+
+private func runningTargetApplications(at target: URL) -> [NSRunningApplication] {
+    let targetPath = canonicalPath(target)
+    let targetExecutablePath = canonicalPath(
+        target.appendingPathComponent("Contents/MacOS/Sloosh")
+    )
+    return NSWorkspace.shared.runningApplications.filter { application in
+        guard !application.isTerminated else {
+            return false
+        }
+        if let bundleURL = application.bundleURL,
+           canonicalPath(bundleURL) == targetPath {
+            return true
+        }
+        return application.executableURL.map(canonicalPath) == targetExecutablePath
+    }
+}
+
+private func waitForApplicationsToExit(
+    at target: URL,
+    timeout: TimeInterval
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if runningTargetApplications(at: target).isEmpty {
+            return true
+        }
+        // NSWorkspace publishes termination changes through AppKit's run loop.
+        // A command-line installer does not otherwise drive that loop while it
+        // waits, leaving NSRunningApplication state stale after termination.
+        RunLoop.current.run(
+            mode: .default,
+            before: Date(timeIntervalSinceNow: 0.05)
+        )
+    }
+    return runningTargetApplications(at: target).isEmpty
+}
+
+private func stopRunningApplication(at target: URL) throws {
+    let applications = runningTargetApplications(at: target)
+    guard !applications.isEmpty else {
+        return
+    }
+
+    for application in applications {
+        _ = application.terminate()
+    }
+    if waitForApplicationsToExit(at: target, timeout: 5) {
+        return
+    }
+
+    for application in runningTargetApplications(at: target) {
+        _ = application.forceTerminate()
+    }
+    guard waitForApplicationsToExit(at: target, timeout: 5) else {
+        throw InstallerFailure.message(
+            "Sloosh is still running and could not be force quit. Quit it manually, then retry the update."
+        )
+    }
+}
+
 private func stopExistingDaemon(home: URL) throws {
     let socket = home.appendingPathComponent(".sloosh/sloosh.sock")
     switch try nodeKind(at: socket) {
@@ -177,7 +241,13 @@ private func stopExistingDaemon(home: URL) throws {
     )
 }
 
-private func replaceApplication(source: URL, target: URL, home: URL, stopDaemon: Bool) throws {
+private func replaceApplication(
+    source: URL,
+    target: URL,
+    home: URL,
+    stopApplication: Bool,
+    stopDaemon: Bool
+) throws {
     try validatedSlooshBundle(at: source)
     let targetKind = try nodeKind(at: target)
     if targetKind == .symbolicLink {
@@ -190,6 +260,9 @@ private func replaceApplication(source: URL, target: URL, home: URL, stopDaemon:
         guard try isRecognizedSlooshBundle(at: target) else {
             throw InstallerFailure.message("Refusing to replace unrecognized application directory \(target.path).")
         }
+    }
+    if stopApplication && targetKind == .directory {
+        try stopRunningApplication(at: target)
     }
     if stopDaemon && targetKind == .directory {
         try stopExistingDaemon(home: home)
@@ -206,6 +279,13 @@ private func replaceApplication(source: URL, target: URL, home: URL, stopDaemon:
     } catch {
         try? fileManager.removeItem(at: staged)
         throw InstallerFailure.message("Could not stage Sloosh in \(parent.path): \(error.localizedDescription)")
+    }
+
+    // Close any instance launched while the replacement was being staged.
+    // The user's confirmation covers the whole update transaction, but the
+    // old bundle must never be moved while one of its processes is still live.
+    if stopApplication && targetKind == .directory {
+        try stopRunningApplication(at: target)
     }
 
     if targetKind == .missing {
@@ -272,11 +352,18 @@ private func install(
     sourceApp: URL,
     applicationsDirectory: URL,
     home: URL,
+    stopApplication: Bool,
     stopDaemon: Bool
 ) throws -> InstallResult {
     try requireDirectory(applicationsDirectory, create: true)
     let target = applicationsDirectory.appendingPathComponent("Sloosh.app", isDirectory: true)
-    try replaceApplication(source: sourceApp, target: target, home: home, stopDaemon: stopDaemon)
+    try replaceApplication(
+        source: sourceApp,
+        target: target,
+        home: home,
+        stopApplication: stopApplication,
+        stopDaemon: stopDaemon
+    )
     return InstallResult(targetApp: target, cliMessage: installCLILink(targetApp: target, home: home))
 }
 
@@ -445,15 +532,23 @@ private func runInstallerUI() -> Int32 {
     let sourceApp = installerBundle.appendingPathComponent("Contents/Helpers/Sloosh.app")
     let applications = URL(fileURLWithPath: "/Applications", isDirectory: true)
     let home = fileManager.homeDirectoryForCurrentUser
-    let existing = (try? nodeKind(at: applications.appendingPathComponent("Sloosh.app"))) != .missing
-    let detail = existing
-        ? "This replaces the installed app and stops its daemon, ending active sessions and forwards. The CLI link at ~/.local/bin/sloosh is preserved or created when safe."
+    let target = applications.appendingPathComponent("Sloosh.app", isDirectory: true)
+    let targetKind = try? nodeKind(at: target)
+    let existing = targetKind != .missing
+    let recognizedExisting = targetKind == .directory
+        && (try? isRecognizedSlooshBundle(at: target)) == true
+    let running = recognizedExisting && !runningTargetApplications(at: target).isEmpty
+    let detail = running
+        ? "Sloosh is running. Continuing will ask it to quit; if it does not close within 5 seconds, the installer will force quit it. Its daemon will also stop, ending active sessions and forwards."
+        : existing
+        ? "This replaces the installed app. If Sloosh starts before replacement, the installer will quit it and force quit after 5 seconds if needed. Its daemon will also stop, ending active sessions and forwards."
         : "Sloosh will be copied to Applications. Its CLI will be linked at ~/.local/bin/sloosh when that path is available."
 
     guard showAlert(
-        title: existing ? "Replace Sloosh?" : "Install Sloosh?",
+        title: running ? "Quit Sloosh and Update?" : existing ? "Replace Sloosh?" : "Install Sloosh?",
         message: detail,
-        buttons: [existing ? "Replace" : "Install", "Cancel"]
+        buttons: [running ? "Quit and Update" : existing ? "Replace" : "Install", "Cancel"],
+        style: running ? .warning : .informational
     ) == .alertFirstButtonReturn else {
         return 0
     }
@@ -464,6 +559,7 @@ private func runInstallerUI() -> Int32 {
             sourceApp: sourceApp,
             applicationsDirectory: applications,
             home: home,
+            stopApplication: true,
             stopDaemon: true
         )
     } catch {
@@ -525,6 +621,7 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
                 sourceApp: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/Sloosh.app"),
                 applicationsDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
                 home: URL(fileURLWithPath: arguments[3], isDirectory: true),
+                stopApplication: false,
                 stopDaemon: false
             )
             print("installed \(result.targetApp.path)")
@@ -550,6 +647,21 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
             fputs("error: \(error.localizedDescription)\n", stderr)
             return 1
         }
+    case "--test-stop-application":
+        guard arguments.count == 3 else { return 2 }
+        do {
+            try stopRunningApplication(at: URL(fileURLWithPath: arguments[2], isDirectory: true))
+            return 0
+        } catch {
+            fputs("error: \(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    case "--test-running-application-count":
+        guard arguments.count == 3 else { return 2 }
+        print(runningTargetApplications(
+            at: URL(fileURLWithPath: arguments[2], isDirectory: true)
+        ).count)
+        return 0
     case "--test-cleanup":
         guard arguments.count == 3 else { return 2 }
         do {

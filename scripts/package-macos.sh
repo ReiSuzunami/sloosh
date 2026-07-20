@@ -49,8 +49,22 @@ tmp_dir="$(mktemp -d)"
 mount_dir="$tmp_dir/mount"
 mounted_path="$mount_dir"
 mounted=0
+mounted_installer=""
+test_gui_started=0
+running_gui_home=""
+simulated_install=""
 
 cleanup() {
+  if [[ "$test_gui_started" -eq 1 && -x "$mounted_installer/Contents/MacOS/install-sloosh" ]]; then
+    env SLOOSH_INSTALLER_TEST_MODE=1 \
+      "$mounted_installer/Contents/MacOS/install-sloosh" \
+        --test-stop-application "$simulated_install" >/dev/null 2>&1 || true
+    if [[ -n "$running_gui_home" && -S "$running_gui_home/.sloosh/sloosh.sock" ]]; then
+      env SLOOSH_INSTALLER_TEST_MODE=1 \
+        "$mounted_installer/Contents/MacOS/install-sloosh" \
+          --test-shutdown "$running_gui_home" >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ "$mounted" -eq 1 ]]; then
     hdiutil detach "$mounted_path" >/dev/null 2>&1 ||
       hdiutil detach -force "$mounted_path" >/dev/null 2>&1 || true
@@ -64,7 +78,10 @@ contents="$app/Contents"
 installer="$tmp_dir/Install Sloosh.app"
 installer_contents="$installer/Contents"
 icon_source="$repo_root/packaging/macos/AppIcon.png"
+adaptive_icon_source="$repo_root/packaging/macos/Sloosh.icon"
 iconset="$tmp_dir/Sloosh.iconset"
+adaptive_icon_output="$tmp_dir/adaptive-icon"
+adaptive_icon_plist="$tmp_dir/adaptive-icon.plist"
 background_generator="$repo_root/packaging/macos/render-dmg-background.swift"
 layout_script="$repo_root/packaging/macos/layout-dmg.applescript"
 installer_source="$repo_root/packaging/macos/install-sloosh.swift"
@@ -113,6 +130,27 @@ done <<'ICON_SIZES'
 ICON_SIZES
 iconutil -c icns "$iconset" -o "$contents/Resources/Sloosh.icns"
 [[ -s "$contents/Resources/Sloosh.icns" ]]
+
+mkdir -p "$adaptive_icon_output"
+if xcrun actool \
+  --compile "$adaptive_icon_output" \
+  --platform macosx \
+  --target-device mac \
+  --minimum-deployment-target 11.0 \
+  --app-icon Sloosh \
+  --standalone-icon-behavior all \
+  --output-partial-info-plist "$adaptive_icon_plist" \
+  "$adaptive_icon_source" >"$tmp_dir/actool.log" 2>&1; then
+  install -m 0644 "$adaptive_icon_output/Assets.car" \
+    "$contents/Resources/Assets.car"
+  install -m 0644 "$adaptive_icon_output/Sloosh.icns" \
+    "$contents/Resources/Sloosh.icns"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Sloosh" \
+    "$contents/Info.plist"
+else
+  echo "adaptive app icons are unavailable; using static ICNS fallback" >&2
+  sed 's/^/actool: /' "$tmp_dir/actool.log" >&2
+fi
 
 /usr/libexec/PlistBuddy -c \
   "Set :CFBundleShortVersionString $marketing_version" "$contents/Info.plist"
@@ -215,6 +253,12 @@ ditto "$app" "$installer_contents/Helpers/Sloosh.app"
 install -m 0644 "$contents/Resources/Sloosh.icns" \
   "$installer_contents/Resources/Sloosh.icns"
 install -m 0644 "$installer_info" "$installer_contents/Info.plist"
+if [[ -s "$contents/Resources/Assets.car" ]]; then
+  install -m 0644 "$contents/Resources/Assets.car" \
+    "$installer_contents/Resources/Assets.car"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Sloosh" \
+    "$installer_contents/Info.plist"
+fi
 /usr/libexec/PlistBuddy -c \
   "Set :CFBundleShortVersionString $marketing_version" "$installer_contents/Info.plist"
 /usr/libexec/PlistBuddy -c \
@@ -311,6 +355,13 @@ test "$(sips -g pixelHeight "$mount_dir/.background/background.png" |
 test "$(plutil -extract CFBundleIconFile raw \
   "$mounted_app/Contents/Info.plist")" = "Sloosh.icns"
 [[ -s "$mounted_app/Contents/Resources/Sloosh.icns" ]]
+if [[ -s "$mounted_app/Contents/Resources/Assets.car" ]]; then
+  test "$(plutil -extract CFBundleIconName raw \
+    "$mounted_app/Contents/Info.plist")" = "Sloosh"
+  [[ -s "$mounted_installer/Contents/Resources/Assets.car" ]]
+  test "$(plutil -extract CFBundleIconName raw \
+    "$mounted_installer/Contents/Info.plist")" = "Sloosh"
+fi
 [[ -x "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/MacOS/sloosh-approval" ]]
 test "$(plutil -extract CFBundleIdentifier raw \
   "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/Info.plist")" = \
@@ -357,6 +408,65 @@ env SLOOSH_INSTALLER_TEST_MODE=1 \
   "$mounted_installer/Contents/MacOS/install-sloosh" \
   --test-install "$(dirname "$simulated_install")" "$simulated_home"
 codesign --verify --deep --strict --verbose=2 "$simulated_install"
+
+# Updating a running GUI first asks it to terminate, escalates to force-quit
+# after a bounded wait, and never targets another bundle path with the same ID.
+running_gui_home="$tmp_dir/running-gui-home"
+mkdir -p "$running_gui_home/.sloosh"
+open -n -g \
+  --env "SLOOSH_HOME=$running_gui_home/.sloosh" \
+  --stdout "$tmp_dir/running-gui.log" \
+  --stderr "$tmp_dir/running-gui.log" \
+  "$simulated_install"
+test_gui_started=1
+running_count=0
+for _ in {1..100}; do
+  running_count="$(
+    env SLOOSH_INSTALLER_TEST_MODE=1 \
+      "$mounted_installer/Contents/MacOS/install-sloosh" \
+        --test-running-application-count "$simulated_install"
+  )"
+  [[ "$running_count" -gt 0 ]] && break
+  sleep 0.05
+done
+[[ "$running_count" -gt 0 ]] || {
+  echo "installer did not recognize the running sandbox Sloosh GUI" >&2
+  exit 1
+}
+env SLOOSH_INSTALLER_TEST_MODE=1 \
+  "$mounted_installer/Contents/MacOS/install-sloosh" \
+    --test-stop-application "$tmp_dir/not-the-running-app/Sloosh.app"
+running_count="$(
+  env SLOOSH_INSTALLER_TEST_MODE=1 \
+    "$mounted_installer/Contents/MacOS/install-sloosh" \
+      --test-running-application-count "$simulated_install"
+)"
+[[ "$running_count" -gt 0 ]] || {
+  echo "installer stopped a Sloosh GUI at the wrong bundle path" >&2
+  exit 1
+}
+env SLOOSH_INSTALLER_TEST_MODE=1 \
+  "$mounted_installer/Contents/MacOS/install-sloosh" \
+    --test-stop-application "$simulated_install"
+for _ in {1..100}; do
+  running_count="$(
+    env SLOOSH_INSTALLER_TEST_MODE=1 \
+      "$mounted_installer/Contents/MacOS/install-sloosh" \
+        --test-running-application-count "$simulated_install"
+  )"
+  [[ "$running_count" -eq 0 ]] && break
+  sleep 0.05
+done
+if [[ "$running_count" -ne 0 ]]; then
+  echo "installer did not stop the running sandbox Sloosh GUI" >&2
+  exit 1
+fi
+if [[ -S "$running_gui_home/.sloosh/sloosh.sock" ]]; then
+  env SLOOSH_INSTALLER_TEST_MODE=1 \
+    "$mounted_installer/Contents/MacOS/install-sloosh" \
+      --test-shutdown "$running_gui_home"
+fi
+test_gui_started=0
 
 # An unrelated existing CLI must never be overwritten.
 conflict_home="$tmp_dir/conflict-home"

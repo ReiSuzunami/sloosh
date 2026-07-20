@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "version": 1,
+//!   "version": 2,
 //!   "kdf": { "m_cost": 65536, "t_cost": 3, "p_cost": 4, "salt": "<hex>" },
 //!   "nonce": "<hex>",
 //!   "ciphertext": "<hex>"
@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::proto::{HostAuthKind, HostRoute};
 use crate::transport::unix::{ensure_private_dir, sloosh_home};
 
 /// Argon2id memory cost in KiB (64 MiB). docs/internals/architecture.md asks for "m=64MiB
@@ -53,8 +54,14 @@ const KDF_T_COST: u32 = 3;
 const KDF_P_COST: u32 = 4;
 const KDF_OUTPUT_LEN: usize = 32;
 const SALT_LEN: usize = 16;
+const MAX_HOST_ALIAS_BYTES: usize = 255;
+const MAX_HOSTNAME_BYTES: usize = 255;
+const MAX_HOST_USER_BYTES: usize = 255;
+const MAX_JUMP_BYTES: usize = 1024;
+const MAX_MANAGED_ROUTE_HOPS: usize = 8;
 
-const VAULT_VERSION: u32 = 1;
+const VAULT_VERSION: u32 = 2;
+const LEGACY_VAULT_VERSION: u32 = 1;
 
 /// Standard vault location: `~/.sloosh/vault`.
 pub fn vault_path() -> PathBuf {
@@ -154,9 +161,8 @@ impl Drop for VaultData {
 }
 
 /// One vault entry: enough connection info to dial a host plus an auth
-/// method. `AuthMethod` is deliberately an enum so it can grow a
-/// `Key { path, passphrase }` variant later without breaking the on-disk
-/// format (`#[serde(default)]` discipline, per proto.rs conventions).
+/// method. Vault version 2 adds explicit agent/key-file authentication and
+/// typed routes; version 1 plaintext is accepted and migrated on next write.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HostEntry {
     pub hostname: String,
@@ -165,14 +171,49 @@ pub struct HostEntry {
     #[serde(default)]
     pub user: Option<String>,
     pub auth: AuthMethod,
-    /// Optional jump host alias (docs/internals/architecture.md), resolvable via the vault or
-    /// `~/.ssh/config` — same syntax as an `~/.ssh/config` `ProxyJump` entry
-    /// (`user@host:port`, or a bare alias). `#[serde(default)]` so vault
-    /// files written before this field existed (still version 1 — this is a
-    /// purely additive change) keep decrypting. Not a secret: fine to show
-    /// in `Debug` output.
-    #[serde(default)]
-    pub jump: Option<String>,
+    /// `alias = "jump"` accepts version-1 plaintext. The custom decoder maps
+    /// `null` to Direct and a legacy string to advanced ProxyJump semantics.
+    #[serde(default, alias = "jump", deserialize_with = "deserialize_host_route")]
+    pub route: HostRoute,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredRoute {
+    Typed(HostRoute),
+    Legacy(String),
+}
+
+fn deserialize_host_route<'de, D>(deserializer: D) -> Result<HostRoute, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<StoredRoute>::deserialize(deserializer)? {
+        None => HostRoute::Direct,
+        Some(StoredRoute::Typed(route)) => route,
+        Some(StoredRoute::Legacy(spec)) => HostRoute::ProxyJump { spec },
+    })
+}
+
+/// Connection metadata safe to return to human management clients.
+/// Authentication material is deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMetadata {
+    pub alias: String,
+    pub hostname: String,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub auth: HostAuthKind,
+    pub route: HostRoute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostUpdate {
+    pub alias: String,
+    pub hostname: String,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub route: HostRoute,
 }
 
 impl HostEntry {
@@ -188,7 +229,7 @@ impl fmt::Debug for HostEntry {
             .field("port", &self.port)
             .field("user", &self.user)
             .field("auth", &self.auth)
-            .field("jump", &self.jump)
+            .field("route", &self.route)
             .finish()
     }
 }
@@ -197,12 +238,25 @@ impl fmt::Debug for HostEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {
     Password { password: String },
+    Agent,
+    KeyFile { path: String },
+}
+
+impl AuthMethod {
+    pub fn kind(&self) -> HostAuthKind {
+        match self {
+            Self::Password { .. } => HostAuthKind::Password,
+            Self::Agent => HostAuthKind::Agent,
+            Self::KeyFile { .. } => HostAuthKind::KeyFile,
+        }
+    }
 }
 
 impl AuthMethod {
     fn zeroize_secrets(&mut self) {
         match self {
             AuthMethod::Password { password } => password.zeroize(),
+            AuthMethod::Agent | AuthMethod::KeyFile { .. } => {}
         }
     }
 }
@@ -214,6 +268,8 @@ impl fmt::Debug for AuthMethod {
                 .debug_struct("Password")
                 .field("password", &"<redacted>")
                 .finish(),
+            AuthMethod::Agent => f.write_str("Agent"),
+            AuthMethod::KeyFile { path } => f.debug_struct("KeyFile").field("path", path).finish(),
         }
     }
 }
@@ -226,14 +282,14 @@ impl fmt::Debug for AuthMethod {
 pub enum VaultError {
     #[error(
         "no vault at {path} yet — this is a brand-new sloosh install; a human needs to run \
-         `sloosh vault init` (or `sloosh add <alias> --hostname <host>`) in a real terminal \
+         `sloosh vault init` (or `sloosh host add <alias> --hostname <host>`) in a real terminal \
          to create one and set a master password"
     )]
     NotFound { path: PathBuf },
 
     #[error(
         "vault file at {path} is not valid sloosh-vault JSON — it may be corrupted; restore \
-         from backup or delete it and re-add your hosts with `sloosh add` (cause: {source})"
+         from backup or delete it and re-add your hosts with `sloosh host add` (cause: {source})"
     )]
     Corrupt {
         path: PathBuf,
@@ -273,11 +329,22 @@ pub enum VaultError {
         source: io::Error,
     },
 
-    #[error("no host entry named '{0}' in the vault — run `sloosh add {0} --hostname <host>`")]
+    #[error("no host entry named '{0}' in the vault — run `sloosh host add {0} --hostname <host>`")]
     NoSuchHost(String),
 
-    #[error("'{0}' is already in the vault — run `sloosh rm {0}` first if you want to replace it")]
+    #[error("'{0}' is already in the vault — use `sloosh host edit {0}` or remove it first")]
     HostExists(String),
+
+    #[error("cannot remove '{alias}' because these managed routes depend on it: {dependents}")]
+    HostInUse { alias: String, dependents: String },
+
+    #[error("invalid host metadata: {0}")]
+    InvalidHost(String),
+
+    #[error(
+        "vault format version {found} is newer than this Sloosh build supports (latest: {supported}); upgrade Sloosh before opening it"
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
 
     #[error("a vault already exists at {0}; this function is only for first-time creation")]
     AlreadyExists(PathBuf),
@@ -427,16 +494,28 @@ fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultErr
             path: tmp_path.clone(),
             source,
         })?;
-    let result = tmp.write_all(&json).map_err(|source| VaultError::Write {
-        path: tmp_path.clone(),
-        source,
-    });
+    let result = tmp
+        .write_all(&json)
+        .and_then(|()| tmp.sync_all())
+        .map_err(|source| VaultError::Write {
+            path: tmp_path.clone(),
+            source,
+        });
     drop(tmp);
     let result = result.and_then(|()| {
         std::fs::rename(&tmp_path, path).map_err(|source| VaultError::Write {
             path: path.to_path_buf(),
             source,
         })
+    });
+    let result = result.and_then(|()| {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| VaultError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -473,11 +552,17 @@ fn unlock_material_at(
     password: &[u8],
 ) -> Result<(VaultData, KdfParamsFile, Zeroizing<[u8; 32]>), VaultError> {
     let VaultFile {
+        version,
         kdf,
         nonce,
         ciphertext,
-        ..
     } = read_vault_file(path)?;
+    if version != LEGACY_VAULT_VERSION && version != VAULT_VERSION {
+        return Err(VaultError::UnsupportedVersion {
+            found: version,
+            supported: VAULT_VERSION,
+        });
+    }
     let key = derive_key(password, &kdf)?;
     let nonce = hex_decode(&nonce)?;
     let ciphertext = hex_decode(&ciphertext)?;
@@ -497,6 +582,96 @@ fn create_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), Vault
     save_new_at(path, data, password)
 }
 
+fn validate_host_field(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), VaultError> {
+    if value.trim().is_empty() {
+        return Err(VaultError::InvalidHost(format!("{field} cannot be empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(VaultError::InvalidHost(format!(
+            "{field} exceeds the {max_bytes}-byte limit"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(VaultError::InvalidHost(format!(
+            "{field} cannot contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_host_update(metadata: &HostUpdate) -> Result<(), VaultError> {
+    validate_host_field("alias", &metadata.alias, MAX_HOST_ALIAS_BYTES)?;
+    validate_host_field("hostname", &metadata.hostname, MAX_HOSTNAME_BYTES)?;
+    if metadata.port == Some(0) {
+        return Err(VaultError::InvalidHost(
+            "port must be between 1 and 65535".to_string(),
+        ));
+    }
+    if let Some(user) = &metadata.user {
+        validate_host_field("user", user, MAX_HOST_USER_BYTES)?;
+    }
+    match &metadata.route {
+        HostRoute::Direct => {}
+        HostRoute::ManagedHost { alias } => {
+            validate_host_field("managed host alias", alias, MAX_HOST_ALIAS_BYTES)?;
+            if alias == &metadata.alias {
+                return Err(VaultError::InvalidHost(
+                    "a host cannot route through itself".to_string(),
+                ));
+            }
+        }
+        HostRoute::ProxyJump { spec } => {
+            validate_host_field("ProxyJump", spec, MAX_JUMP_BYTES)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_auth(auth: &AuthMethod) -> Result<(), VaultError> {
+    if let AuthMethod::KeyFile { path } = auth {
+        validate_host_field("key file path", path, MAX_JUMP_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_managed_route(
+    data: &VaultData,
+    owner: &str,
+    route: &HostRoute,
+) -> Result<(), VaultError> {
+    if let HostRoute::ManagedHost { alias } = route {
+        if !data.hosts.contains_key(alias) {
+            return Err(VaultError::InvalidHost(format!(
+                "managed route host '{alias}' does not exist; add that host profile first"
+            )));
+        }
+        let mut seen = std::collections::HashSet::from([owner.to_string()]);
+        let mut current = alias.as_str();
+        for _ in 0..MAX_MANAGED_ROUTE_HOPS {
+            if !seen.insert(current.to_string()) {
+                return Err(VaultError::InvalidHost(format!(
+                    "managed route creates a cycle through '{current}'"
+                )));
+            }
+            let Some(entry) = data.hosts.get(current) else {
+                return Ok(());
+            };
+            match &entry.route {
+                HostRoute::ManagedHost { alias } => current = alias,
+                HostRoute::Direct | HostRoute::ProxyJump { .. } => return Ok(()),
+            }
+        }
+        return Err(VaultError::InvalidHost(format!(
+            "managed route exceeds the {MAX_MANAGED_ROUTE_HOPS}-hop limit"
+        )));
+    }
+    Ok(())
+}
+
 async fn add_entry_at(
     path: &Path,
     alias: &str,
@@ -504,6 +679,14 @@ async fn add_entry_at(
     password: &[u8],
     replace: bool,
 ) -> Result<(), VaultError> {
+    validate_host_update(&HostUpdate {
+        alias: alias.to_string(),
+        hostname: entry.hostname.clone(),
+        port: entry.port,
+        user: entry.user.clone(),
+        route: entry.route.clone(),
+    })?;
+    validate_auth(&entry.auth)?;
     let _mutation = vault_mutation_lock().lock().await;
     let data = {
         let _writer = vault_writer_guard();
@@ -515,6 +698,7 @@ async fn add_entry_at(
         if !replace && data.hosts.contains_key(alias) {
             return Err(VaultError::HostExists(alias.to_string()));
         }
+        validate_managed_route(&data, alias, &entry.route)?;
         data.hosts.insert(alias.to_string(), entry);
         save_new_at(path, &data, password)?;
         data
@@ -528,8 +712,85 @@ async fn rm_entry_at(path: &Path, alias: &str, password: &[u8]) -> Result<(), Va
     let data = {
         let _writer = vault_writer_guard();
         let mut data = unlock_at(path, password)?;
+        let mut dependents = data
+            .hosts
+            .iter()
+            .filter_map(|(dependent, entry)| match &entry.route {
+                HostRoute::ManagedHost { alias: route_alias } if route_alias == alias => {
+                    Some(dependent.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        dependents.sort_unstable();
+        if !dependents.is_empty() {
+            return Err(VaultError::HostInUse {
+                alias: alias.to_string(),
+                dependents: dependents.join(", "),
+            });
+        }
         if data.hosts.remove(alias).is_none() {
             return Err(VaultError::NoSuchHost(alias.to_string()));
+        }
+        save_new_at(path, &data, password)?;
+        data
+    };
+    refresh_cache_if_present(path, &data, password).await;
+    Ok(())
+}
+
+fn list_entries_at(path: &Path, password: &[u8]) -> Result<Vec<HostMetadata>, VaultError> {
+    let _writer = vault_writer_guard();
+    let data = unlock_at(path, password)?;
+    let mut hosts = data
+        .hosts
+        .iter()
+        .map(|(alias, entry)| HostMetadata {
+            alias: alias.clone(),
+            hostname: entry.hostname.clone(),
+            port: entry.port,
+            user: entry.user.clone(),
+            auth: entry.auth.kind(),
+            route: entry.route.clone(),
+        })
+        .collect::<Vec<_>>();
+    hosts.sort_unstable_by(|left, right| left.alias.cmp(&right.alias));
+    Ok(hosts)
+}
+
+async fn update_entry_at(
+    path: &Path,
+    metadata: HostUpdate,
+    new_auth: Option<AuthMethod>,
+    password: &[u8],
+) -> Result<(), VaultError> {
+    validate_host_update(&metadata)?;
+    if let Some(auth) = &new_auth {
+        validate_auth(auth)?;
+    }
+    let _mutation = vault_mutation_lock().lock().await;
+    let data = {
+        let _writer = vault_writer_guard();
+        let mut data = unlock_at(path, password)?;
+        let HostUpdate {
+            alias,
+            hostname,
+            port,
+            user,
+            route,
+        } = metadata;
+        validate_managed_route(&data, &alias, &route)?;
+        let entry = data
+            .hosts
+            .get_mut(&alias)
+            .ok_or_else(|| VaultError::NoSuchHost(alias.clone()))?;
+        entry.hostname = hostname;
+        entry.port = port;
+        entry.user = user;
+        entry.route = route;
+        if let Some(new_auth) = new_auth {
+            entry.auth.zeroize_secrets();
+            entry.auth = new_auth;
         }
         save_new_at(path, &data, password)?;
         data
@@ -581,6 +842,21 @@ pub async fn add_entry(
 /// Remove a host entry, re-encrypting and saving the whole vault.
 pub async fn rm_entry(alias: &str, password: &[u8]) -> Result<(), VaultError> {
     rm_entry_at(&vault_path(), alias, password).await
+}
+
+/// Return sorted, non-secret host metadata after verifying the Master Password.
+pub fn list_entries(password: &[u8]) -> Result<Vec<HostMetadata>, VaultError> {
+    list_entries_at(&vault_path(), password)
+}
+
+/// Update an existing host atomically, preserving its SSH password unless a
+/// replacement is supplied.
+pub async fn update_entry(
+    metadata: HostUpdate,
+    new_auth: Option<AuthMethod>,
+    password: &[u8],
+) -> Result<(), VaultError> {
+    update_entry_at(&vault_path(), metadata, new_auth, password).await
 }
 
 // ---------------------------------------------------------------------
@@ -718,15 +994,13 @@ mod tests {
             auth: AuthMethod::Password {
                 password: "hunter2".to_string(),
             },
-            jump: None,
+            route: HostRoute::Direct,
         }
     }
 
     #[test]
     fn host_entry_without_jump_field_still_deserializes() {
-        // Simulates a vault entry written before the `jump` field existed —
-        // `#[serde(default)]` must let it decode with `jump: None` rather
-        // than failing, so old (still version 1) vault files keep working.
+        // Simulates a version-1 vault entry before typed routes existed.
         let json = r#"{
             "hostname": "example.com",
             "port": 22,
@@ -735,7 +1009,74 @@ mod tests {
         }"#;
         let entry: HostEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.hostname, "example.com");
-        assert_eq!(entry.jump, None);
+        assert_eq!(entry.route, HostRoute::Direct);
+    }
+
+    #[test]
+    fn version_one_jump_string_migrates_to_proxy_jump_route() {
+        let json = r#"{
+            "hostname": "example.com",
+            "auth": { "type": "agent" },
+            "jump": "bastion,edge"
+        }"#;
+        let entry: HostEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            entry.route,
+            HostRoute::ProxyJump {
+                spec: "bastion,edge".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn auth_debug_redacts_password_and_labels_non_secret_methods() {
+        let password = format!(
+            "{:?}",
+            AuthMethod::Password {
+                password: "never-print-me".to_string()
+            }
+        );
+        assert!(!password.contains("never-print-me"));
+        assert!(password.contains("redacted"));
+        assert_eq!(format!("{:?}", AuthMethod::Agent), "Agent");
+        assert!(
+            format!(
+                "{:?}",
+                AuthMethod::KeyFile {
+                    path: "~/.ssh/id_ed25519".to_string()
+                }
+            )
+            .contains("id_ed25519")
+        );
+    }
+
+    #[test]
+    fn newer_vault_envelope_fails_with_upgrade_message() {
+        let path = temp_vault_path("future-version");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+        let mut file = read_vault_file(&path).unwrap();
+        file.version = VAULT_VERSION + 1;
+        write_vault_file_atomic(&path, &file).unwrap();
+        let error = unlock_at(&path, b"pw").unwrap_err();
+        assert!(matches!(error, VaultError::UnsupportedVersion { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn version_one_envelope_is_rewritten_as_version_two_on_mutation() {
+        let path = temp_vault_path("legacy-envelope");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+        let mut file = read_vault_file(&path).unwrap();
+        file.version = LEGACY_VAULT_VERSION;
+        write_vault_file_atomic(&path, &file).unwrap();
+
+        add_entry_at(&path, "web", sample_entry(), b"pw", false)
+            .await
+            .unwrap();
+        assert_eq!(read_vault_file(&path).unwrap().version, VAULT_VERSION);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -757,6 +1098,7 @@ mod tests {
         assert_eq!(entry.hostname, "example.com");
         match &entry.auth {
             AuthMethod::Password { password } => assert_eq!(password, "hunter2"),
+            AuthMethod::Agent | AuthMethod::KeyFile { .. } => panic!("wrong auth method"),
         }
 
         let _ = std::fs::remove_file(&path);
@@ -871,6 +1213,204 @@ mod tests {
         assert!(matches!(err, VaultError::NoSuchHost(_)));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn list_update_refreshes_cache_and_rotates_password() {
+        let _cache_guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("list-update");
+        let _ = std::fs::remove_file(&path);
+
+        let mut data = VaultData::default();
+        data.hosts.insert("web".to_string(), sample_entry());
+        let mut bastion = sample_entry();
+        bastion.hostname = "bastion.example.com".to_string();
+        data.hosts.insert("bastion".to_string(), bastion);
+        create_at(&path, &data, b"pw").unwrap();
+        unlock_for_lease_at(&path, b"pw").await.unwrap();
+
+        let hosts = list_entries_at(&path, b"pw").unwrap();
+        assert_eq!(
+            hosts
+                .iter()
+                .map(|host| host.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bastion", "web"]
+        );
+
+        update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "web".to_string(),
+                hostname: "web.internal.example".to_string(),
+                port: Some(2222),
+                user: Some("deploy".to_string()),
+                route: HostRoute::ManagedHost {
+                    alias: "bastion".to_string(),
+                },
+            },
+            None,
+            b"pw",
+        )
+        .await
+        .unwrap();
+
+        let updated = unlock_at(&path, b"pw").unwrap();
+        let entry = updated.hosts.get("web").unwrap();
+        assert_eq!(entry.hostname, "web.internal.example");
+        assert_eq!(entry.port, Some(2222));
+        assert_eq!(entry.user.as_deref(), Some("deploy"));
+        assert_eq!(
+            entry.route,
+            HostRoute::ManagedHost {
+                alias: "bastion".to_string()
+            }
+        );
+        let AuthMethod::Password { password } = &entry.auth else {
+            panic!("password auth should be preserved");
+        };
+        assert_eq!(password, "hunter2");
+
+        let cached = get_entry("web").await.unwrap();
+        assert_eq!(cached.hostname, "web.internal.example");
+        assert_eq!(
+            cached.route,
+            HostRoute::ManagedHost {
+                alias: "bastion".to_string()
+            }
+        );
+
+        let cycle = update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "bastion".to_string(),
+                hostname: "bastion.example.com".to_string(),
+                port: None,
+                user: None,
+                route: HostRoute::ManagedHost {
+                    alias: "web".to_string(),
+                },
+            },
+            None,
+            b"pw",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(cycle, VaultError::InvalidHost(message) if message.contains("cycle")));
+
+        let error = rm_entry_at(&path, "bastion", b"pw").await.unwrap_err();
+        assert!(matches!(error, VaultError::HostInUse { alias, .. } if alias == "bastion"));
+
+        update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "web".to_string(),
+                hostname: "web.internal.example".to_string(),
+                port: Some(2222),
+                user: Some("deploy".to_string()),
+                route: HostRoute::ManagedHost {
+                    alias: "bastion".to_string(),
+                },
+            },
+            Some(AuthMethod::Password {
+                password: "rotated-password".to_string(),
+            }),
+            b"pw",
+        )
+        .await
+        .unwrap();
+        let cached = get_entry("web").await.unwrap();
+        let AuthMethod::Password { password } = &cached.auth else {
+            panic!("password auth should be replaced");
+        };
+        assert_eq!(password, "rotated-password");
+
+        let err = update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "missing".to_string(),
+                hostname: "missing.example.com".to_string(),
+                port: None,
+                user: None,
+                route: HostRoute::Direct,
+            },
+            None,
+            b"pw",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VaultError::NoSuchHost(alias) if alias == "missing"));
+
+        clear_cache().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn host_mutations_reject_invalid_metadata_before_writing() {
+        let _cache_guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("invalid-hosts");
+        let _ = std::fs::remove_file(&path);
+
+        let err = add_entry_at(&path, "", sample_entry(), b"pw", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidHost(_)));
+        assert!(!path.exists());
+
+        let mut bad_port = sample_entry();
+        bad_port.port = Some(0);
+        let err = add_entry_at(&path, "web", bad_port, b"pw", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidHost(_)));
+
+        let err = add_entry_at(
+            &path,
+            "a".repeat(MAX_HOST_ALIAS_BYTES + 1).as_str(),
+            sample_entry(),
+            b"pw",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidHost(_)));
+
+        let err = update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "web".to_string(),
+                hostname: "server.example.com".to_string(),
+                port: None,
+                user: Some("line\nbreak".to_string()),
+                route: HostRoute::Direct,
+            },
+            None,
+            b"pw",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidHost(_)));
+
+        let err = update_entry_at(
+            &path,
+            HostUpdate {
+                alias: "web".to_string(),
+                hostname: "server.example.com".to_string(),
+                port: None,
+                user: None,
+                route: HostRoute::ManagedHost {
+                    alias: "web".to_string(),
+                },
+            },
+            None,
+            b"pw",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidHost(_)));
+        assert!(!path.exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

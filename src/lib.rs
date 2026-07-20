@@ -11,3 +11,4 @@ pub mod native_approval;
 pub mod procs;
 pub mod proto;
 pub mod transport;
+pub mod vault_settings;

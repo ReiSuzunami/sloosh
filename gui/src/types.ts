@@ -20,7 +20,29 @@ export type AppSnapshot = {
     remainingSecs: number | null;
     error: string | null;
   };
+  vaultUnlock: VaultUnlockSnapshot;
+  vaultTimeoutMinutes: 1 | 5 | 15 | 30;
   cliPath: string;
 };
 
-export type View = 'overview' | 'security' | 'setup';
+export type VaultUnlockSnapshot = {
+  state: 'locked' | 'unlocked';
+  method: 'master_password' | 'touch_id' | 'pin' | null;
+  idleRemainingSecs: number | null;
+  absoluteRemainingSecs: number | null;
+  idleTimeoutMinutes: 1 | 5 | 15 | 30;
+};
+
+export type HostSummary = {
+  alias: string;
+  hostname: string;
+  port: number | null;
+  user: string | null;
+  auth: 'agent' | 'password' | 'key_file';
+  route:
+    | { type: 'direct' }
+    | { type: 'managed_host'; alias: string }
+    | { type: 'proxy_jump'; spec: string };
+};
+
+export type View = 'overview' | 'hosts' | 'security' | 'setup';

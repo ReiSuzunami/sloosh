@@ -7,7 +7,7 @@
 //! `Interrupt`/`Open`/`Ls`/`Kill`), port forwarding (`Forward`/`ForwardLs`/
 //! `ForwardStop`), and the vault/lease authorization flow
 //! (`RequestLease`/`DescribeLeaseRequest`/`ApproveLease`/`VaultExists`/
-//! `InitVault`/`AddCred`/`RmCred`).
+//! `InitVault`/`AddCred`/`ListHosts`/`UpdateHost`/`RmCred`).
 //!
 //! **Trust posture (docs/internals/architecture.md):** the Unix socket is still mode 0600
 //! same-user-only (see `transport::unix`) — that's the outer perimeter. On
@@ -22,7 +22,7 @@
 //! moment its lease expires or is revoked, even though a shell session
 //! survives that (`daemon::forward`'s module doc explains why).
 //!
-//! CLI-side TTY guards (`approve`/`add`/`rm`/`vault init`) only protect
+//! CLI-side TTY guards (`approve`/`host *`/legacy `add`/`rm`/`vault init`) only protect
 //! those entry points: any same-user process can write raw NDJSON straight
 //! to the socket, so every human-in-the-loop property must also hold
 //! daemon-side. Concretely: `ApproveLease` never creates the vault (a
@@ -698,25 +698,95 @@ async fn handle_connection(
                 hostname,
                 port,
                 user,
-                ssh_password,
+                auth,
                 master_password,
                 replace,
-                jump,
+                route,
             } => {
+                let auth = match auth {
+                    proto::HostAuth::Agent => vault::AuthMethod::Agent,
+                    proto::HostAuth::Password { password } => vault::AuthMethod::Password {
+                        password: password.into_string(),
+                    },
+                    proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                };
                 let entry = vault::HostEntry {
                     hostname,
                     port,
                     user,
-                    auth: vault::AuthMethod::Password {
-                        password: ssh_password.into_string(),
-                    },
-                    jump,
+                    auth,
+                    route,
                 };
                 let resp = match vault::add_entry(
                     &alias,
                     entry,
                     master_password.expose_secret().as_bytes(),
                     replace,
+                )
+                .await
+                {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::ListHosts { master_password } => {
+                let inventory = tokio::task::spawn_blocking(move || {
+                    vault::list_entries(master_password.expose_secret().as_bytes())
+                })
+                .await;
+                let resp = match inventory {
+                    Ok(Ok(hosts)) => Response::Hosts {
+                        hosts: hosts
+                            .into_iter()
+                            .map(|host| proto::HostSummary {
+                                alias: host.alias,
+                                hostname: host.hostname,
+                                port: host.port,
+                                user: host.user,
+                                auth: host.auth,
+                                route: host.route,
+                            })
+                            .collect(),
+                    },
+                    Ok(Err(e)) => Response::Error {
+                        message: e.to_string(),
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("host inventory worker failed: {e}"),
+                    },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::UpdateHost {
+                alias,
+                hostname,
+                port,
+                user,
+                route,
+                auth,
+                master_password,
+            } => {
+                let metadata = vault::HostUpdate {
+                    alias,
+                    hostname,
+                    port,
+                    user,
+                    route,
+                };
+                let auth = auth.map(|auth| match auth {
+                    proto::HostAuth::Agent => vault::AuthMethod::Agent,
+                    proto::HostAuth::Password { password } => vault::AuthMethod::Password {
+                        password: password.into_string(),
+                    },
+                    proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                });
+                let resp = match vault::update_entry(
+                    metadata,
+                    auth,
+                    master_password.expose_secret().as_bytes(),
                 )
                 .await
                 {

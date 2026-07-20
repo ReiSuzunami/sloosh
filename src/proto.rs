@@ -26,7 +26,7 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Exact CLI/daemon wire contract version. Bump this for any incompatible
 /// message shape or sequencing change; package versions may differ while this
 /// remains equal.
-pub const WIRE_PROTOCOL_VERSION: u32 = 1;
+pub const WIRE_PROTOCOL_VERSION: u32 = 3;
 
 /// A password/secret that crosses the CLI<->daemon socket (docs/internals/architecture.md:
 /// "passwords/keys crossing the socket is acceptable, same-user 0600" — but
@@ -74,6 +74,39 @@ impl Drop for SecretString {
     fn drop(&mut self) {
         self.0.zeroize();
     }
+}
+
+/// Authentication material supplied by a human management client.
+/// Secrets remain wrapped so request debug logging is always redacted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostAuth {
+    Agent,
+    Password { password: SecretString },
+    KeyFile { path: String },
+}
+
+/// Non-secret authentication label returned in host inventory responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAuthKind {
+    Agent,
+    Password,
+    KeyFile,
+}
+
+/// Explicit route for a vault-managed host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostRoute {
+    #[default]
+    Direct,
+    ManagedHost {
+        alias: String,
+    },
+    ProxyJump {
+        spec: String,
+    },
 }
 
 /// A request sent from the CLI to the daemon.
@@ -200,15 +233,31 @@ pub enum Request {
         port: Option<u16>,
         #[serde(default)]
         user: Option<String>,
-        ssh_password: SecretString,
+        auth: HostAuth,
         master_password: SecretString,
         #[serde(default)]
         replace: bool,
-        /// Optional jump host alias (docs/internals/architecture.md), resolvable via the
-        /// vault or `~/.ssh/config`. `#[serde(default)]` so older CLI/daemon
-        /// builds exchanging this message without the field keep working.
         #[serde(default)]
-        jump: Option<String>,
+        route: HostRoute,
+    },
+    /// Return every vault-managed host as non-secret connection metadata.
+    /// Reading the encrypted inventory is human-only and requires the Master
+    /// Password even when a lease currently keeps a separate cache unlocked.
+    ListHosts { master_password: SecretString },
+    /// Update one existing host without exposing or needlessly replacing its
+    /// current SSH password. Alias renames are deliberately not supported:
+    /// aliases are lease and ProxyJump identities, not display labels.
+    UpdateHost {
+        alias: String,
+        hostname: String,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        user: Option<String>,
+        route: HostRoute,
+        #[serde(default)]
+        auth: Option<HostAuth>,
+        master_password: SecretString,
     },
     /// Remove a credential from the vault.
     RmCred {
@@ -291,6 +340,8 @@ impl Request {
             Self::VaultExists => "VaultExists",
             Self::InitVault { .. } => "InitVault",
             Self::AddCred { .. } => "AddCred",
+            Self::ListHosts { .. } => "ListHosts",
+            Self::UpdateHost { .. } => "UpdateHost",
             Self::RmCred { .. } => "RmCred",
             Self::Put { .. } => "Put",
             Self::Get { .. } => "Get",
@@ -349,6 +400,9 @@ pub enum Response {
     LeaseRequestPending(LeaseRequestSummary),
     /// Reply to `Request::VaultExists`.
     VaultExists { exists: bool },
+    /// Reply to `Request::ListHosts`. Contains connection metadata only;
+    /// authentication material never crosses this response seam.
+    Hosts { hosts: Vec<HostSummary> },
     /// Reply to `Request::ApproveLease`.
     LeaseActivated(LeaseActivatedInfo),
     /// Reply to `Request::Put`/`Request::Get`.
@@ -361,6 +415,20 @@ pub enum Response {
     Forward(ForwardOpened),
     /// Reply to `Request::ForwardLs`.
     ForwardLs { forwards: Vec<ForwardSummary> },
+}
+
+/// Non-secret vault host metadata shared by human management clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSummary {
+    pub alias: String,
+    pub hostname: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub user: Option<String>,
+    pub auth: HostAuthKind,
+    #[serde(default)]
+    pub route: HostRoute,
 }
 
 /// Reply to `Request::Run`.
@@ -864,24 +932,53 @@ mod tests {
             hostname: "example.com".to_string(),
             port: Some(22),
             user: Some("alice".to_string()),
-            ssh_password: SecretString::new("sshpw"),
+            auth: HostAuth::Password {
+                password: SecretString::new("sshpw"),
+            },
             master_password: SecretString::new("masterpw"),
             replace: false,
-            jump: Some("bastion".to_string()),
+            route: HostRoute::ManagedHost {
+                alias: "bastion".to_string(),
+            },
         });
         round_trip(Request::RmCred {
             alias: "web".to_string(),
             master_password: SecretString::new("masterpw"),
         });
+        round_trip(Request::ListHosts {
+            master_password: SecretString::new("masterpw"),
+        });
+        round_trip(Request::UpdateHost {
+            alias: "web".to_string(),
+            hostname: "web.internal.example".to_string(),
+            port: Some(2222),
+            user: Some("deploy".to_string()),
+            route: HostRoute::ManagedHost {
+                alias: "bastion".to_string(),
+            },
+            auth: Some(HostAuth::Password {
+                password: SecretString::new("new-sshpw"),
+            }),
+            master_password: SecretString::new("masterpw"),
+        });
+        round_trip(Response::Hosts {
+            hosts: vec![HostSummary {
+                alias: "web".to_string(),
+                hostname: "web.internal.example".to_string(),
+                port: Some(2222),
+                user: Some("deploy".to_string()),
+                auth: HostAuthKind::Password,
+                route: HostRoute::ManagedHost {
+                    alias: "bastion".to_string(),
+                },
+            }],
+        });
     }
 
     #[test]
-    fn old_add_cred_without_jump_still_parses() {
-        // Backward compat: a client built before the ProxyJump-chain
-        // milestone omits `jump` entirely; `#[serde(default)]` must fill it
-        // in as `None` rather than failing to parse.
+    fn add_cred_without_route_defaults_to_direct() {
         let json = r#"{"type":"AddCred","alias":"web","hostname":"example.com",
-            "ssh_password":"sshpw","master_password":"masterpw"}"#;
+            "auth":{"type":"agent"},"master_password":"masterpw"}"#;
         let req: Request = serde_json::from_str(json).expect("deserialize");
         assert_eq!(
             req,
@@ -890,10 +987,10 @@ mod tests {
                 hostname: "example.com".to_string(),
                 port: None,
                 user: None,
-                ssh_password: SecretString::new("sshpw"),
+                auth: HostAuth::Agent,
                 master_password: SecretString::new("masterpw"),
                 replace: false,
-                jump: None,
+                route: HostRoute::Direct,
             }
         );
     }
@@ -916,6 +1013,21 @@ mod tests {
         };
         let debug = format!("{req:?}");
         assert!(!debug.contains("super-secret-password"), "{debug}");
+
+        let req = Request::UpdateHost {
+            alias: "web".to_string(),
+            hostname: "example.com".to_string(),
+            port: None,
+            user: None,
+            route: HostRoute::Direct,
+            auth: Some(HostAuth::Password {
+                password: SecretString::new("new-super-secret-password"),
+            }),
+            master_password: SecretString::new("master-super-secret-password"),
+        };
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("new-super-secret-password"), "{debug}");
+        assert!(!debug.contains("master-super-secret-password"), "{debug}");
     }
 
     #[test]

@@ -44,6 +44,42 @@ NSColor(
 ).setFill()
 NSRect(x: 0, y: 0, width: width, height: height).fill()
 
+let paragraph = NSMutableParagraphStyle()
+paragraph.alignment = .center
+
+let instruction = NSAttributedString(
+    string: "Double click to install",
+    attributes: [
+        .font: NSFont.systemFont(ofSize: 18, weight: .medium),
+        .foregroundColor: NSColor(
+            calibratedRed: 0.20,
+            green: 0.22,
+            blue: 0.26,
+            alpha: 1
+        ),
+        .paragraphStyle: paragraph,
+    ]
+)
+instruction.draw(in: NSRect(x: 0, y: 356, width: width, height: 28))
+
+let arrowColor = NSColor(
+    calibratedRed: 0.36,
+    green: 0.39,
+    blue: 0.45,
+    alpha: 0.88
+)
+arrowColor.setStroke()
+let arrow = NSBezierPath()
+arrow.lineWidth = 2.25
+arrow.lineCapStyle = .round
+arrow.lineJoinStyle = .round
+arrow.move(to: NSPoint(x: 360, y: 342))
+arrow.line(to: NSPoint(x: 360, y: 300))
+arrow.move(to: NSPoint(x: 353, y: 308))
+arrow.line(to: NSPoint(x: 360, y: 300))
+arrow.line(to: NSPoint(x: 367, y: 308))
+arrow.stroke()
+
 graphics.flushGraphics()
 NSGraphicsContext.restoreGraphicsState()
 

@@ -5,6 +5,7 @@
 /gui/src-tauri/gen/
 /dist/
 /.claude-bridge/
+/.impeccable/
 
 # macOS Finder metadata
 .DS_Store

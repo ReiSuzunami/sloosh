@@ -85,10 +85,14 @@ sloosh init
 This human-only command first installs the Agent Skill embedded in the current
 binary, then creates the credential vault. A DMG installation also enrolls the
 vault password in local login Keychain, gated by Touch ID and biometric
-enrollment-state comparison. If the vault
+enrollment-state comparison. Before the system prompts appear, the CLI explains
+the Keychain item, the `Sloosh Approval` access prompt, and one-time `Allow`
+versus `Always Allow`. If the vault
 already exists, rerunning `sloosh init` asks for its password once and enables
 Touch ID. Source builds and the standalone CLI archive have no native helper
-and keep terminal approval behavior.
+and keep terminal approval behavior. Linux requires no Keychain or biometric
+permission; initialization prints the separate-terminal `sloosh approve <ID>`
+fallback that will be used for pending leases.
 
 Setup is safe to rerun: an existing vault is left alone. The steps are not a
 transaction, so a Skill installed before a vault, daemon, or Touch ID error
@@ -97,8 +101,18 @@ invalidates the Keychain item; rerun `sloosh init` to enroll again.
 
 The DMG app exposes the same setup as focused native actions: Setup installs the
 embedded Skill and initializes the vault; Security enables Touch ID or an
-optional 6-digit PIN. Master Password and PIN entry stay in the bundled native
-helper and never enter the WebView. A device without Touch ID can use PIN.
+optional 6-digit PIN; Hosts manages vault-backed connection profiles. Master
+Password enrollment starts with a Keychain onboarding step that explains the
+stored local credential, the possible `Sloosh Approval` access prompt, and the
+difference between one-time `Allow` and `Always Allow`. It also makes clear that
+setup neither imports SSH private keys nor approves a host. Master
+Password and PIN entry stay in the bundled native helper and never enter the
+WebView. A desktop SSH Password is entered in the local Hosts form, sent as a
+redacted secret, and cleared after submission. A device without Touch ID can
+use PIN. Hosts can be unlocked once with Touch ID, Sloosh PIN, or Master
+Password. Security offers a shared 1/5/15/30-minute vault timeout, also
+available as `sloosh vault timeout [minutes]`; it governs the desktop session
+and idle daemon leases without bypassing per-request approval.
 
 By default, `--agent auto` installs for every detected agent. It uses these
 locations:
@@ -141,7 +155,10 @@ sloosh skill install
 For a DMG installation, open the new DMG and run `Install Sloosh`. When
 replacing an existing valid installation, it stops the old daemon before the
 staged replacement and leaves a matching CLI link in place. The confirmation
-warns that stopping the daemon ends active sessions and forwards.
+warns that stopping the daemon ends active sessions and forwards. If the GUI is
+running, the same confirmation says it must quit; the installer requests normal
+termination, waits 5 seconds, then force quits only under that explicit consent.
+Replacement never starts while the old GUI is still running.
 
 This order also avoids the old daemon continuing from a replaced executable on
 Linux, where the new CLI correctly refuses an unverifiable `/proc/<pid>/exe`

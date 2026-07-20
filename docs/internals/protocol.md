@@ -1,9 +1,9 @@
 # Local Wire Protocol
 
 This document specifies the current CLI-to-daemon wire contract. The exact
-version constant is `WIRE_PROTOCOL_VERSION = 1` in `src/proto.rs`.
+version constant is `WIRE_PROTOCOL_VERSION = 3` in `src/proto.rs`.
 
-Protocol 1 is local IPC over a Unix domain socket. It combines NDJSON control
+Protocol 3 is local IPC over a Unix domain socket. It combines NDJSON control
 messages with bounded binary frames for SFTP data. It is not a network API and
 has no compatibility promise for arbitrary raw clients.
 
@@ -18,10 +18,10 @@ For ordinary new CLI connections:
 1. CLI authenticates the daemon peer by eUID and canonical executable path.
 2. CLI sends `{"type":"Status"}\n` as the first request.
 3. Daemon returns a `Status` response containing `wire_protocol`.
-4. CLI requires an exact value of `1`.
-5. CLI sends `{"type":"Hello","wire_protocol":1}\n`.
+4. CLI requires an exact value of `3`.
+5. CLI sends `{"type":"Hello","wire_protocol":3}\n`.
 6. Daemon replies
-   `{"type":"ProtocolReady","wire_protocol":1}\n` and marks that connection
+   `{"type":"ProtocolReady","wire_protocol":3}\n` and marks that connection
    negotiated.
 7. Only then may the CLI send an ordinary request on that connection.
 
@@ -62,8 +62,8 @@ terminated by one newline byte:
 
 ```text
 {"type":"Status"}\n
-{"type":"Hello","wire_protocol":1}\n
-{"type":"ProtocolReady","wire_protocol":1}\n
+{"type":"Hello","wire_protocol":3}\n
+{"type":"ProtocolReady","wire_protocol":3}\n
 {"type":"Ok"}\n
 {"type":"Error","message":"..."}\n
 ```
@@ -87,6 +87,31 @@ the vault, start SFTP, create a forward, or append request-specific audit data.
 Except during the raw stream states described below, a negotiated connection is
 a sequence of request/response exchanges. There is no request ID and no
 multiplexing of independent operations on one connection.
+
+### Host management requests
+
+Protocol 3 makes vault host authentication and routing explicit:
+
+- `ListHosts { master_password }` returns `Hosts { hosts }` sorted by alias.
+- Each host summary contains only `alias`, `hostname`, optional `port`, optional
+  `user`, non-secret `auth` kind, and typed `route`.
+- `HostAuth` is exactly one of `agent`, `password { password }`, or
+  `key_file { path }`. The selected method is exclusive for vault profiles.
+- `HostRoute` is exactly one of `direct`, `managed_host { alias }`, or
+  `proxy_jump { spec }`. Managed-host routes reuse another profile; advanced
+  ProxyJump preserves OpenSSH comma-chain syntax.
+- `UpdateHost` carries complete desired non-secret metadata, the Master
+  Password, and optional replacement `auth`. Omitting `auth` preserves the
+  existing method and credential. Alias
+  renames are unsupported because aliases are lease and ProxyJump identities.
+- Mutations reject empty or control-character metadata, port zero, aliases or
+  hostnames over 255 bytes, users over 255 bytes, routes/key paths over 1024
+  bytes, missing managed hosts, managed cycles/depth overflow, and a managed
+  route that names the host itself. Removing a referenced managed host fails.
+- `AddCred`, `ListHosts`, `UpdateHost`, and `RmCred` remain daemon-owned. Human
+  CLI commands require a real TTY. The desktop adapter collects secrets through
+  the bundled native helper before constructing wire requests; secrets never
+  enter Svelte or Tauri command arguments.
 
 ## 3. Raw frame format
 
@@ -251,7 +276,7 @@ last control message:
 ```text
 UNNEGOTIATED
   | Status -> Status                 (stay UNNEGOTIATED)
-  | Hello(1) -> ProtocolReady(1)
+  | Hello(2) -> ProtocolReady(2)
   v
 CONTROL
   | Put/Get accepted
@@ -315,7 +340,7 @@ its bundled Touch ID or PIN helper before replying. Success returns the already-
 `Ok` response for `RequestLease`; failure returns `LeaseRequestPending` exactly
 as before. Helper traffic uses anonymous child-process pipes, is not part of
 this wire protocol, and never exposes the generated bearer lease token to the
-requesting connection. Therefore this optional path does not change protocol 1
+requesting connection. Therefore this optional path does not change protocol 3
 message shape or sequencing. PIN and Master Password entry use anonymous helper
 pipes and never become Tauri command arguments. Raw PIN never becomes a
 protocol field. GUI vault initialization uses the existing `InitVault`

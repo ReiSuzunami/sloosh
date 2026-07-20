@@ -110,8 +110,17 @@ PIN never enters Svelte, the WebView, Tauri command arguments, logs, or the
 daemon wire protocol. Master Password never enters Svelte, the WebView, Tauri
 command arguments, or logs; vault initialization sends the existing redacted
 `SecretString` over the verified owner-only Unix socket to the daemon, which
-remains the vault authority. Daemon independently verifies the PIN before
-activation. At runtime Sloosh rejects a native helper that is a symlink, has an
+remains the vault authority. After Master Password, Touch ID, or PIN unlock,
+the Tauri Rust process may retain one zeroizing `SecretString` for the configured
+desktop vault timeout; the WebView receives only method, lock state, and bounded
+countdowns. The session is dropped on manual lock, idle or 8-hour absolute
+expiry, app exit, macOS sleep, screen sleep, or user-session deactivation. It
+never satisfies or bypasses an Agent lease approval. SSH Password entered in the desktop Hosts form is
+transient WebView state, crosses the local Tauri command boundary and verified
+owner-only Unix socket only as a redacted `SecretString`, and is cleared from
+the form after every submission attempt. It is never logged. Daemon
+independently verifies the PIN before activation. At runtime Sloosh rejects a
+native helper that is a symlink, has an
 unexpected owner, or is group- or other-writable; the installer separately
 validates the ad-hoc bundle signature.
 Cancellation or helper failure leaves request pending. Unknown SSH
@@ -125,6 +134,16 @@ process restart: attempts 5, 10, and 14 impose 30-second, 2-minute, and
 10-minute delays; attempt 15 disables PIN until the human re-enables it with
 the Master Password. PIN failures never increment or reset a pending request's
 Master Password attempt budget. Touch ID remains usable while PIN is locked.
+The same PIN can unlock the desktop vault, but only the native helper receives
+it; Rust independently verifies it before retaining or using the returned
+vault password.
+
+The shared idle setting lives in `~/.sloosh/vault-settings.json`. It accepts
+only 1, 5, 15, or 30 minutes, defaults to 15, and applies to both the desktop
+vault session and idle daemon leases. The file is bounded, owner-only,
+symlink-refused, and atomically replaced at mode `0600`. Unsafe or corrupt
+state fails closed to one minute at runtime. The setting never changes the
+8-hour absolute lease/session ceiling.
 
 Long-lived forwards store an opaque `LeaseGrant` scoped to one host and active
 lease. They do not retain a short-lived creator CLI PID. Real traffic refreshes
@@ -189,6 +208,11 @@ or explicit daemon/process termination remains the termination path.
   collision-safe `create_new`, so reused sequence numbers cannot truncate
   retained history.
 - ProxyJump recursion: at most 8 hops, with cycle rejection.
+- Vault host mutations bound aliases, hostnames, users, key paths, and route
+  expressions before writing the vault; port zero and managed self-routes are
+  rejected. Managed routes must reference an existing profile and cannot form
+  cycles or exceed 8 hops; referenced profiles cannot be removed. Connection
+  route expansion repeats the global 8-hop/cycle checks.
 
 Spool limits cover PTY command output only. They never cap SFTP bytes or
 duration. Other resources still have no global process, connection-count,
@@ -263,6 +287,9 @@ macOS filesystem permissions, Gatekeeper, or Privacy controls.
 
 The vault uses Argon2id and ChaCha20-Poly1305. A fresh salt and nonce are used
 for each save. Successful AEAD decryption is the password check.
+Vault envelope version 2 adds typed authentication and routing. Version-1
+plaintext is accepted and rewritten on the next mutation; unknown newer
+versions fail with an upgrade-required error before decryption.
 
 Vault mutations and `unlock_for_lease` share one async mutation lock across disk
 read-modify-write and cache publication. Unlock reads one `VaultFile` envelope,
@@ -295,7 +322,7 @@ leaves the host unknown, and real SSH connection attempts remain fail closed.
 
 The daemon, not the CLI, is the authority for host operations. Current request
 classes are below. Except for `Status`, `Hello`, and `Shutdown`, every wire
-request first requires a negotiated protocol 1 connection; the table lists
+request first requires a negotiated protocol 3 connection; the table lists
 additional authority after that gate.
 
 | Request or command | Required authority | Notes |
@@ -315,7 +342,9 @@ additional authority after that gate.
 | `ApproveLease` | master password, separate ancestry, exact host list | CLI requires TTY; daemon cannot prove TTY from raw protocol |
 | `VaultExists` | no lease | metadata only |
 | `InitVault` | no existing vault plus new master password | CLI requires TTY |
-| `AddCred` | master password | may create first vault; CLI requires TTY |
+| `AddCred` | master password | may create first vault; carries explicit agent/password/key-file auth; CLI requires TTY |
+| `ListHosts` | master password | returns sorted non-secret connection metadata; CLI requires TTY |
+| `UpdateHost` | master password | preserves current auth unless an explicit replacement is supplied; CLI requires TTY |
 | `RmCred` | master password | CLI requires TTY |
 | `log` | local file read | no daemon request |
 
@@ -335,7 +364,7 @@ Gatekeeper limits are documented in installation guide.
 ## 6. Lease and forward timing
 
 - Pending lease request: 15 minutes before approval must be requested again.
-- Lease idle limit: 2 hours.
+- Lease idle limit: shared vault timeout (1, 5, 15, or 30 minutes; default 15).
 - Lease absolute limit: 8 hours.
 - Lease reaper interval: 60 seconds. API use also prunes synchronously.
 - Forward grant check interval: 15 seconds without touching idle time.
@@ -371,7 +400,7 @@ Sloosh does not guarantee protection from hostile same-UID code. Such code may:
 
 - connect as a raw UDS client because the daemon intentionally accepts
   same-user tools and derives authority from peer PID/ancestry, not client
-  executable identity; ordinary requests still require a correct protocol 1
+  executable identity; ordinary requests still require a correct protocol 3
   `Hello` first;
 - issue pre-handshake `Status` or `Shutdown`, then negotiate and issue unleased
   `Ls`, `ForwardLs`, `ForwardStop`, lease-request, and metadata requests;

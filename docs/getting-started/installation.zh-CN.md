@@ -75,17 +75,27 @@ sloosh init
 ```
 
 这个仅限人类交互的命令会先安装当前二进制内嵌的 Agent Skill，再创建凭据 vault。DMG
-安装还会把 vault 密码登记到本机 login Keychain，并以 Touch ID 和指纹登记状态比对保护。已有 vault 时，
+安装还会把 vault 密码登记到本机 login Keychain，并以 Touch ID 和指纹登记状态比对保护。
+系统提示出现前，CLI 会先解释 Keychain 条目、`Sloosh Approval` 访问提示，以及一次性的
+`Allow` 与 `Always Allow`。已有 vault 时，
 重新运行 `sloosh init`，输入一次 vault 密码即可启用 Touch ID。源码构建与独立 CLI 压缩包
-不含原生 helper，继续使用终端审批。
+不含原生 helper，继续使用终端审批。Linux 无需 Keychain 或生物识别权限；初始化会明确输出
+后续 pending lease 所需的另一终端 `sloosh approve <ID>` 流程。
 
 重复运行是安全的，已有 vault 不会改变。各步骤不是事务：如果 vault、daemon 或 Touch ID
 随后报错，已经安装的 Skill 会保留，修复问题后可直接重试。系统中登记的指纹变化会使
 Keychain 项目失效；重新运行 `sloosh init` 即可登记。
 
 DMG App 也提供相同的设置能力：Setup 安装内置 Skill 并初始化 vault，Security 启用 Touch ID
-或可选的 6 位 PIN。Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
-没有 Touch ID 的设备可以使用 PIN。
+或可选的 6 位 PIN，Hosts 管理 vault 中的连接配置。登记 Master Password 前会先显示
+Keychain onboarding，说明本地保存的凭据、可能出现的 `Sloosh Approval` 访问提示，以及
+一次性 `Allow` 与 `Always Allow` 的区别；同时明确 setup 不会导入 SSH 私钥，也不会批准
+任何主机。Master Password 与 PIN 只在内置原生
+helper 中输入，不会进入 WebView。桌面端 SSH Password 在本地 Hosts 表单中输入，以脱敏
+secret 类型提交，并在提交后立即清空。没有 Touch ID 的设备可以使用 PIN。
+Hosts 可以用 Touch ID、Sloosh PIN 或 Master Password 解锁一次。Security 提供共用的
+1/5/15/30 分钟 vault 空闲期，也可通过 `sloosh vault timeout [分钟]` 查看或修改；它同时
+约束桌面会话与空闲 daemon lease，但不会绕过每次请求的人工审批。
 
 默认的 `--agent auto` 会为检测到的所有 Agent 安装，路径如下：
 
@@ -124,7 +134,9 @@ sloosh skill install
 
 如果使用 DMG 安装，打开新版 DMG 并运行 `Install Sloosh`。替换已有的有效安装时，安装器
 会先停止旧 daemon，再进行 staged replacement；指向正确位置的 CLI 链接会保留。确认框会
-提示：停止 daemon 会结束活跃 session 和 forward。
+提示：停止 daemon 会结束活跃 session 和 forward。若 GUI 正在运行，同一确认框会说明必须
+退出；安装器先请求正常退出，等待 5 秒后才在用户已确认的前提下强制退出。旧 GUI 仍在运行
+时不会开始替换。
 
 这个顺序也避免 Linux 上旧 daemon 继续从已替换的 executable 运行；新 CLI 会拒绝无法通过
 `/proc/<pid>/exe` 验证的 peer。

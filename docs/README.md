@@ -14,6 +14,13 @@ user guides are maintained translations, not separate specifications.
 | Contributing and tests | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | — | Development and verification workflow |
 | Releasing | [`releasing.md`](maintainers/releasing.md) | — | Versioning, crates.io, and GitHub Releases |
 
+Non-canonical research notes:
+
+- [`native-approval-research.md`](internals/native-approval-research.md)
+  records macOS/Windows biometric-approval feasibility and unpaid distribution
+  options. `SECURITY.md` and `architecture.md` remain authoritative for shipped
+  behavior.
+
 Repository instructions for coding agents live in
 [`AGENTS.md`](https://github.com/ReiSuzunami/sloosh/blob/main/AGENTS.md). The
 operational [`skills/sloosh/`](../skills/sloosh/) artifact teaches agents how

@@ -41,9 +41,13 @@ pub enum Command {
     Request(RequestArgs),
     /// Approve a pending lease request (human side, run in another terminal).
     Approve(ApproveArgs),
+    /// Manage vault-backed SSH hosts (interactive, human-only).
+    Host(HostArgs),
     /// Add a credential to the vault. Interactive and human-only: there is no flag to pass a secret.
+    /// Kept for compatibility; prefer `sloosh host add`.
     Add(AddArgs),
     /// Remove a credential from the vault.
+    /// Kept for compatibility; prefer `sloosh host rm`.
     Rm(RmArgs),
     /// Manage the credential vault itself (e.g. first-time initialization).
     Vault(VaultArgs),
@@ -63,7 +67,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Host alias to run the command on (as configured via `sloosh add` / `~/.ssh/config`).
+    /// Host alias to run the command on (as configured via `sloosh host add` / `~/.ssh/config`).
     pub host: String,
     /// Command to run in the remote shell.
     pub command: String,
@@ -175,16 +179,117 @@ pub struct AddArgs {
     /// SSH port (defaults to 22 if omitted).
     #[arg(long)]
     pub port: Option<u16>,
+    /// Authentication method for this profile.
+    #[arg(long, value_enum, default_value_t = HostAuthArg::Password)]
+    pub auth: HostAuthArg,
+    /// Private key path for --auth key-file. Encrypted keys must be loaded into ssh-agent.
+    #[arg(long, required_if_eq("auth", "key-file"))]
+    pub key_file: Option<String>,
+    /// Route through another managed host profile.
+    #[arg(long, conflicts_with_all = ["proxy_jump", "jump"])]
+    pub via: Option<String>,
+    /// Advanced OpenSSH ProxyJump specification.
+    #[arg(long, conflicts_with_all = ["via", "jump"])]
+    pub proxy_jump: Option<String>,
     /// Jump host alias to reach this host through (resolvable via the vault
-    /// or ~/.ssh/config), same as an ~/.ssh/config `ProxyJump` entry.
-    #[arg(long)]
+    /// or ~/.ssh/config). Deprecated; use --via or --proxy-jump.
+    #[arg(long, conflicts_with_all = ["via", "proxy_jump"])]
     pub jump: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HostAuthArg {
+    Agent,
+    Password,
+    KeyFile,
 }
 
 #[derive(Debug, Args)]
 pub struct RmArgs {
     /// Alias of the credential to remove.
     pub alias: String,
+}
+
+#[derive(Debug, Args)]
+pub struct HostArgs {
+    #[command(subcommand)]
+    pub action: HostAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostAction {
+    /// List vault-backed hosts without exposing authentication material.
+    #[command(alias = "ls")]
+    List(HostListArgs),
+    /// Show one vault-backed host without exposing authentication material.
+    Show(HostShowArgs),
+    /// Add a vault-backed host.
+    Add(AddArgs),
+    /// Edit an existing vault-backed host. Alias cannot be changed.
+    Edit(HostEditArgs),
+    /// Remove a vault-backed host.
+    Rm(RmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HostListArgs {
+    /// Print machine-readable JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostShowArgs {
+    /// Alias of the vault-backed host to show.
+    pub alias: String,
+    /// Print machine-readable JSON instead of labeled fields.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostEditArgs {
+    /// Alias of the vault-backed host to edit. Aliases are immutable.
+    pub alias: String,
+    /// Replace the real hostname/address.
+    #[arg(long)]
+    pub hostname: Option<String>,
+    /// Replace the remote username.
+    #[arg(long, conflicts_with = "clear_user")]
+    pub user: Option<String>,
+    /// Clear the configured remote username.
+    #[arg(long)]
+    pub clear_user: bool,
+    /// Replace the SSH port.
+    #[arg(long, conflicts_with = "clear_port")]
+    pub port: Option<u16>,
+    /// Clear the configured port and use SSH's default.
+    #[arg(long)]
+    pub clear_port: bool,
+    /// Replace the authentication method.
+    #[arg(long, value_enum)]
+    pub auth: Option<HostAuthArg>,
+    /// Private key path for --auth key-file.
+    #[arg(long, required_if_eq("auth", "key-file"))]
+    pub key_file: Option<String>,
+    /// Route through another managed host profile.
+    #[arg(long, conflicts_with_all = ["proxy_jump", "jump", "direct", "clear_jump"])]
+    pub via: Option<String>,
+    /// Advanced OpenSSH ProxyJump specification.
+    #[arg(long, conflicts_with_all = ["via", "jump", "direct", "clear_jump"])]
+    pub proxy_jump: Option<String>,
+    /// Connect directly and clear the current route.
+    #[arg(long, conflicts_with_all = ["via", "proxy_jump", "jump", "clear_jump"])]
+    pub direct: bool,
+    /// Replace the ProxyJump alias.
+    #[arg(long, conflicts_with_all = ["clear_jump", "via", "proxy_jump", "direct"])]
+    pub jump: Option<String>,
+    /// Clear the configured ProxyJump alias.
+    #[arg(long, conflicts_with_all = ["via", "proxy_jump", "direct", "jump"])]
+    pub clear_jump: bool,
+    /// Securely prompt for and replace the SSH password. Deprecated; use --auth password.
+    #[arg(long, conflicts_with = "auth")]
+    pub change_password: bool,
 }
 
 #[derive(Debug, Args)]
@@ -198,6 +303,14 @@ pub enum VaultAction {
     /// Create the credential vault and set its master password (interactive, human-only).
     /// Required once before any `sloosh approve` can succeed: approval never creates the vault.
     Init,
+    /// Show or set the shared desktop-vault and idle lease timeout.
+    Timeout(VaultTimeoutArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct VaultTimeoutArgs {
+    /// Idle timeout in minutes. Supported values: 1, 5, 15, 30.
+    pub minutes: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -330,7 +443,7 @@ pub enum ForwardAction {
     group(ArgGroup::new("direction").args(["local", "remote"]).required(true))
 )]
 pub struct ForwardOpenArgs {
-    /// Host to forward through (as configured via `sloosh add` / `~/.ssh/config`).
+    /// Host to forward through (as configured via `sloosh host add` / `~/.ssh/config`).
     pub host: String,
     /// Local forward: listen on a loopback address and tunnel to
     /// remote_host:remote_port via `host`. `[bind_addr:]local_port:remote_host:remote_port`
@@ -450,5 +563,87 @@ mod tests {
         assert!(install_help.contains("claude"), "{install_help}");
         assert!(install_help.contains("all"), "{install_help}");
         assert!(install_help.contains("--force"), "{install_help}");
+    }
+
+    #[test]
+    fn host_help_exposes_complete_management_surface_and_legacy_commands() {
+        let mut command = Cli::command();
+        let host = command
+            .find_subcommand_mut("host")
+            .expect("host subcommand");
+        for action in ["list", "show", "add", "edit", "rm"] {
+            assert!(
+                host.find_subcommand_mut(action).is_some(),
+                "missing host {action}"
+            );
+        }
+        let edit_help = host
+            .find_subcommand_mut("edit")
+            .expect("host edit subcommand")
+            .render_help()
+            .to_string();
+        assert!(edit_help.contains("--change-password"), "{edit_help}");
+        assert!(edit_help.contains("--auth <AUTH>"), "{edit_help}");
+        assert!(edit_help.contains("--key-file <KEY_FILE>"), "{edit_help}");
+        assert!(edit_help.contains("--via <VIA>"), "{edit_help}");
+        assert!(
+            edit_help.contains("--proxy-jump <PROXY_JUMP>"),
+            "{edit_help}"
+        );
+        assert!(edit_help.contains("--clear-user"), "{edit_help}");
+        assert!(edit_help.contains("--clear-port"), "{edit_help}");
+        assert!(edit_help.contains("--clear-jump"), "{edit_help}");
+
+        assert!(command.find_subcommand_mut("add").is_some());
+        assert!(command.find_subcommand_mut("rm").is_some());
+    }
+
+    #[test]
+    fn host_add_requires_key_path_and_routes_are_exclusive() {
+        let missing_key = Cli::try_parse_from([
+            "sloosh",
+            "host",
+            "add",
+            "web",
+            "--hostname",
+            "web.example",
+            "--auth",
+            "key-file",
+        ]);
+        assert!(missing_key.is_err());
+
+        let conflicting_route = Cli::try_parse_from([
+            "sloosh",
+            "host",
+            "add",
+            "web",
+            "--hostname",
+            "web.example",
+            "--via",
+            "bastion",
+            "--proxy-jump",
+            "edge",
+        ]);
+        assert!(conflicting_route.is_err());
+
+        let valid = Cli::try_parse_from([
+            "sloosh",
+            "host",
+            "add",
+            "web",
+            "--hostname",
+            "web.example",
+            "--auth",
+            "agent",
+            "--via",
+            "bastion",
+        ]);
+        assert!(valid.is_ok());
+    }
+
+    #[test]
+    fn vault_timeout_accepts_show_and_set_forms() {
+        assert!(Cli::try_parse_from(["sloosh", "vault", "timeout"]).is_ok());
+        assert!(Cli::try_parse_from(["sloosh", "vault", "timeout", "5"]).is_ok());
     }
 }

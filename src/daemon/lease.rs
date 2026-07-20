@@ -11,7 +11,7 @@
 //! - **Active leases**: created by `approve`, binding a set of hosts to an
 //!   "anchor" process (docs/internals/architecture.md's ancestry-anchoring scheme) so the
 //!   agent process (and anything it spawns) can keep making requests without
-//!   re-approval, until [`IDLE_TIMEOUT`] of no matching calls.
+//!   re-approval, until the configured vault timeout of no matching calls.
 //!
 //! Anchor **selection** (choosing which process in the caller's ancestry
 //! chain to bind the lease to) happens once, at `request` time. Anchor
@@ -26,15 +26,16 @@ use crate::daemon::ssh;
 use crate::daemon::vault::{self, VaultError};
 use crate::procs::{self, AncestorInfo};
 use crate::proto::{LeaseActivatedInfo, LeaseRequestSummary, LeaseSummary};
+#[cfg(not(test))]
+use crate::vault_settings::{VaultSettingsStore, VaultTimeout};
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex as AsyncMutex;
 
-/// A lease with no matching call for this long is dropped (docs/internals/architecture.md).
-/// TODO: make configurable; a bare constant is fine for milestone 3.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// Default lease idle timeout when no shared vault setting has been saved.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Hard ceiling for an approved lease, even while actively used. A fresh
 /// human approval is required after this point so long-lived forwards and
@@ -227,17 +228,17 @@ fn state() -> &'static AsyncMutex<LeaseState> {
 /// the last lease expires"). API entry points and [`spawn_reaper`] both use
 /// this one expiry decision.
 async fn prune_expired(st: &mut LeaseState) {
-    prune_expired_at(st, Instant::now()).await;
+    prune_expired_at(st, Instant::now(), configured_idle_timeout()).await;
 }
 
-async fn prune_expired_at(st: &mut LeaseState, now: Instant) {
+async fn prune_expired_at(st: &mut LeaseState, now: Instant, idle_timeout: Duration) {
     st.pending
         .retain(|_, p| now.duration_since(p.created_at) < PENDING_EXPIRY);
 
     let had_active = !st.active.is_empty();
     let (kept, expired): (Vec<ActiveLease>, Vec<ActiveLease>) =
         std::mem::take(&mut st.active).into_iter().partition(|l| {
-            now.duration_since(l.last_used) < IDLE_TIMEOUT
+            now.duration_since(l.last_used) < idle_timeout
                 && now.duration_since(l.created_at) < MAX_LIFETIME
         });
     st.active = kept;
@@ -266,7 +267,7 @@ pub async fn expire_active_leases_for_integration_test() {
     let future = Instant::now()
         .checked_add(MAX_LIFETIME)
         .expect("an eight-hour monotonic deadline must fit");
-    prune_expired_at(&mut st, future).await;
+    prune_expired_at(&mut st, future, configured_idle_timeout()).await;
 }
 
 /// Start an expiry sweep. Unlike lazy pruning at API entry
@@ -817,6 +818,7 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
     let now = Instant::now();
+    let idle_timeout = configured_idle_timeout();
     let mut out: Vec<LeaseSummary> = st
         .active
         .iter()
@@ -829,7 +831,7 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
                 hosts,
                 anchor_name: l.anchor.name.clone(),
                 anchor_pid: l.anchor.pid,
-                idle_remaining_secs: IDLE_TIMEOUT
+                idle_remaining_secs: idle_timeout
                     .saturating_sub(idle)
                     .min(MAX_LIFETIME.saturating_sub(age))
                     .as_secs(),
@@ -838,6 +840,19 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
         .collect();
     out.sort_by_key(|a| a.anchor_pid);
     out
+}
+
+#[cfg(not(test))]
+fn configured_idle_timeout() -> Duration {
+    VaultSettingsStore::current_user()
+        .load()
+        .unwrap_or_else(|_| VaultTimeout::minimum())
+        .duration()
+}
+
+#[cfg(test)]
+fn configured_idle_timeout() -> Duration {
+    DEFAULT_IDLE_TIMEOUT
 }
 
 #[cfg(test)]
@@ -975,7 +990,9 @@ mod tests {
             auth: vault::AuthMethod::Password {
                 password: "ssh-secret".to_string(),
             },
-            jump: Some(jump.to_string()),
+            route: crate::proto::HostRoute::ProxyJump {
+                spec: jump.to_string(),
+            },
         }
     }
 
@@ -1262,13 +1279,13 @@ mod tests {
             .unwrap();
         assert!(vault::is_cached().await);
 
-        // Simulate idle expiry directly (waiting out the real 2h timeout is
+        // Simulate idle expiry directly (waiting out the configured timeout is
         // obviously not something a unit test can do): backdate the lease's
         // `last_used`.
         {
             let mut st = state().lock().await;
             for l in st.active.iter_mut() {
-                l.last_used = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+                l.last_used = Instant::now() - DEFAULT_IDLE_TIMEOUT - Duration::from_secs(1);
             }
         }
         assert!(!check_authorized_for_chain(&chain, "web", None).await);

@@ -109,6 +109,15 @@ fn init_refuses_non_tty_before_installing_the_skill() {
 }
 
 #[test]
+fn embedded_skill_explains_platform_specific_init_approval() {
+    assert!(EMBEDDED_SKILL.contains("DMG-installed macOS"));
+    assert!(EMBEDDED_SKILL.contains("Sloosh Approval"));
+    assert!(EMBEDDED_SKILL.contains("Always Allow"));
+    assert!(EMBEDDED_SKILL.contains("On Linux and standalone/source builds"));
+    assert!(EMBEDDED_SKILL.contains("sloosh approve <ID>"));
+}
+
+#[test]
 fn all_agent_selection_installs_both_supported_targets() {
     let home = TestHome::new("all-agents");
 

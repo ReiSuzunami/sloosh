@@ -32,11 +32,14 @@ private struct Request: Decodable {
     let allow_pin: Bool?
     let purpose: String?
     let confirm: Bool?
+    let verified: Bool?
+    let host_label: String?
 }
 
 private struct Response: Encodable {
     let type: String
     let master_password: String?
+    let ssh_password: String?
     let pin: String?
     let touch_id_enrolled: Bool?
     let pin_credential_stored: Bool?
@@ -44,27 +47,31 @@ private struct Response: Encodable {
     let message: String?
 
     static func simple(_ type: String) -> Response {
-        Response(type: type, master_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
+        Response(type: type, master_password: nil, ssh_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
     }
 
     static func unlocked(_ password: String) -> Response {
-        Response(type: "unlocked", master_password: password, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
+        Response(type: "unlocked", master_password: password, ssh_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
     }
 
     static func masterPassword(_ password: String) -> Response {
-        Response(type: "master_password_entered", master_password: password, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
+        Response(type: "master_password_entered", master_password: password, ssh_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
+    }
+
+    static func sshPassword(_ password: String) -> Response {
+        Response(type: "ssh_password_entered", master_password: nil, ssh_password: password, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
     }
 
     static func pin(_ pin: String) -> Response {
-        Response(type: "pin_entered", master_password: nil, pin: pin, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
+        Response(type: "pin_entered", master_password: nil, ssh_password: nil, pin: pin, touch_id_enrolled: nil, pin_credential_stored: nil, code: nil, message: nil)
     }
 
     static func approvalStatus(touchID: Bool, pinCredential: Bool) -> Response {
-        Response(type: "approval_status", master_password: nil, pin: nil, touch_id_enrolled: touchID, pin_credential_stored: pinCredential, code: nil, message: nil)
+        Response(type: "approval_status", master_password: nil, ssh_password: nil, pin: nil, touch_id_enrolled: touchID, pin_credential_stored: pinCredential, code: nil, message: nil)
     }
 
     static func error(_ code: String, _ message: String) -> Response {
-        Response(type: "error", master_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: code, message: message)
+        Response(type: "error", master_password: nil, ssh_password: nil, pin: nil, touch_id_enrolled: nil, pin_credential_stored: nil, code: code, message: message)
     }
 }
 
@@ -476,6 +483,35 @@ private func promptMasterPassword(purpose: String, confirmation: Bool) -> Respon
     return .masterPassword(first.stringValue)
 }
 
+private func promptSshPassword(hostLabel: String) -> Response {
+    activateApplication()
+    let alert = NSAlert()
+    alert.alertStyle = .informational
+    alert.icon = NSImage(
+        systemSymbolName: "key.fill",
+        accessibilityDescription: "SSH Password"
+    )
+    alert.messageText = "SSH Password"
+    alert.informativeText = "Enter the SSH password stored for \"\(hostLabel)\". It stays outside the Sloosh control panel."
+    let section = labeledSecureField(
+        label: "SSH Password",
+        placeholder: "Enter remote account password"
+    )
+    alert.accessoryView = section.view
+    DispatchQueue.main.async {
+        alert.window.makeFirstResponder(section.field)
+    }
+    alert.addButton(withTitle: "Continue")
+    alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else {
+        return .error("cancelled", "SSH Password input was cancelled")
+    }
+    guard !section.field.stringValue.isEmpty else {
+        return .error("invalid_input", "SSH Password cannot be empty")
+    }
+    return .sshPassword(section.field.stringValue)
+}
+
 private func promptNewPin() -> Response {
     activateApplication()
     let alert = NSAlert()
@@ -632,6 +668,64 @@ case "status":
         exit(1)
     }
 
+case "unlock_with_touch_id":
+    let stored: StoredCredential
+    switch loadCredential() {
+    case .success(let credential):
+        stored = credential
+    case .failure(let response):
+        send(response)
+        exit(1)
+    }
+    guard let enrolledDomainState = stored.biometricDomainState else {
+        send(.error("not_enrolled", "Touch ID approval is not enrolled"))
+        exit(1)
+    }
+    let currentDomainState: Data
+    switch authenticate(reason: "Unlock Sloosh") {
+    case .success(let state):
+        currentDomainState = state
+    case .failure(let response):
+        send(response)
+        exit(1)
+    }
+    guard enrolledDomainState == currentDomainState else {
+        send(.error("not_enrolled", "Touch ID enrollment changed; re-enroll it in Sloosh"))
+        exit(1)
+    }
+    send(.unlocked(stored.masterPassword))
+    exit(0)
+
+case "begin_pin_unlock":
+    let stored: StoredCredential
+    switch loadCredential() {
+    case .success(let credential):
+        stored = credential
+    case .failure(let response):
+        send(response)
+        exit(1)
+    }
+    let response = promptPin(
+        title: "Unlock Sloosh",
+        message: "Enter your 6-digit Sloosh PIN."
+    )
+    send(response)
+    guard response.type == "pin_entered" else {
+        exit(1)
+    }
+    guard let second = receive(),
+          second.type == "complete_pin_unlock",
+          let verified = second.verified else {
+        send(.error("invalid_request", "Missing PIN verification result"))
+        exit(1)
+    }
+    guard verified else {
+        send(.simple("pin_rejected"))
+        exit(0)
+    }
+    send(.unlocked(stored.masterPassword))
+    exit(0)
+
 case "enroll":
     guard let password = first.master_password else {
         send(.error("invalid_request", "Enrollment password is missing"))
@@ -648,6 +742,11 @@ case "prompt_master_password":
     )
     send(response)
     exit(response.type == "master_password_entered" ? 0 : 1)
+
+case "prompt_ssh_password":
+    let response = promptSshPassword(hostLabel: first.host_label ?? "SSH host")
+    send(response)
+    exit(response.type == "ssh_password_entered" ? 0 : 1)
 
 case "prompt_pin":
     let response = promptNewPin()

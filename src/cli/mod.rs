@@ -8,17 +8,19 @@ mod skill;
 pub use args::Cli;
 use args::{
     AddArgs, ApproveArgs, Command, DaemonAction, ForwardAction, ForwardLsArgs, ForwardOpenArgs,
-    ForwardStopArgs, GetArgs, InitArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs,
-    PeekArgs, PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, SkillAction, SkillAgent,
-    SkillInstallArgs, SkillStatusArgs, StatusArgs, VaultAction,
+    ForwardStopArgs, GetArgs, HostAction, HostAuthArg, HostEditArgs, HostListArgs, HostShowArgs,
+    InitArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs, PeekArgs, PutArgs, RequestArgs,
+    RmArgs, RunArgs, SendArgs, SkillAction, SkillAgent, SkillInstallArgs, SkillStatusArgs,
+    StatusArgs, VaultAction, VaultTimeoutArgs,
 };
 
 use crate::daemon::audit;
 use crate::daemon::ssh;
 use crate::daemon::vault;
 use crate::proto::{
-    self, ForwardDirection, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response,
-    RunReply, SecretString, SessionSummary, StatusReply,
+    self, ForwardDirection, HostAuth, HostRoute, HostSummary, LeaseActivatedInfo,
+    LeaseRequestSummary, PeekReply, Request, Response, RunReply, SecretString, SessionSummary,
+    StatusReply,
 };
 use crate::transport::unix::{self, UnixChannel};
 use crate::transport::{Channel, MAX_RAW_FRAME_BYTES};
@@ -46,16 +48,44 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Kill(args) => cmd_kill(args).await,
         Command::Request(args) => cmd_request(args).await,
         Command::Approve(args) => cmd_approve(args).await,
+        Command::Host(args) => match args.action {
+            HostAction::List(args) => cmd_host_list(args).await,
+            HostAction::Show(args) => cmd_host_show(args).await,
+            HostAction::Add(args) => cmd_add(args).await,
+            HostAction::Edit(args) => cmd_host_edit(args).await,
+            HostAction::Rm(args) => cmd_rm(args).await,
+        },
         Command::Add(args) => cmd_add(args).await,
         Command::Rm(args) => cmd_rm(args).await,
         Command::Vault(args) => match args.action {
             VaultAction::Init => cmd_vault_init().await,
+            VaultAction::Timeout(args) => cmd_vault_timeout(args),
         },
         Command::Put(args) => cmd_put(args).await,
         Command::Get(args) => cmd_get(args).await,
         Command::Forward(args) => cmd_forward(args.action).await,
         Command::Log(args) => cmd_log(args).await,
     }
+}
+
+fn cmd_vault_timeout(args: VaultTimeoutArgs) -> anyhow::Result<()> {
+    use crate::vault_settings::{VaultSettingsStore, VaultTimeout};
+
+    let store = VaultSettingsStore::current_user();
+    let timeout = match args.minutes {
+        Some(minutes) => {
+            let timeout = VaultTimeout::try_from(minutes)?;
+            store.save(timeout)?;
+            timeout
+        }
+        None => store.load()?,
+    };
+    println!(
+        "vault timeout: {} minute{}",
+        timeout.minutes(),
+        if timeout.minutes() == 1 { "" } else { "s" }
+    );
+    Ok(())
 }
 
 async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
@@ -528,8 +558,9 @@ fn display_host_list(hosts: &[String]) -> String {
 
 async fn cmd_vault_init() -> anyhow::Result<()> {
     require_tty("vault init")?;
+    let native_approval_available = explain_native_approval_setup();
     let password = cmd_vault_init_inner().await?;
-    enroll_native_approval(password).await
+    enroll_native_approval(password, native_approval_available).await
 }
 
 async fn cmd_vault_init_inner() -> anyhow::Result<Option<SecretString>> {
@@ -540,7 +571,7 @@ async fn cmd_vault_init_inner() -> anyhow::Result<Option<SecretString>> {
     };
     if exists {
         println!(
-            "a credential vault already exists — nothing to do. Use `sloosh add`/`sloosh rm` to \
+            "a credential vault already exists — nothing to do. Use `sloosh host add/list/edit/rm` to \
              manage its entries."
         );
         return Ok(None);
@@ -556,7 +587,7 @@ async fn cmd_vault_init_inner() -> anyhow::Result<Option<SecretString>> {
     )?;
     println!(
         "vault created. You can now approve lease requests (`sloosh approve <ID>`) and add \
-         credentials (`sloosh add <alias> --hostname <host>`)."
+         credentials (`sloosh host add <alias> --hostname <host>`)."
     );
     Ok(Some(master_password))
 }
@@ -567,25 +598,48 @@ async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
         agent: args.agent,
         force: args.force_skill,
     })?;
+    let native_approval_available = explain_native_approval_setup();
     let password = cmd_vault_init_inner().await?;
-    enroll_native_approval(password).await
+    enroll_native_approval(password, native_approval_available).await
 }
 
-async fn enroll_native_approval(password: Option<SecretString>) -> anyhow::Result<()> {
-    if !crate::native_approval::is_available() {
+const MACOS_NATIVE_APPROVAL_SETUP: &str = "Native approval setup (macOS):\n  Sloosh will store a protected copy of the vault Master Password in your login Keychain.\n  macOS may ask whether \"Sloosh Approval\" may access it. Choose \"Always Allow\" to avoid repeated prompts, or \"Allow\" for one-time access.\n  Follow any CLI Master Password prompt, then complete Touch ID.\n  Setup imports no SSH private keys and grants no host access. Each lease shows its exact host scope before biometric or PIN verification.";
+
+const TERMINAL_APPROVAL_SETUP: &str = "Native approval is unavailable in this installation.\n  No Keychain or biometric setup is required. This is the normal flow on Linux and standalone/source builds.\n  Approve each pending lease in another terminal with the printed `sloosh approve <ID>` command.";
+
+fn native_approval_setup_message(available: bool) -> &'static str {
+    if available {
+        MACOS_NATIVE_APPROVAL_SETUP
+    } else {
+        TERMINAL_APPROVAL_SETUP
+    }
+}
+
+fn explain_native_approval_setup() -> bool {
+    let available = crate::native_approval::is_available();
+    let message = native_approval_setup_message(available);
+    println!("{message}");
+    available
+}
+
+async fn enroll_native_approval(
+    password: Option<SecretString>,
+    available: bool,
+) -> anyhow::Result<()> {
+    if !available {
         return Ok(());
     }
     let password = match password {
         Some(password) => password,
         None => {
-            println!("Touch ID approval is available. Enter the vault password once to enable it.");
+            println!("Enter the vault Master Password once to continue.");
             prompt_master_password(true)?
         }
     };
     crate::native_approval::enroll(&password)
         .await
         .map_err(|error| anyhow::anyhow!("could not enable Touch ID approval: {error}"))?;
-    println!("Touch ID approval enabled.");
+    println!("Touch ID approval enabled. Future requests show the exact host scope first.");
     Ok(())
 }
 
@@ -760,8 +814,8 @@ fn print_lease_activated(info: &LeaseActivatedInfo) {
 
 async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
     require_tty("add")?;
-
-    let ssh_password = rpassword::prompt_password(format!("SSH password for {}: ", args.alias))?;
+    let auth = host_auth_input(args.auth, args.key_file, &args.alias)?;
+    let route = host_route_input(args.via, args.proxy_jump, args.jump);
 
     let vault_exists_resp =
         bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
@@ -778,10 +832,10 @@ async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
         hostname: args.hostname,
         port: args.port,
         user: args.user,
-        ssh_password: SecretString::new(ssh_password),
+        auth,
         master_password,
         replace: false,
-        jump: args.jump,
+        route,
     };
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("added '{}' to the vault", args.alias);
@@ -799,6 +853,213 @@ async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
     bail_on_error_or_unexpected(send_request(&req).await?)?;
     println!("removed '{}' from the vault", args.alias);
     Ok(())
+}
+
+async fn read_host_inventory(master_password: SecretString) -> anyhow::Result<Vec<HostSummary>> {
+    let response =
+        bail_on_error_or_unexpected(send_request(&Request::ListHosts { master_password }).await?)?;
+    let Response::Hosts { hosts } = response else {
+        anyhow::bail!("daemon sent an unexpected reply to ListHosts: {response:?}");
+    };
+    Ok(hosts)
+}
+
+async fn cmd_host_list(args: HostListArgs) -> anyhow::Result<()> {
+    require_tty("host list")?;
+    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
+    let hosts = read_host_inventory(master_password).await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&hosts)?);
+        return Ok(());
+    }
+    if hosts.is_empty() {
+        println!("No vault-backed hosts configured.");
+        return Ok(());
+    }
+
+    println!("ALIAS\tENDPOINT\tUSER\tAUTH\tROUTE");
+    for host in hosts {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            escape_terminal_controls(&host.alias),
+            display_host_endpoint(&host),
+            escape_terminal_controls(host.user.as_deref().unwrap_or("(default)")),
+            host_auth_label(host.auth),
+            escape_terminal_controls(&host_route_label(&host.route))
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_host_show(args: HostShowArgs) -> anyhow::Result<()> {
+    require_tty("host show")?;
+    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
+    let hosts = read_host_inventory(master_password).await?;
+    let host = hosts
+        .into_iter()
+        .find(|host| host.alias == args.alias)
+        .ok_or_else(|| anyhow::anyhow!("no host named '{}' in the vault", args.alias))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&host)?);
+    } else {
+        println!("Alias:    {}", escape_terminal_controls(&host.alias));
+        println!("Hostname: {}", escape_terminal_controls(&host.hostname));
+        println!("Port:     {}", host.port.unwrap_or(22));
+        println!(
+            "User:     {}",
+            escape_terminal_controls(host.user.as_deref().unwrap_or("(default)"))
+        );
+        println!("Auth:     {}", host_auth_label(host.auth));
+        println!(
+            "Route:    {}",
+            escape_terminal_controls(&host_route_label(&host.route))
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_host_edit(args: HostEditArgs) -> anyhow::Result<()> {
+    require_tty("host edit")?;
+    if args.hostname.is_none()
+        && args.user.is_none()
+        && !args.clear_user
+        && args.port.is_none()
+        && !args.clear_port
+        && args.auth.is_none()
+        && args.key_file.is_none()
+        && args.via.is_none()
+        && args.proxy_jump.is_none()
+        && !args.direct
+        && args.jump.is_none()
+        && !args.clear_jump
+        && !args.change_password
+    {
+        anyhow::bail!("no changes requested; pass a field option or --change-password");
+    }
+
+    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
+    let hosts = read_host_inventory(master_password.clone()).await?;
+    let current = hosts
+        .into_iter()
+        .find(|host| host.alias == args.alias)
+        .ok_or_else(|| anyhow::anyhow!("no host named '{}' in the vault", args.alias))?;
+    if args.key_file.is_some() && args.auth != Some(HostAuthArg::KeyFile) {
+        anyhow::bail!("--key-file requires --auth key-file");
+    }
+    let auth = if args.change_password {
+        Some(host_auth_input(HostAuthArg::Password, None, &args.alias)?)
+    } else {
+        args.auth
+            .map(|auth| host_auth_input(auth, args.key_file, &args.alias))
+            .transpose()?
+    };
+    let route = if args.direct || args.clear_jump {
+        HostRoute::Direct
+    } else if args.via.is_some() || args.proxy_jump.is_some() || args.jump.is_some() {
+        host_route_input(args.via, args.proxy_jump, args.jump)
+    } else {
+        current.route
+    };
+    let request = Request::UpdateHost {
+        alias: args.alias.clone(),
+        hostname: args.hostname.unwrap_or(current.hostname),
+        port: if args.clear_port {
+            None
+        } else {
+            args.port.or(current.port)
+        },
+        user: if args.clear_user {
+            None
+        } else {
+            args.user.or(current.user)
+        },
+        route,
+        auth,
+        master_password,
+    };
+    bail_on_error_or_unexpected(send_request(&request).await?)?;
+    println!("updated '{}' in the vault", args.alias);
+    Ok(())
+}
+
+fn host_auth_input(
+    auth: HostAuthArg,
+    key_file: Option<String>,
+    alias: &str,
+) -> anyhow::Result<HostAuth> {
+    Ok(match auth {
+        HostAuthArg::Agent => {
+            if key_file.is_some() {
+                anyhow::bail!("--key-file can only be used with --auth key-file");
+            }
+            HostAuth::Agent
+        }
+        HostAuthArg::Password => {
+            if key_file.is_some() {
+                anyhow::bail!("--key-file can only be used with --auth key-file");
+            }
+            HostAuth::Password {
+                password: SecretString::new(rpassword::prompt_password(format!(
+                    "SSH password for {alias}: "
+                ))?),
+            }
+        }
+        HostAuthArg::KeyFile => HostAuth::KeyFile {
+            path: key_file
+                .ok_or_else(|| anyhow::anyhow!("--auth key-file requires --key-file <PATH>"))?,
+        },
+    })
+}
+
+fn host_route_input(
+    via: Option<String>,
+    proxy_jump: Option<String>,
+    legacy_jump: Option<String>,
+) -> HostRoute {
+    if let Some(alias) = via {
+        HostRoute::ManagedHost { alias }
+    } else if let Some(spec) = proxy_jump.or(legacy_jump) {
+        HostRoute::ProxyJump { spec }
+    } else {
+        HostRoute::Direct
+    }
+}
+
+fn host_auth_label(auth: proto::HostAuthKind) -> &'static str {
+    match auth {
+        proto::HostAuthKind::Agent => "agent",
+        proto::HostAuthKind::Password => "password",
+        proto::HostAuthKind::KeyFile => "key-file",
+    }
+}
+
+fn host_route_label(route: &HostRoute) -> String {
+    match route {
+        HostRoute::Direct => "Direct".to_string(),
+        HostRoute::ManagedHost { alias } => format!("Via {alias}"),
+        HostRoute::ProxyJump { spec } => format!("ProxyJump {spec}"),
+    }
+}
+
+fn display_host_endpoint(host: &HostSummary) -> String {
+    let hostname = escape_terminal_controls(&host.hostname);
+    match host.port {
+        Some(port) if host.hostname.contains(':') => format!("[{hostname}]:{port}"),
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname,
+    }
+}
+
+fn escape_terminal_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 // ---------------------------------------------------------------------
@@ -1275,6 +1536,43 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'));
         assert!(rendered.contains("\\n"));
         assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn legacy_host_metadata_escapes_terminal_controls() {
+        let host = HostSummary {
+            alias: "web\nforged".to_string(),
+            hostname: "server\u{1b}[31m.example".to_string(),
+            port: Some(22),
+            user: Some("deploy\tadmin".to_string()),
+            auth: proto::HostAuthKind::Agent,
+            route: HostRoute::Direct,
+        };
+
+        assert_eq!(escape_terminal_controls(&host.alias), "web\\nforged");
+        assert_eq!(display_host_endpoint(&host), "server\\u{1b}[31m.example:22");
+        assert_eq!(
+            escape_terminal_controls(host.user.as_deref().unwrap()),
+            "deploy\\tadmin"
+        );
+    }
+
+    #[test]
+    fn native_approval_setup_explains_macos_keychain_before_biometrics() {
+        let message = native_approval_setup_message(true);
+        assert!(message.contains("login Keychain"));
+        assert!(message.contains("Sloosh Approval"));
+        assert!(message.contains("Always Allow"));
+        assert!(message.contains("exact host scope before biometric or PIN verification"));
+    }
+
+    #[test]
+    fn terminal_approval_setup_explains_linux_without_keychain_work() {
+        let message = native_approval_setup_message(false);
+        assert!(message.contains("normal flow on Linux and standalone/source builds"));
+        assert!(message.contains("No Keychain or biometric setup is required"));
+        assert!(message.contains("sloosh approve <ID>"));
+        assert!(!message.contains("Touch ID approval enabled"));
     }
 
     fn transfer_test_path(tag: &str) -> std::path::PathBuf {

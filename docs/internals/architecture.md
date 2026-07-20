@@ -67,10 +67,16 @@ Ownership is deliberate:
   accesses the vault. `sloosh init` requires a real TTY, installs/verifies the
   embedded Skill, then enters the existing vault initialization flow. These
   steps are deliberately restartable rather than transactional.
-- `gui/` is a Svelte 5 frontend inside a Tauri 2 desktop process. It owns only
-  presentation and fixed setup commands. It receives status DTOs without
-  secrets; daemon, vault, Skill filesystem, PIN policy, and native helper
-  remain Rust-owned. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
+- `gui/` is a Svelte 5 frontend inside a Tauri 2 desktop process. It owns
+  presentation, fixed setup commands, and host-management forms. Host inventory
+  and mutations still cross the verified daemon seam. Master Password, Touch ID,
+  and PIN unlock create a time-bounded desktop session containing one zeroizing
+  `SecretString` in Rust memory; only status and countdowns enter the WebView.
+  Its idle timeout comes from the same owner-only `vault-settings.json` used by
+  daemon leases, while each Agent request still needs its own exact-scope human
+  approval. SSH Password is transient WebView state, crosses the local Tauri
+  command boundary as `SecretString`, and is cleared after submission. The
+  bundle keeps the CLI/daemon as `Helpers/sloosh`.
 
 ## 2. Local transport boundary
 
@@ -102,7 +108,7 @@ socket before replacing an existing recognized app. It never negotiates,
 accesses credentials, or sends an ordinary request, and it never executes the
 old installed bundle.
 
-Protocol 1 uses bounded NDJSON control messages and bounded raw frames for SFTP
+Protocol 3 uses bounded NDJSON control messages and bounded raw frames for SFTP
 payloads. CLI performs `Status -> Hello -> ProtocolReady`; daemon rejects
 unnegotiated ordinary requests before side effects. `protocol.md` owns exact
 limits, allowed pre-negotiation messages, transfer state machines, and upgrade
@@ -121,8 +127,10 @@ trees.
 
 An active lease grants a set of host aliases. API entry points prune expired
 state before use; background reapers clean otherwise-idle state and clear the
-vault cache after the last lease ends. Exact lifetimes and reaper intervals
-belong to `SECURITY.md`.
+vault cache after the last lease ends. The idle limit is the shared 1/5/15/30
+minute vault timeout; the daemon reads it independently and retains its separate
+8-hour hard lifetime cap. Exact lifetimes and reaper intervals belong to
+`SECURITY.md`.
 
 ### Stable `LeaseGrant`
 
@@ -260,6 +268,18 @@ decrypts its ciphertext, then publishes cache material together. Saves use
 fresh cryptographic material and atomic temp-file rename. Daemon cache is
 cleared after last lease expires. Exact cryptography, permissions, symlink/ACL
 checks, and zeroization guarantees belong to `SECURITY.md`.
+
+Vault format 2 stores an explicit authentication method and route per host.
+Authentication is exactly one of SSH agent, encrypted password, or an
+unencrypted private-key path; vault profiles do not silently fall back to a
+different method. Routing is exactly direct, through another managed profile,
+or an advanced OpenSSH ProxyJump expression. Version-1 entries are accepted:
+missing `jump` becomes direct and a legacy string becomes advanced ProxyJump;
+the next mutation rewrites the envelope as version 2. Vault mutation rejects
+missing managed hosts, managed-route cycles, over-depth chains, and removal of
+a profile still referenced by another managed route. `src/daemon/ssh.rs`
+repeats ProxyJump cycle/depth enforcement before dialing and owns lease and
+host-key ordering.
 
 ## 9. Module map
 

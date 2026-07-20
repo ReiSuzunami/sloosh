@@ -56,6 +56,11 @@ pub enum NativeApprovalError {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HelperRequest<'a> {
     Status,
+    UnlockWithTouchId,
+    BeginPinUnlock,
+    CompletePinUnlock {
+        verified: bool,
+    },
     Enroll {
         master_password: &'a str,
     },
@@ -72,6 +77,9 @@ enum HelperRequest<'a> {
     PromptMasterPassword {
         purpose: &'a str,
         confirm: bool,
+    },
+    PromptSshPassword {
+        host_label: &'a str,
     },
     StorePinCredential {
         master_password: &'a str,
@@ -91,9 +99,13 @@ enum HelperResponse {
     MasterPasswordEntered {
         master_password: SecretString,
     },
+    SshPasswordEntered {
+        ssh_password: SecretString,
+    },
     PinEntered {
         pin: SecretString,
     },
+    PinRejected,
     PinCredentialStored,
     PinCredentialRemoved,
     ApprovalStatus {
@@ -139,6 +151,14 @@ impl HelperProcess {
         &mut self,
         request: &HelperRequest<'_>,
     ) -> Result<HelperResponse, NativeApprovalError> {
+        self.send_request(request).await?;
+        self.receive_response().await
+    }
+
+    async fn send_request(
+        &mut self,
+        request: &HelperRequest<'_>,
+    ) -> Result<(), NativeApprovalError> {
         let mut encoded = serde_json::to_vec(request)
             .map_err(|error| NativeApprovalError::InvalidData(error.to_string()))?;
         if encoded.len() + 1 > MAX_HELPER_MESSAGE_BYTES {
@@ -150,7 +170,10 @@ impl HelperProcess {
         self.stdin.write_all(&encoded).await?;
         self.stdin.flush().await?;
         encoded.fill(0);
+        Ok(())
+    }
 
+    async fn receive_response(&mut self) -> Result<HelperResponse, NativeApprovalError> {
         let mut line = Zeroizing::new(String::new());
         let read = tokio::time::timeout(
             HELPER_INTERACTION_TIMEOUT,
@@ -262,6 +285,71 @@ pub async fn prompt_master_password(
         HelperResponse::Error { code, message } => Err(map_helper_error(code, message)),
         _ => Err(NativeApprovalError::InvalidData(
             "unexpected master password response".into(),
+        )),
+    }
+}
+
+pub async fn unlock_with_touch_id() -> Result<SecretString, NativeApprovalError> {
+    let mut helper = HelperProcess::spawn().await?;
+    match helper.exchange(&HelperRequest::UnlockWithTouchId).await? {
+        HelperResponse::Unlocked { master_password } => {
+            helper.finish().await?;
+            Ok(master_password)
+        }
+        HelperResponse::Error { code, message } => Err(map_helper_error(code, message)),
+        _ => Err(NativeApprovalError::InvalidData(
+            "unexpected Touch ID unlock response".into(),
+        )),
+    }
+}
+
+pub async fn unlock_with_pin() -> Result<SecretString, NativeApprovalError> {
+    let mut helper = HelperProcess::spawn().await?;
+    let pin = match helper.exchange(&HelperRequest::BeginPinUnlock).await? {
+        HelperResponse::PinEntered { pin } => pin,
+        HelperResponse::Error { code, message } => return Err(map_helper_error(code, message)),
+        _ => {
+            return Err(NativeApprovalError::InvalidData(
+                "unexpected PIN input response".into(),
+            ));
+        }
+    };
+    if let Err(error) = verify_pin(&PinStore::current_user(), &pin) {
+        let _ = helper
+            .exchange(&HelperRequest::CompletePinUnlock { verified: false })
+            .await;
+        let _ = helper.finish().await;
+        return Err(error);
+    }
+    let master_password = match helper
+        .exchange(&HelperRequest::CompletePinUnlock { verified: true })
+        .await?
+    {
+        HelperResponse::Unlocked { master_password } => master_password,
+        HelperResponse::Error { code, message } => return Err(map_helper_error(code, message)),
+        _ => {
+            return Err(NativeApprovalError::InvalidData(
+                "unexpected PIN unlock response".into(),
+            ));
+        }
+    };
+    helper.finish().await?;
+    Ok(master_password)
+}
+
+pub async fn prompt_ssh_password(host_label: &str) -> Result<SecretString, NativeApprovalError> {
+    let mut helper = HelperProcess::spawn().await?;
+    let response = helper
+        .exchange(&HelperRequest::PromptSshPassword { host_label })
+        .await?;
+    match response {
+        HelperResponse::SshPasswordEntered { ssh_password } => {
+            helper.finish().await?;
+            Ok(ssh_password)
+        }
+        HelperResponse::Error { code, message } => Err(map_helper_error(code, message)),
+        _ => Err(NativeApprovalError::InvalidData(
+            "unexpected SSH password response".into(),
         )),
     }
 }
@@ -379,29 +467,9 @@ pub async fn try_approve(
         return Err(error);
     }
     if let Some(pin) = entered_pin {
-        let verification = match pin_store.verify(&pin) {
-            Ok(verification) => verification,
-            Err(error) => {
-                lease::discard_native_preview().await;
-                return Err(error.into());
-            }
-        };
-        match verification {
-            PinVerify::Approved => {}
-            PinVerify::Rejected { remaining_attempts } => {
-                lease::discard_native_preview().await;
-                return Err(NativeApprovalError::WrongPin {
-                    remaining: remaining_attempts,
-                });
-            }
-            PinVerify::Locked { remaining_secs } => {
-                lease::discard_native_preview().await;
-                return Err(NativeApprovalError::PinLocked { remaining_secs });
-            }
-            PinVerify::Disabled => {
-                lease::discard_native_preview().await;
-                return Err(NativeApprovalError::PinDisabled);
-            }
+        if let Err(error) = verify_pin(&pin_store, &pin) {
+            lease::discard_native_preview().await;
+            return Err(error);
         }
     }
     let activated = lease::approve_lease_native(
@@ -414,6 +482,19 @@ pub async fn try_approve(
         lease::discard_native_preview().await;
     }
     activated.map_err(Into::into)
+}
+
+fn verify_pin(store: &PinStore, pin: &SecretString) -> Result<(), NativeApprovalError> {
+    match store.verify(pin)? {
+        PinVerify::Approved => Ok(()),
+        PinVerify::Rejected { remaining_attempts } => Err(NativeApprovalError::WrongPin {
+            remaining: remaining_attempts,
+        }),
+        PinVerify::Locked { remaining_secs } => {
+            Err(NativeApprovalError::PinLocked { remaining_secs })
+        }
+        PinVerify::Disabled => Err(NativeApprovalError::PinDisabled),
+    }
 }
 
 fn helper_path() -> Option<PathBuf> {
@@ -482,6 +563,29 @@ mod tests {
             map_helper_error("cancelled".into(), "ignored".into()),
             NativeApprovalError::Cancelled
         ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn native_approval_is_unavailable_off_macos() {
+        assert!(helper_path().is_none());
+        assert!(!is_available());
+    }
+
+    #[test]
+    fn desktop_unlock_requests_have_stable_helper_names() {
+        assert_eq!(
+            serde_json::to_value(HelperRequest::UnlockWithTouchId).unwrap(),
+            serde_json::json!({ "type": "unlock_with_touch_id" })
+        );
+        assert_eq!(
+            serde_json::to_value(HelperRequest::BeginPinUnlock).unwrap(),
+            serde_json::json!({ "type": "begin_pin_unlock" })
+        );
+        assert_eq!(
+            serde_json::to_value(HelperRequest::CompletePinUnlock { verified: true }).unwrap(),
+            serde_json::json!({ "type": "complete_pin_unlock", "verified": true })
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //!
 //! **ProxyJump chains** (docs/internals/architecture.md): a `ProxyJump` spec may name
 //! several comma-separated hops, and any hop may itself have its own
-//! `ProxyJump` (vault `jump` field or `~/.ssh/config` directive), expanded
+//! `ProxyJump` (typed vault route or `~/.ssh/config` directive), expanded
 //! recursively up to [`MAX_PROXY_JUMP_HOPS`] hops with cycle detection by
 //! resolved alias. Each hop is dialed in turn over a `direct-tcpip` channel
 //! opened on the previous hop's connection, exactly like the single-hop case.
@@ -45,7 +45,7 @@ use crate::daemon::vault;
 use crate::transport::unix::sloosh_home;
 
 /// Hard cap on ProxyJump chain length (docs/internals/architecture.md), counting every hop
-/// pulled in transitively by a jump host's own `ProxyJump` (vault `jump`
+/// pulled in transitively by a jump host's own `ProxyJump` (vault route
 /// field or `~/.ssh/config` directive). Matches OpenSSH's own default
 /// `MAX_PROXY_JUMP` bound in spirit — deep chains are almost always a
 /// misconfigured loop, not a real topology.
@@ -153,10 +153,10 @@ pub enum SshError {
     EncryptedIdentity { path: PathBuf },
 
     #[error(
-        "no working authentication method for {host} (tried ssh-agent identities, unencrypted \
-         IdentityFile keys from ~/.ssh/config, and a vault password if '{host}' has one). Load a \
-         key into ssh-agent with `ssh-add`, add an `IdentityFile` entry to ~/.ssh/config, or \
-         `sloosh add {host} --hostname <h>` to store a password in the vault."
+        "no working authentication method for {host}. A vault-managed profile uses only its \
+         selected ssh-agent, Password, or Key File method; an SSH-config host tries ssh-agent \
+         and IdentityFile keys. Check the profile in Sloosh Hosts, load a key with `ssh-add`, or \
+         compare with `ssh {host}` by hand."
     )]
     AuthFailed { host: String },
 
@@ -170,8 +170,8 @@ pub enum SshError {
     #[error(
         "the ProxyJump chain for this host revisits '{alias}' — that's a cycle (a jump host, \
          directly or through its own ProxyJump, eventually points back at an alias already in the \
-         chain), so there is no finite path to dial. Check `~/.ssh/config` (and any vault `jump` \
-         fields) for a ProxyJump loop involving '{alias}'."
+         chain), so there is no finite path to dial. Check `~/.ssh/config` and managed Sloosh \
+         routes for a ProxyJump loop involving '{alias}'."
     )]
     ProxyJumpCycle { alias: String },
 
@@ -1104,17 +1104,18 @@ pub(crate) async fn connect_with_route(
 /// that was never in the vault at all.
 async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
     if let Some(entry) = vault::get_entry(alias).await {
+        let proxy_jump = match &entry.route {
+            crate::proto::HostRoute::Direct => None,
+            crate::proto::HostRoute::ManagedHost { alias } => Some(alias.clone()),
+            crate::proto::HostRoute::ProxyJump { spec } => Some(spec.clone()),
+        };
         return HostConfig {
             alias: alias.to_string(),
             hostname: entry.hostname,
             port: entry.port.unwrap_or(22),
             user: entry.user.unwrap_or_else(current_user),
-            // Vault entries don't carry key-based identities (docs/internals/architecture.md
-            // only specifies password auth for vault entries); a
-            // vault-backed host that also needs one of those should keep
-            // using ~/.ssh/config instead.
             identity_files: Vec::new(),
-            proxy_jump: entry.jump,
+            proxy_jump,
             identity_agent: None,
         };
     }
@@ -1230,7 +1231,7 @@ async fn connect_via_proxy_jump(
 
 /// Recursively expand a `ProxyJump` spec (comma-separated hops, OpenSSH
 /// semantics: the first entry is connected to first) into a flat, dial-ordered
-/// chain of resolved hop configs. Each hop's own `ProxyJump` (vault `jump`
+/// chain of resolved hop configs. Each hop's own `ProxyJump` (vault route
 /// field or `~/.ssh/config` directive) is expanded too, and its hops are
 /// inserted *before* the hop that depends on them, since they must be reached
 /// first. `seen` starts out containing the ultimate target's alias so a chain
@@ -1537,6 +1538,68 @@ async fn authenticate(
         .flatten()
         .flatten();
 
+    // Vault profiles are explicit: use exactly the method the human chose.
+    // This avoids surprising fallback from Password/Key File to ssh-agent.
+    if let Some(entry) = vault::get_entry(&host_cfg.alias).await {
+        return match entry.auth {
+            vault::AuthMethod::Agent => {
+                if try_agent_auth(handle, host_cfg, hash_alg).await? {
+                    Ok(())
+                } else {
+                    Err(SshError::AuthFailed {
+                        host: host_cfg.alias.clone(),
+                    })
+                }
+            }
+            vault::AuthMethod::Password { mut password } => {
+                let result = handle
+                    .authenticate_password(&host_cfg.user, password.clone())
+                    .await;
+                password.zeroize();
+                match result {
+                    Ok(res) if res.success() => Ok(()),
+                    Ok(_) => Err(SshError::AuthFailed {
+                        host: host_cfg.alias.clone(),
+                    }),
+                    Err(error) => {
+                        debug!(alias = %host_cfg.alias, %error, "vault password auth error");
+                        Err(SshError::AuthFailed {
+                            host: host_cfg.alias.clone(),
+                        })
+                    }
+                }
+            }
+            vault::AuthMethod::KeyFile { path } => {
+                let path = expand_tilde(&path);
+                let key = match russh::keys::load_secret_key(&path, None) {
+                    Ok(key) => key,
+                    Err(russh::keys::Error::KeyIsEncrypted) => {
+                        return Err(SshError::EncryptedIdentity { path });
+                    }
+                    Err(error) => {
+                        debug!(path = %path.display(), %error, "could not load vault key file");
+                        return Err(SshError::AuthFailed {
+                            host: host_cfg.alias.clone(),
+                        });
+                    }
+                };
+                let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+                match handle.authenticate_publickey(&host_cfg.user, key).await {
+                    Ok(result) if result.success() => Ok(()),
+                    Ok(_) => Err(SshError::AuthFailed {
+                        host: host_cfg.alias.clone(),
+                    }),
+                    Err(error) => {
+                        debug!(alias = %host_cfg.alias, %error, "vault key file auth error");
+                        Err(SshError::AuthFailed {
+                            host: host_cfg.alias.clone(),
+                        })
+                    }
+                }
+            }
+        };
+    }
+
     if try_agent_auth(handle, host_cfg, hash_alg).await? {
         return Ok(());
     }
@@ -1564,28 +1627,6 @@ async fn authenticate(
             Err(e) => {
                 debug!(path = %path.display(), error = %e, "could not load identity file, skipping");
             }
-        }
-    }
-
-    // Vault password auth (docs/internals/architecture.md): only ever finds an entry while
-    // the vault's derived key is cached, i.e. while at least one lease is
-    // active — the credential never comes from a CLI argument or the
-    // agent's context, only from the daemon's in-memory unlocked vault.
-    if let Some(entry) = vault::get_entry(&host_cfg.alias).await {
-        let vault::AuthMethod::Password { password } = entry.auth;
-        let mut password = password;
-        let result = handle
-            .authenticate_password(&host_cfg.user, password.clone())
-            .await;
-        // We can zeroize our own copy; the copy `russh` moved onto its
-        // internal message channel is out of our control (the crate's
-        // `authenticate_password` takes the password by value, not by
-        // reference) — noted as a known limitation, not a full guarantee.
-        password.zeroize();
-        match result {
-            Ok(res) if res.success() => return Ok(()),
-            Ok(_) => debug!(alias = %host_cfg.alias, "vault password rejected by server"),
-            Err(e) => debug!(alias = %host_cfg.alias, error = %e, "vault password auth error"),
         }
     }
 

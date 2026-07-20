@@ -24,10 +24,21 @@ anything. Prefer the verified GitHub Release described in the repository's
 installation guide. Do not use `curl | sh`, request credentials, bypass
 Gatekeeper/SmartScreen, or silently invoke a package manager.
 
-Once the binary is available, ask the user to run `sloosh init` themselves in
-their own terminal, then stop and wait. Never run it for them, fake a TTY, or
-enter a vault password. After they confirm completion, you may run
-`sloosh skill status` and `sloosh status` to verify Skill and daemon state.
+Once the binary is available, explain that `sloosh init` detects the installed
+delivery and prints the matching human-approval setup:
+
+- On DMG-installed macOS, it explains the login Keychain item, the possible
+  `Sloosh Approval` system prompt, and Touch ID enrollment. The user handles
+  every native prompt; `Always Allow` avoids repeated Keychain prompts, while
+  `Allow` grants one-time access.
+- On Linux and standalone/source builds, there is no native helper or Keychain
+  permission step. Later pending requests print a `sloosh approve <ID>` command
+  for the human to run in another terminal.
+
+Then ask the user to run `sloosh init` themselves in their own terminal, stop,
+and wait. Never run it for them, fake a TTY, or enter a vault password. After
+they confirm completion, you may run `sloosh skill status` and `sloosh status`
+to verify Skill and daemon state.
 
 ## Mental model
 
@@ -58,14 +69,18 @@ sloosh status                                # daemon/lease/session overview —
   pending fallback, show the printed approval command to your user and **stop
   and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
   Touch ID or an approval PIN may complete the request without another terminal.
+- Active leases idle out according to the human's shared vault timeout
+  (1, 5, 15, or 30 minutes; default 15). Do not assume a prior lease remains
+  active; use `sloosh status` and request approval again when needed.
 - If `run` returns `running` (it hit its timeout but the command is still
   going), use `sloosh peek <host>` to follow up incrementally — do not
   re-run the command.
-- **Never ask the user for a password or key.** Credential enrollment
-  (`sloosh add`) is something the user does themselves, interactively, in
+- **Never ask the user for a password or key.** Host management
+  (`sloosh host add/edit/rm/list/show`) is something the user does themselves, interactively, in
   their own terminal. If a host isn't set up yet, tell them to run
-  `sloosh add` and wait.
-- `sloosh init`, `sloosh approve`, and credential enrollment are human-only.
+  `sloosh host add` and wait. Humans may choose SSH agent, password, or an
+  unencrypted key-file profile plus direct, managed-host, or ProxyJump routing.
+- `sloosh init`, `sloosh approve`, and every `sloosh host` command are human-only.
   Never work around their TTY checks. The Agent Skill cannot approve leases,
   initialize the vault, or grant itself new authority.
 - Sessions keep their working directory and environment between calls; you

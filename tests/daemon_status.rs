@@ -6,7 +6,10 @@
 //! `transport::unix::resolve_socket_path`, same code path the real CLI
 //! uses) specifically so tests don't collide with a real user's daemon.
 
-use sloosh::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
+use sloosh::proto::{
+    HostAuth, HostAuthKind, HostRoute, HostSummary, Request, Response, SecretString,
+    WIRE_PROTOCOL_VERSION,
+};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
@@ -104,6 +107,129 @@ async fn status_round_trip_against_running_daemon() {
         Some(Response::ProtocolReady {
             wire_protocol: WIRE_PROTOCOL_VERSION,
         })
+    );
+
+    chan.send(&Request::InitVault {
+        master_password: SecretString::new("masterpw"),
+    })
+    .await
+    .expect("send InitVault");
+    assert_eq!(
+        chan.recv::<Response>().await.expect("recv InitVault"),
+        Some(Response::Ok)
+    );
+
+    chan.send(&Request::AddCred {
+        alias: "web".to_string(),
+        hostname: "web.example.com".to_string(),
+        port: None,
+        user: Some("deploy".to_string()),
+        auth: HostAuth::Password {
+            password: SecretString::new("sshpw"),
+        },
+        master_password: SecretString::new("masterpw"),
+        replace: false,
+        route: HostRoute::Direct,
+    })
+    .await
+    .expect("send AddCred");
+    assert_eq!(
+        chan.recv::<Response>().await.expect("recv AddCred"),
+        Some(Response::Ok)
+    );
+
+    chan.send(&Request::ListHosts {
+        master_password: SecretString::new("masterpw"),
+    })
+    .await
+    .expect("send ListHosts");
+    assert_eq!(
+        chan.recv::<Response>().await.expect("recv ListHosts"),
+        Some(Response::Hosts {
+            hosts: vec![HostSummary {
+                alias: "web".to_string(),
+                hostname: "web.example.com".to_string(),
+                port: None,
+                user: Some("deploy".to_string()),
+                auth: HostAuthKind::Password,
+                route: HostRoute::Direct,
+            }],
+        })
+    );
+
+    chan.send(&Request::UpdateHost {
+        alias: "web".to_string(),
+        hostname: "web.internal.example".to_string(),
+        port: Some(2222),
+        user: Some("operator".to_string()),
+        route: HostRoute::ProxyJump {
+            spec: "bastion".to_string(),
+        },
+        auth: None,
+        master_password: SecretString::new("masterpw"),
+    })
+    .await
+    .expect("send UpdateHost");
+    assert_eq!(
+        chan.recv::<Response>().await.expect("recv UpdateHost"),
+        Some(Response::Ok)
+    );
+
+    chan.send(&Request::UpdateHost {
+        alias: "web".to_string(),
+        hostname: String::new(),
+        port: None,
+        user: None,
+        route: HostRoute::Direct,
+        auth: None,
+        master_password: SecretString::new("masterpw"),
+    })
+    .await
+    .expect("send malformed UpdateHost");
+    let invalid_update = chan
+        .recv::<Response>()
+        .await
+        .expect("recv malformed-update response");
+    assert!(
+        matches!(invalid_update, Some(Response::Error { ref message }) if message.contains("hostname cannot be empty")),
+        "{invalid_update:?}"
+    );
+
+    chan.send(&Request::ListHosts {
+        master_password: SecretString::new("masterpw"),
+    })
+    .await
+    .expect("send ListHosts after rejected update");
+    assert_eq!(
+        chan.recv::<Response>()
+            .await
+            .expect("recv unchanged ListHosts"),
+        Some(Response::Hosts {
+            hosts: vec![HostSummary {
+                alias: "web".to_string(),
+                hostname: "web.internal.example".to_string(),
+                port: Some(2222),
+                user: Some("operator".to_string()),
+                auth: HostAuthKind::Password,
+                route: HostRoute::ProxyJump {
+                    spec: "bastion".to_string()
+                },
+            }],
+        })
+    );
+
+    chan.send(&Request::ListHosts {
+        master_password: SecretString::new("wrong"),
+    })
+    .await
+    .expect("send ListHosts with wrong password");
+    let wrong_password = chan
+        .recv::<Response>()
+        .await
+        .expect("recv wrong-password response");
+    assert!(
+        matches!(wrong_password, Some(Response::Error { ref message }) if message.contains("wrong master password")),
+        "{wrong_password:?}"
     );
 
     // Ask the daemon to shut down and make sure its task actually exits.
