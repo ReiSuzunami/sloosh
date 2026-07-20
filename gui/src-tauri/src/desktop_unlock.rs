@@ -65,12 +65,7 @@ impl DesktopUnlockSession {
         self.unlock_at(master_password, method, Instant::now());
     }
 
-    fn unlock_at(
-        &mut self,
-        master_password: SecretString,
-        method: UnlockMethod,
-        now: Instant,
-    ) {
+    fn unlock_at(&mut self, master_password: SecretString, method: UnlockMethod, now: Instant) {
         self.credential = Some(UnlockedCredential {
             master_password,
             method,
@@ -93,10 +88,7 @@ impl DesktopUnlockSession {
         };
         UnlockStatus::Unlocked {
             method: credential.method,
-            idle_remaining_secs: remaining_secs(
-                credential.last_used_at + self.idle_timeout,
-                now,
-            ),
+            idle_remaining_secs: remaining_secs(credential.last_used_at + self.idle_timeout, now),
             absolute_remaining_secs: remaining_secs(
                 credential.unlocked_at + self.absolute_timeout,
                 now,
@@ -220,11 +212,7 @@ mod tests {
     fn absolute_timeout_wins_even_when_session_is_active() {
         let start = Instant::now();
         let mut session = session();
-        session.unlock_at(
-            SecretString::new("vault secret"),
-            UnlockMethod::Pin,
-            start,
-        );
+        session.unlock_at(SecretString::new("vault secret"), UnlockMethod::Pin, start);
 
         for interval in 1..48 {
             session

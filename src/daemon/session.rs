@@ -18,21 +18,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-use russh_sftp::client::error::Error as SftpClientError;
-use russh_sftp::client::fs::File as SftpFile;
-use russh_sftp::client::{Config as SftpConfig, SftpSession};
-use russh_sftp::protocol::{OpenFlags, StatusCode};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::sleep_until;
 use tracing::{info, warn};
 
 use crate::daemon::audit;
 use crate::daemon::ssh::{self, SshError};
-use crate::proto::{SessionSummary, TransferReply};
+use crate::proto::SessionSummary;
 
+mod sftp;
 mod spool;
 
+pub use sftp::{DownloadTransfer, UploadTransfer, begin_get, begin_put};
 #[cfg(test)]
 use spool::{
     MAX_ENCODED_SPOOL_NAME_BYTES, MAX_SPOOL_DIR_BYTES, MAX_SPOOL_FILE_BYTES, MAX_SPOOL_ROOT_BYTES,
@@ -48,11 +45,6 @@ const RING_CAPACITY: usize = 256 * 1024;
 /// (`SECURITY.md`); spool persistence has separate bounded per-run and global
 /// budgets below.
 const MAX_OUTPUT_CHARS: usize = 30_000;
-/// Replace russh-sftp's 10-second request deadline with the maximum value.
-/// In the pinned Tokio release this maps to its roughly 30-year far-future
-/// timer: operationally disabled for NAS transfers, though not mathematical
-/// infinity. Transport/server failures still surface normally.
-const SFTP_REQUEST_TIMEOUT_SECS: u64 = u64::MAX;
 /// A session with no read or write activity for this long is reaped
 /// (docs/internals/architecture.md). Configurable only in the sense that it's one constant to
 /// edit — no config surface for it in this milestone.
@@ -112,35 +104,6 @@ pub enum SessionError {
          directory exists and is writable by this user. (io: {0})"
     )]
     Io(#[from] std::io::Error),
-
-    // -- put/get (docs/internals/architecture.md) -------------------------------------------
-    #[error(
-        "local file '{path}' does not exist or is not readable — check the path (`sloosh put` \
-         resolves relative paths from the directory it's run in, since the daemon's own working \
-         directory is not yours). (io: {source})"
-    )]
-    LocalFileMissing {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[error(
-        "local destination '{path}' already exists — `sloosh get` refuses to overwrite a file \
-         on your machine unless you pass --force. (Overwriting the *remote* file on `put` is \
-         always allowed: the remote host is the disposable workspace; your local machine is not, \
-         so `get` is more careful about it.) Pass --force to overwrite it, or choose a different \
-         local path."
-    )]
-    LocalDestinationExists { path: String },
-
-    #[error(
-        "could not write local destination '{path}' — check that its containing directory \
-         exists and is writable by this user. (io: {source})"
-    )]
-    LocalDestinationUnwritable {
-        path: String,
-        source: std::io::Error,
-    },
 
     #[error(
         "remote path '{path}' on '{host}' over SFTP: {reason} — check the path, and that the \
@@ -1336,225 +1299,6 @@ pub async fn list_summaries() -> Vec<SessionSummary> {
     ls(None).await
 }
 
-// ---------------------------------------------------------------------------
-// `put`/`get` over SFTP (docs/internals/architecture.md)
-// ---------------------------------------------------------------------------
-
-fn sftp_client_config() -> SftpConfig {
-    SftpConfig {
-        request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECS,
-        ..SftpConfig::default()
-    }
-}
-
-/// Get (or create) the named session, then open a fresh SFTP-subsystem
-/// channel on its *existing* SSH connection (docs/internals/architecture.md: "put/get 走既有
-/// 连接的 SFTP channel" — reuse the authenticated connection, never redial or
-/// reauthenticate per transfer). Returns the resolved session name alongside
-/// the SFTP handle so callers can echo it back in their reply.
-async fn sftp_session(
-    host: &str,
-    session: Option<String>,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<(String, SftpSession), SessionError> {
-    let name = default_session_name(session);
-    let inner = get_or_create_session(host, &name, &lease_ctx).await?;
-    let channel = inner
-        ._connection
-        .handle
-        .channel_open_session()
-        .await
-        .map_err(SshError::from)?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(SshError::from)?;
-    let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_client_config())
-        .await
-        .map_err(|e| SessionError::Sftp {
-            host: host.to_string(),
-            reason: e.to_string(),
-        })?;
-    Ok((name, sftp))
-}
-
-/// Translate an SFTP protocol error on `path` into a self-teaching
-/// `SessionError` — `NoSuchFile`/`PermissionDenied` get a specific message
-/// (docs/internals/architecture.md); anything else falls back to the generic SFTP error.
-fn remote_path_error(host: &str, path: &str, err: SftpClientError) -> SessionError {
-    if let SftpClientError::Status(status) = &err {
-        let reason = match status.status_code {
-            StatusCode::NoSuchFile => Some("no such file or directory"),
-            StatusCode::PermissionDenied => Some("permission denied"),
-            _ => None,
-        };
-        if let Some(reason) = reason {
-            return SessionError::RemotePath {
-                host: host.to_string(),
-                path: path.to_string(),
-                reason: reason.to_string(),
-            };
-        }
-    }
-    SessionError::Sftp {
-        host: host.to_string(),
-        reason: err.to_string(),
-    }
-}
-
-/// Open the remote half of an upload. The caller streams bounded chunks from
-/// the sandboxed CLI into [`UploadTransfer::write_chunk`]; no local path is
-/// ever opened by the daemon and total file size is unbounded.
-pub async fn begin_put(
-    host: &str,
-    session: Option<String>,
-    local_path: &str,
-    remote_path: &str,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<UploadTransfer, SessionError> {
-    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-    let remote_file = sftp
-        .open_with_flags(
-            remote_path,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-        )
-        .await
-        .map_err(|e| remote_path_error(host, remote_path, e))?;
-    Ok(UploadTransfer {
-        host: host.to_string(),
-        session: session_name,
-        local_path: local_path.to_string(),
-        remote_path: remote_path.to_string(),
-        remote_file,
-        bytes_transferred: 0,
-    })
-}
-
-pub struct UploadTransfer {
-    host: String,
-    session: String,
-    local_path: String,
-    remote_path: String,
-    remote_file: SftpFile,
-    bytes_transferred: u64,
-}
-
-impl UploadTransfer {
-    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), SessionError> {
-        self.remote_file
-            .write_all(chunk)
-            .await
-            .map_err(|source| SessionError::Transfer {
-                host: self.host.clone(),
-                local: self.local_path.clone(),
-                remote: self.remote_path.clone(),
-                source,
-            })?;
-        self.bytes_transferred = self.bytes_transferred.saturating_add(chunk.len() as u64);
-        Ok(())
-    }
-
-    pub async fn finish(mut self) -> Result<TransferReply, SessionError> {
-        self.remote_file
-            .shutdown()
-            .await
-            .map_err(|source| SessionError::Transfer {
-                host: self.host.clone(),
-                local: self.local_path.clone(),
-                remote: self.remote_path.clone(),
-                source,
-            })?;
-        audit::record(
-            "put",
-            serde_json::json!({
-                "host": self.host,
-                "session": self.session,
-                "local_path": self.local_path,
-                "remote_path": self.remote_path,
-                "bytes": self.bytes_transferred,
-            }),
-        );
-        Ok(TransferReply {
-            host: self.host,
-            session: self.session,
-            local_path: self.local_path,
-            remote_path: self.remote_path,
-            bytes_transferred: self.bytes_transferred,
-        })
-    }
-}
-
-/// Open the remote half of a download. The caller repeatedly invokes
-/// [`DownloadTransfer::read_chunk`] and forwards each bounded chunk to the
-/// sandboxed CLI, which owns the local destination file.
-pub async fn begin_get(
-    host: &str,
-    session: Option<String>,
-    remote_path: &str,
-    local_path: &str,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<DownloadTransfer, SessionError> {
-    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-    let remote_file = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| remote_path_error(host, remote_path, e))?;
-    Ok(DownloadTransfer {
-        host: host.to_string(),
-        session: session_name,
-        local_path: local_path.to_string(),
-        remote_path: remote_path.to_string(),
-        remote_file,
-        bytes_transferred: 0,
-    })
-}
-
-pub struct DownloadTransfer {
-    host: String,
-    session: String,
-    local_path: String,
-    remote_path: String,
-    remote_file: SftpFile,
-    bytes_transferred: u64,
-}
-
-impl DownloadTransfer {
-    pub async fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, SessionError> {
-        let read =
-            self.remote_file
-                .read(buffer)
-                .await
-                .map_err(|source| SessionError::Transfer {
-                    host: self.host.clone(),
-                    local: self.local_path.clone(),
-                    remote: self.remote_path.clone(),
-                    source,
-                })?;
-        self.bytes_transferred = self.bytes_transferred.saturating_add(read as u64);
-        Ok(read)
-    }
-
-    pub fn finish(self) -> TransferReply {
-        audit::record(
-            "get",
-            serde_json::json!({
-                "host": self.host,
-                "session": self.session,
-                "local_path": self.local_path,
-                "remote_path": self.remote_path,
-                "bytes": self.bytes_transferred,
-            }),
-        );
-        TransferReply {
-            host: self.host,
-            session: self.session,
-            local_path: self.local_path,
-            remote_path: self.remote_path,
-            bytes_transferred: self.bytes_transferred,
-        }
-    }
-}
-
 /// Spawn the background idle-session reaper. Call once, at daemon startup.
 pub fn spawn_idle_reaper() {
     tokio::spawn(async move {
@@ -2393,17 +2137,5 @@ mod tests {
         assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
         std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn sftp_config_replaces_the_short_default_with_far_future_deadline() {
-        let config = sftp_client_config();
-        assert_eq!(config.request_timeout_secs, u64::MAX);
-        assert!(
-            tokio::time::Instant::now()
-                .checked_add(Duration::from_secs(config.request_timeout_secs))
-                .is_none(),
-            "Tokio must route the maximum duration to its far-future path"
-        );
     }
 }

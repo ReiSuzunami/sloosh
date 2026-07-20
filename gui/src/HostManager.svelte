@@ -22,22 +22,14 @@
     Trash2,
     X,
   } from '@lucide/svelte';
+  import {
+    buildHostSubmission,
+    emptyHostForm,
+    hostFormFromSummary,
+    type HostForm,
+    type HostMode,
+  } from './hostForm';
   import type { AppSnapshot, HostSummary, VaultUnlockSnapshot } from './types';
-
-  type HostMode = 'add' | 'edit' | 'delete' | null;
-  type HostForm = {
-    alias: string;
-    hostname: string;
-    port: string;
-    user: string;
-    auth: HostSummary['auth'];
-    password: string;
-    keyFile: string;
-    changeAuth: boolean;
-    routeMode: 'direct' | 'managed_host' | 'proxy_jump';
-    managedHost: string;
-    proxyJump: string;
-  };
 
   let {
     snapshot,
@@ -56,7 +48,7 @@
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
   let formError = $state<string | null>(null);
-  let form = $state<HostForm>(emptyForm());
+  let form = $state<HostForm>(emptyHostForm());
   let reducedMotion = $state(false);
   let unlock = $state<VaultUnlockSnapshot>({
     state: 'locked',
@@ -91,22 +83,6 @@
             ? 'Native secure input is unavailable in this installation.'
             : null,
   );
-
-  function emptyForm(): HostForm {
-    return {
-      alias: '',
-      hostname: '',
-      port: '',
-      user: '',
-      auth: 'agent',
-      password: '',
-      keyFile: '',
-      changeAuth: false,
-      routeMode: 'direct',
-      managedHost: '',
-      proxyJump: '',
-    };
-  }
 
   function errorMessage(cause: unknown): string {
     return cause instanceof Error ? cause.message : String(cause);
@@ -293,26 +269,14 @@
 
   function openAdd() {
     selected = null;
-    form = emptyForm();
+    form = emptyHostForm();
     formError = null;
     mode = 'add';
   }
 
   function openEdit(host: HostSummary) {
     selected = host;
-    form = {
-      alias: host.alias,
-      hostname: host.hostname,
-      port: host.port?.toString() ?? '',
-      user: host.user ?? '',
-      auth: host.auth,
-      password: '',
-      keyFile: '',
-      changeAuth: false,
-      routeMode: host.route.type,
-      managedHost: host.route.type === 'managed_host' ? host.route.alias : '',
-      proxyJump: host.route.type === 'proxy_jump' ? host.route.spec : '',
-    };
+    form = hostFormFromSummary(host);
     formError = null;
     mode = 'edit';
   }
@@ -325,56 +289,10 @@
 
   function closeDialog() {
     form.password = '';
+    form.keyFile = '';
     mode = null;
     selected = null;
     formError = null;
-  }
-
-  function hostInput(): HostSummary | null {
-    const alias = form.alias.trim();
-    const hostname = form.hostname.trim();
-    if (!alias || !hostname) {
-      formError = 'Alias and hostname are required.';
-      return null;
-    }
-    const port = form.port.trim() ? Number(form.port) : null;
-    if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
-      formError = 'Port must be an integer from 1 to 65535.';
-      return null;
-    }
-    if ((mode === 'add' || form.changeAuth) && form.auth === 'key_file' && !form.keyFile.trim()) {
-      formError = 'Choose a private key file.';
-      return null;
-    }
-    if ((mode === 'add' || form.changeAuth) && form.auth === 'password' && !form.password) {
-      formError = 'Enter the SSH password.';
-      return null;
-    }
-    const route = form.routeMode === 'managed_host'
-      ? { type: 'managed_host' as const, alias: form.managedHost.trim() }
-      : form.routeMode === 'proxy_jump'
-        ? { type: 'proxy_jump' as const, spec: form.proxyJump.trim() }
-        : { type: 'direct' as const };
-    if (route.type === 'managed_host' && !route.alias) {
-      formError = 'Choose a managed host to route through.';
-      return null;
-    }
-    if (route.type === 'managed_host' && route.alias === alias) {
-      formError = 'A host cannot route through itself.';
-      return null;
-    }
-    if (route.type === 'proxy_jump' && !route.spec) {
-      formError = 'Enter an OpenSSH ProxyJump specification.';
-      return null;
-    }
-    return {
-      alias,
-      hostname,
-      port,
-      user: form.user.trim() || null,
-      auth: form.auth,
-      route,
-    };
   }
 
   async function chooseKeyFile() {
@@ -393,24 +311,24 @@
   }
 
   async function saveHost() {
-    const host = hostInput();
-    if (!host || activeAction !== null) return;
+    if (activeAction !== null) return;
+    const submission = buildHostSubmission(form, mode);
+    if (!submission.ok) {
+      formError = submission.error;
+      return;
+    }
+    const { host, commandHost, changeAuth } = submission.value;
     const command = mode === 'edit' ? 'update_host' : 'add_host';
     activeAction = command;
     const operation = ++hostOperationGeneration;
     formError = null;
     error = null;
     success = null;
-    const password = form.auth === 'password' ? form.password : null;
     form.password = '';
     try {
       await invoke<void>(command, {
-        host: {
-          ...host,
-          password,
-          keyFile: form.keyFile.trim() || null,
-        },
-        ...(command === 'update_host' ? { changeAuth: form.changeAuth } : {}),
+        host: commandHost,
+        ...(command === 'update_host' ? { changeAuth } : {}),
       });
       if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
         hosts = command === 'update_host'

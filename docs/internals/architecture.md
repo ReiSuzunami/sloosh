@@ -75,8 +75,10 @@ Ownership is deliberate:
   Its idle timeout comes from the same owner-only `vault-settings.json` used by
   daemon leases, while each Agent request still needs its own exact-scope human
   approval. SSH Password is transient WebView state, crosses the local Tauri
-  command boundary as `SecretString`, and is cleared after submission. The
-  bundle keeps the CLI/daemon as `Helpers/sloosh`.
+  command boundary as `SecretString`, and is cleared after submission. Host
+  form serialization sends SSH Password or key-file path only while adding a
+  profile or explicitly changing its authentication; ordinary edits send
+  neither. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
 
 ## 2. Local transport boundary
 
@@ -287,13 +289,24 @@ host-key ordering.
 
 ```text
 src/
-  main.rs            process entry and command dispatch
+  main.rs            process entry
   cli/
     args.rs          clap surface
     client.rs        daemon connect/spawn, peer and protocol checks
-    mod.rs           CLI behavior, local SFTP files, setup, approval UI
+    mod.rs           command dispatch and restartable setup orchestration
+    daemon_cmd.rs    daemon lifecycle and status display
+    approval.rs      TTY policy, vault setup, approval preview, key probes
+    host.rs          vault-backed host inventory and credential enrollment
+    session.rs       PTY session command clients and rendering
+    transfer.rs      CLI-owned local SFTP files and raw-frame streaming
+    forward.rs       forwarding command client and rendering
+    log.rs           bounded audit-log query and rendering
     skill.rs         embedded Agent Skill, target detection, safe install/status
   proto.rs           protocol request/response types and NDJSON limit
+  vault_settings.rs  shared owner-only idle-timeout preference
+  procs/
+    macos.rs         process ancestry via macOS APIs
+    linux.rs         process ancestry via /proc
   transport/
     mod.rs           Channel and raw-frame contract
     unix.rs          UDS, peer credentials, paths and permissions
@@ -305,6 +318,7 @@ src/
     ssh/config.rs    OpenSSH config subset parsing and deterministic resolution
     ssh/route.rs     remote-forward route lifecycle and byte-pump mechanics
     session.rs       PTY state, sentinel framing, registry, SFTP facade
+    session/sftp.rs  remote-only SFTP channels and bounded transfer handles
     session/spool.rs bounded spool writer, actual-byte ledger, retention
     forward.rs       local -L, remote -R, and forward lifetime
     audit.rs         best-effort audit append/read helpers
@@ -313,9 +327,8 @@ src/
     helper.rs        validated helper process and bounded anonymous-pipe IPC
   local_approval.rs  PIN verifier, persistence, backoff, and disable policy
 gui/
-  src/               Svelte status and setup UI; no secret fields
+  src/               Svelte status, setup, and transient host forms
+    hostForm.ts      pure host validation and command serialization
   src-tauri/         fixed desktop command allowlist and bundle configuration
-  procs/
-    macos.rs         process ancestry via macOS APIs
-    linux.rs         process ancestry via /proc
+    host_commands.rs vault-backed host command boundary
 ```

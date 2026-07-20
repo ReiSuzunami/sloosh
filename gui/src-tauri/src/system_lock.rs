@@ -27,12 +27,7 @@ pub fn install(controller: crate::Controller) {
         // captures only thread-safe Rust state, and the workspace notification
         // center retains the observer for the lifetime of this app process.
         unsafe {
-            center.addObserverForName_object_queue_usingBlock(
-                Some(name),
-                None,
-                None,
-                &block,
-            )
+            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
         };
     }
 }
