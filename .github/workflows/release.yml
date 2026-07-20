@@ -72,6 +72,7 @@ jobs:
           corepack enable
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui check
+          pnpm --dir gui test:unit
 
       - name: Check MSRV
         run: cargo +1.85.0 check --all-targets --all-features --locked

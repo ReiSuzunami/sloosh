@@ -85,6 +85,7 @@ jobs:
           corepack enable
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui check
+          pnpm --dir gui test:unit
           pnpm --dir gui build
 
       - name: Check Tauri crate

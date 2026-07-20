@@ -27,6 +27,7 @@ cargo test --all-targets --all-features --locked
 cargo +1.85.0 check --all-targets --all-features --locked
 pnpm --dir gui install --frozen-lockfile
 pnpm --dir gui check
+pnpm --dir gui test:unit
 cargo check --manifest-path gui/src-tauri/Cargo.toml --locked
 # Release binaries must embed the frontend rather than use devUrl:
 cargo build --manifest-path gui/src-tauri/Cargo.toml --locked --release \
