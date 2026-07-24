@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible problem that is not a security vulnerability.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read SUPPORT.md first. Security vulnerabilities must use a private
+        Security Advisory, never a public issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "sloosh 0.1.0 or commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: "macOS 15 arm64 or Ubuntu 24.04 x86_64"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation channel
+      options:
+        - GitHub Release
+        - Source build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest safe sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnostics
+      description: Remove credentials, private keys, vault data, lease tokens, and sensitive logs.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed sensitive data and this is not a security vulnerability.
+          required: true
+        - label: I searched existing issues for duplicates.
+          required: true

@@ -78,7 +78,9 @@ Ownership is deliberate:
   command boundary as `SecretString`, and is cleared after submission. Host
   form serialization sends SSH Password or key-file path only while adding a
   profile or explicitly changing its authentication; ordinary edits send
-  neither. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
+  neither. On macOS, the desktop process maps Tauri's system-theme events to
+  explicit light/dark AppKit Dock icons while the bundle icon remains the
+  launch-time fallback. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
 
 ## 2. Local transport boundary
 
@@ -278,9 +280,12 @@ checks, and zeroization guarantees belong to `SECURITY.md`.
 
 Vault format 2 stores an explicit authentication method and route per host.
 Authentication is exactly one of SSH agent, encrypted password, or an
-unencrypted private-key path; vault profiles do not silently fall back to a
-different method. Routing is exactly direct, through another managed profile,
-or an advanced OpenSSH ProxyJump expression. Version-1 entries are accepted:
+unencrypted Ed25519/ECDSA private-key path; vault profiles do not silently fall
+back to a different method. RSA and encrypted private keys stay usable through
+ssh-agent, but local RSA signing is rejected because the available
+implementation has a timing side channel. Routing is exactly direct, through
+another managed profile, or an advanced OpenSSH ProxyJump expression.
+Version-1 entries are accepted:
 missing `jump` becomes direct and a legacy string becomes advanced ProxyJump;
 the next mutation rewrites the envelope as version 2. Vault mutation rejects
 missing managed hosts, managed-route cycles, over-depth chains, and removal of
@@ -333,5 +338,6 @@ gui/
   src/               Svelte status, setup, and transient host forms
     hostForm.ts      pure host validation and command serialization
   src-tauri/         fixed desktop command allowlist and bundle configuration
+    dock_icon.rs     macOS Dock icon synchronization with system appearance
     host_commands.rs vault-backed host command boundary
 ```

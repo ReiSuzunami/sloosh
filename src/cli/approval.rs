@@ -1,5 +1,6 @@
 //! Human-only vault setup and lease approval flow.
 
+use std::future::Future;
 use std::io::{IsTerminal as _, Write as _};
 
 use super::args::{ApproveArgs, RequestArgs};
@@ -98,22 +99,15 @@ pub(super) async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     // ProxyJump-aware probe can resolve vault-only bastions without another
     // password prompt. Clear it before every return path.
     let approval_result: anyhow::Result<LeaseActivatedInfo> = async {
-        let approved_hosts = ssh::expand_lease_hosts(&info.hosts)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("could not resolve full ProxyJump approval scope: {error}")
-            })?;
-        confirm_approved_hosts(&approved_hosts)?;
-
-        let approve_req = Request::ApproveLease {
-            id: args.request_id,
+        let activated = resolve_confirm_and_submit_approval(
+            args.request_id,
             master_password,
-            approved_hosts,
-        };
-        let resp = bail_on_error_or_unexpected(send_request(&approve_req).await?)?;
-        let Response::LeaseActivated(activated) = resp else {
-            anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
-        };
+            info.hosts,
+            |hosts| async move { ssh::expand_lease_hosts(&hosts).await },
+            confirm_approved_hosts,
+            |request| async move { send_request(&request).await },
+        )
+        .await?;
 
         for target in ssh::host_key_confirmation_order(&activated.hosts).await {
             if ssh::host_has_known_key(&target.hostname, target.port) {
@@ -128,6 +122,38 @@ pub(super) async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     let activated = approval_result?;
     print_lease_activated(&activated);
     Ok(())
+}
+
+async fn resolve_confirm_and_submit_approval<Resolve, ResolveFuture, Confirm, Send, SendFuture>(
+    request_id: String,
+    master_password: SecretString,
+    requested_hosts: Vec<String>,
+    resolve_scope: Resolve,
+    confirm_scope: Confirm,
+    send: Send,
+) -> anyhow::Result<LeaseActivatedInfo>
+where
+    Resolve: FnOnce(Vec<String>) -> ResolveFuture,
+    ResolveFuture: Future<Output = Result<Vec<String>, ssh::SshError>>,
+    Confirm: FnOnce(&[String]) -> anyhow::Result<()>,
+    Send: FnOnce(Request) -> SendFuture,
+    SendFuture: Future<Output = anyhow::Result<Response>>,
+{
+    let approved_hosts = resolve_scope(requested_hosts).await.map_err(|error| {
+        anyhow::anyhow!("could not resolve full ProxyJump approval scope: {error}")
+    })?;
+    confirm_scope(&approved_hosts)?;
+
+    let approve_req = Request::ApproveLease {
+        id: request_id,
+        master_password,
+        approved_hosts,
+    };
+    let resp = bail_on_error_or_unexpected(send(approve_req).await?)?;
+    let Response::LeaseActivated(activated) = resp else {
+        anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
+    };
+    Ok(activated)
 }
 
 fn confirm_approved_hosts(hosts: &[String]) -> anyhow::Result<()> {
@@ -257,4 +283,45 @@ fn print_lease_activated(info: &LeaseActivatedInfo) {
          only this once.",
         info.token
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn route_expansion_failure_never_sends_approve_lease() {
+        let confirmations = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let observed_confirmations = confirmations.clone();
+        let observed_sends = sends.clone();
+
+        let error = resolve_confirm_and_submit_approval(
+            "request-id".to_string(),
+            SecretString::new("test-master-password"),
+            vec!["target".to_string()],
+            |_| async { Err(ssh::SshError::ProxyJumpTooDeep { limit: 8 }) },
+            move |_| {
+                observed_confirmations.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            move |_| {
+                observed_sends.fetch_add(1, Ordering::Relaxed);
+                async { Ok(Response::Ok) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not resolve full ProxyJump approval scope"),
+            "{error}"
+        );
+        assert_eq!(confirmations.load(Ordering::Relaxed), 0);
+        assert_eq!(sends.load(Ordering::Relaxed), 0);
+    }
 }

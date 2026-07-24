@@ -3,7 +3,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { flip } from 'svelte/animate';
   import { onMount, untrack } from 'svelte';
-  import { fade, fly } from 'svelte/transition';
+  import { fade, scale } from 'svelte/transition';
   import {
     Cable,
     Check,
@@ -62,8 +62,8 @@
   let statusInFlight = false;
   let expirySyncRequested = false;
   let hostOperationGeneration = 0;
-  const enterDuration = $derived(reducedMotion ? 140 : 220);
-  const exitDuration = $derived(reducedMotion ? 110 : 140);
+  const enterDuration = $derived(reducedMotion ? 0 : 180);
+  const exitDuration = $derived(reducedMotion ? 0 : 120);
   const dependentHosts = $derived(
     selected
       ? (hosts ?? []).filter(
@@ -431,20 +431,20 @@
   </div>
 
   {#if error}
-    <div class="notice error" role="alert" in:fly={{ y: reducedMotion ? 0 : -6, duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+    <div class="notice error" role="alert" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
       <CircleAlert size={18} />
       <span>{error}</span>
     </div>
   {/if}
   {#if success}
-    <div class="notice success" role="status" in:fly={{ y: reducedMotion ? 0 : -6, duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+    <div class="notice success" role="status" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
       <Check size={18} />
       <span>{success}</span>
     </div>
   {/if}
 
   {#if blocker}
-    <div class="host-gate" in:fly={{ y: reducedMotion ? 0 : 6, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 6, duration: exitDuration }}>
+    <div class="host-gate" in:fade={{ duration: enterDuration }}>
       <div class="host-gate-mark"><LockKeyhole size={22} /></div>
       <div>
         <h3>Host management unavailable</h3>
@@ -455,7 +455,7 @@
       {/if}
     </div>
   {:else if unlock.state === 'locked' || hosts === null}
-    <div class="host-gate" in:fly={{ y: reducedMotion ? 0 : 6, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 6, duration: exitDuration }}>
+    <div class="host-gate" in:fade={{ duration: enterDuration }}>
       <div class="host-gate-mark"><KeyRound size={22} /></div>
       <div>
         <h3>Credential vault locked</h3>
@@ -478,7 +478,7 @@
       </div>
     </div>
   {:else if hosts.length === 0}
-    <div class="host-empty" in:fly={{ y: reducedMotion ? 0 : 6, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 6, duration: exitDuration }}>
+    <div class="host-empty" in:fade={{ duration: enterDuration }}>
       <Server size={24} />
       <h3>No vault-backed hosts</h3>
       <p>Add the first connection profile for approved SSH work.</p>
@@ -486,11 +486,11 @@
     </div>
   {:else}
     <ul class="host-list" aria-label="Vault-backed SSH hosts">
-      {#each hosts as host, index (host.alias)}
+      {#each hosts as host (host.alias)}
         <li
-          animate:flip={{ duration: enterDuration }}
-          in:fly={{ y: reducedMotion ? 0 : 8, duration: enterDuration, delay: reducedMotion ? 0 : Math.min(index, 5) * 22 }}
-          out:fly={{ y: reducedMotion ? 0 : 8, duration: exitDuration }}
+          animate:flip={{ duration: reducedMotion ? 0 : 160 }}
+          in:fade={{ duration: enterDuration }}
+          out:fade={{ duration: exitDuration }}
         >
           <div class="host-identity">
             <span class="host-icon"><Server size={18} /></span>
@@ -528,9 +528,8 @@
       class="host-dialog"
       aria-modal="true"
       aria-labelledby="host-dialog-title"
-      onclose={closeDialog}
-      in:fly={{ y: reducedMotion ? 0 : 10, duration: enterDuration }}
-      out:fly={{ y: reducedMotion ? 0 : 10, duration: exitDuration }}
+      in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
+      out:fade={{ duration: exitDuration }}
     >
       <form onsubmit={(event) => { event.preventDefault(); void saveHost(); }}>
         <header>
@@ -581,7 +580,7 @@
               </label>
             {/if}
             {#if mode === 'add' || form.changeAuth}
-              <div class="choice-grid auth-choices" in:fly={{ y: reducedMotion ? 0 : 5, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 5, duration: exitDuration }}>
+              <div class="choice-grid auth-choices" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <label class:chosen={form.auth === 'agent'}>
                   <input bind:group={form.auth} type="radio" value="agent" />
                   <KeyRound size={18} />
@@ -595,19 +594,19 @@
                 <label class:chosen={form.auth === 'key_file'}>
                   <input bind:group={form.auth} type="radio" value="key_file" />
                   <FileKey2 size={18} />
-                  <span><strong>Key file</strong><small>References an unencrypted private key on this Mac.</small></span>
+                  <span><strong>Key file</strong><small>References an unencrypted Ed25519/ECDSA key. Load RSA or encrypted keys into SSH Agent.</small></span>
                 </label>
               </div>
               {#if form.auth === 'agent'}
                 <p class="auth-guidance" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}><Check size={15} /> Choose this when macOS Keychain or <code>ssh-add</code> already loaded your key.</p>
               {:else if form.auth === 'password'}
-                <label class="conditional-field" in:fly={{ y: reducedMotion ? 0 : 5, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 5, duration: exitDuration }}>
+                <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                   <span>SSH password</span>
                   <input bind:value={form.password} type="password" autocomplete="current-password" placeholder="Password for this SSH account" />
                   <small>Encrypted in the Sloosh vault. Cleared from this form immediately after submission.</small>
                 </label>
               {:else if form.auth === 'key_file'}
-                <label class="conditional-field" in:fly={{ y: reducedMotion ? 0 : 5, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 5, duration: exitDuration }}>
+                <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                   <span>Private key file</span>
                   <div class="file-picker-row">
                     <input value={form.keyFile} readonly autocomplete="off" placeholder="No file selected" aria-label="Selected private key file" />
@@ -638,7 +637,7 @@
               </label>
             </div>
             {#if form.routeMode === 'managed_host'}
-              <label class="conditional-field" in:fly={{ y: reducedMotion ? 0 : 5, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 5, duration: exitDuration }}>
+              <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <span>Managed host</span>
                 <select bind:value={form.managedHost} required>
                   <option value="" disabled>Select a host profile</option>
@@ -648,7 +647,7 @@
                 </select>
               </label>
             {:else if form.routeMode === 'proxy_jump'}
-              <label class="conditional-field" in:fly={{ y: reducedMotion ? 0 : 5, duration: enterDuration }} out:fly={{ y: reducedMotion ? 0 : 5, duration: exitDuration }}>
+              <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <span>ProxyJump specification</span>
                 <input bind:value={form.proxyJump} autocomplete="off" placeholder="user@bastion:22,edge" />
                 <small>Comma-separated OpenSSH syntax. Cycles and routes over 8 hops are rejected.</small>
@@ -678,9 +677,8 @@
       class="host-dialog confirm-dialog"
       aria-modal="true"
       aria-labelledby="remove-host-title"
-      onclose={closeDialog}
-      in:fly={{ y: reducedMotion ? 0 : 10, duration: enterDuration }}
-      out:fly={{ y: reducedMotion ? 0 : 10, duration: exitDuration }}
+      in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
+      out:fade={{ duration: exitDuration }}
     >
       <header>
         <div>

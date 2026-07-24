@@ -129,12 +129,25 @@ impl DesktopUnlockSession {
         self.set_idle_timeout_at(idle_timeout, Instant::now());
     }
 
-    fn set_idle_timeout_at(&mut self, idle_timeout: Duration, now: Instant) {
+    pub fn sync_idle_timeout(&mut self, idle_timeout: Duration) {
         assert!(idle_timeout > Duration::ZERO);
         assert!(idle_timeout <= self.absolute_timeout);
         self.idle_timeout = idle_timeout;
-        if self.is_expired_at(now) {
+    }
+
+    fn set_idle_timeout_at(&mut self, idle_timeout: Duration, now: Instant) {
+        assert!(idle_timeout > Duration::ZERO);
+        assert!(idle_timeout <= self.absolute_timeout);
+        let credential_expired = self.credential.as_ref().is_some_and(|credential| {
+            elapsed(now, credential.last_used_at) >= self.idle_timeout
+                || elapsed(now, credential.unlocked_at) >= self.absolute_timeout
+        });
+        self.idle_timeout = idle_timeout;
+
+        if credential_expired {
             self.lock();
+        } else if let Some(credential) = self.credential.as_mut() {
+            credential.last_used_at = now;
         }
     }
 
@@ -262,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn shortening_timeout_applies_to_the_current_session_immediately() {
+    fn changing_timeout_starts_a_new_idle_window() {
         let start = Instant::now();
         let mut session = session();
         session.unlock_at(
@@ -275,6 +288,67 @@ mod tests {
 
         assert!(matches!(
             session.status_at(start + Duration::from_secs(61)),
+            UnlockStatus::Unlocked {
+                idle_remaining_secs: 60,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.status_at(start + Duration::from_secs(121)),
+            UnlockStatus::Locked
+        ));
+    }
+
+    #[test]
+    fn changing_timeout_does_not_extend_the_absolute_deadline() {
+        let start = Instant::now();
+        let mut session = session();
+        session.unlock_at(
+            SecretString::new("vault secret"),
+            UnlockMethod::MasterPassword,
+            start,
+        );
+
+        session.set_idle_timeout_at(Duration::from_secs(60), start + ABSOLUTE);
+
+        assert!(matches!(
+            session.status_at(start + ABSOLUTE),
+            UnlockStatus::Locked
+        ));
+    }
+
+    #[test]
+    fn changing_timeout_does_not_revive_an_expired_session() {
+        let start = Instant::now();
+        let mut session = session();
+        session.unlock_at(
+            SecretString::new("vault secret"),
+            UnlockMethod::MasterPassword,
+            start,
+        );
+
+        session.set_idle_timeout_at(Duration::from_secs(30 * 60), start + IDLE);
+
+        assert!(matches!(
+            session.status_at(start + IDLE),
+            UnlockStatus::Locked
+        ));
+    }
+
+    #[test]
+    fn synchronizing_timeout_does_not_refresh_idle_activity() {
+        let start = Instant::now();
+        let mut session = session();
+        session.unlock_at(
+            SecretString::new("vault secret"),
+            UnlockMethod::MasterPassword,
+            start,
+        );
+
+        session.sync_idle_timeout(IDLE);
+
+        assert!(matches!(
+            session.status_at(start + IDLE),
             UnlockStatus::Locked
         ));
     }

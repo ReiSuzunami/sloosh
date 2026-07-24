@@ -63,10 +63,10 @@ Touch ID，用于后续 lease 请求；登记前 CLI 会解释 login Keychain �
 Codex 与 Claude Code；可用 `sloosh skill status` 检查结果。二进制本身不会调用 `npx`
 或任何 Agent marketplace。
 
-登记后，`sloosh request` 会先显示原生的精确主机列表确认，再以 Touch ID 或可选审批 PIN
-完成授权，不再要求另开终端。PIN 使用持久退避，连续失败 15 次后禁用，并且不会消耗 Master
-Password 的失败次数。取消、未登记以及源码/压缩包构建会退回 `sloosh approve`。首次遇到未知 SSH
-host key 时也仍使用终端审批，以便人类核对指纹。
+登记后，`sloosh request <host-alias>` 会先显示原生的精确主机列表确认，再以 Touch ID
+或可选审批 PIN 完成授权，不再要求另开终端。PIN 使用持久退避，连续失败 15 次后禁用，
+并且不会消耗 Master Password 的失败次数。取消、未登记以及源码/压缩包构建会退回
+`sloosh approve`。首次遇到未知 SSH host key 时也仍使用终端审批，以便人类核对指纹。
 
 Linux 不需要 Keychain、Touch ID 或原生 helper 权限。`sloosh init` 结束时会明确说明：后续
 pending lease 需要由人类在另一终端执行输出中的 `sloosh approve <ID>` 命令。
@@ -74,8 +74,9 @@ pending lease 需要由人类在另一终端执行输出中的 `sloosh approve <
 ## 管理主机
 
 桌面 App 提供锁定的 Hosts 页面，用于管理 vault 中的连接配置。认证方式可明确选择 SSH
-agent、vault 加密密码或未加密私钥路径；路由可选择直连、经过另一条受管主机配置，或高级
-OpenSSH ProxyJump。使用 Touch ID、6 位 Sloosh PIN 或 Master Password 解锁一次后，Rust
+agent、vault 加密密码或未加密 Ed25519/ECDSA 私钥路径；RSA 与加密私钥必须先载入
+ssh-agent。路由可选择直连、经过另一条受管主机配置，或高级 OpenSSH ProxyJump。使用 Touch
+ID、6 位 Sloosh PIN 或 Master Password 解锁一次后，Rust
 桌面进程会在共用的 1/5/15/30 分钟空闲期内保留可零化会话；macOS 睡眠、锁屏或切换用户、
 手动锁定、退出 App 或达到固定 8 小时上限都会清除它。Master Password 与 PIN 始终由原生
 helper 输入。桌面端 SSH Password 仅短暂
@@ -91,6 +92,18 @@ sloosh host edit myhost --auth key-file --key-file ~/.ssh/id_ed25519
 sloosh host rm myhost
 sloosh vault timeout 15
 ```
+
+添加 `myhost` 后，首次连接的最小流程为：
+
+```sh
+sloosh request myhost
+# 如果 request 输出 pending 审批命令，由人类在另一终端执行：
+sloosh approve REQUEST_ID_FROM_OUTPUT
+sloosh run myhost "uname -a"
+```
+
+仅在 `request` 报告 `authorized` 后继续。macOS DMG 安装可通过 Touch ID 或 PIN 完成
+审批，无需第二终端。
 
 `sloosh vault timeout` 可查看当前值。在 GUI 或 CLI 中修改后，桌面 vault 与空闲的 CLI/Agent
 lease 会共用该值；逐请求主机审批与 8 小时绝对 lease 上限仍然独立。
@@ -110,6 +123,11 @@ cargo build --release --locked
 ```
 
 生成的二进制位于 `target/release/sloosh`。
+
+## 社区
+
+提交 pull request 或 issue 前，请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)、
+[SUPPORT.md](./SUPPORT.md) 与 [SECURITY.md](./SECURITY.md)。
 
 ## 许可证
 

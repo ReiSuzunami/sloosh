@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
-  import { fade, fly } from 'svelte/transition';
+  import { fade, scale } from 'svelte/transition';
   import {
     Check,
     ChevronRight,
@@ -32,11 +32,9 @@
   let success = $state<string | null>(null);
   let activeAction = $state<string | null>(null);
   let pendingApprovalMethod = $state<ApprovalMethod | null>(null);
-  let approvalDialog = $state<HTMLDialogElement | null>(null);
   let reducedMotion = $state(false);
-  const enterDuration = $derived(reducedMotion ? 140 : 220);
-  const exitDuration = $derived(reducedMotion ? 110 : 140);
-  const viewOffset = $derived(reducedMotion ? 0 : 6);
+  const enterDuration = $derived(reducedMotion ? 0 : 180);
+  const exitDuration = $derived(reducedMotion ? 0 : 120);
 
   const localApprovalReady = $derived(
     Boolean(
@@ -178,12 +176,7 @@
     pendingApprovalMethod = method;
   }
 
-  function closeApprovalSetup() {
-    pendingApprovalMethod = null;
-  }
-
   function dismissApprovalSetup() {
-    if (approvalDialog?.open) approvalDialog.close();
     pendingApprovalMethod = null;
   }
 
@@ -373,21 +366,21 @@
     </header>
 
     {#if error}
-      <div class="notice error" role="alert" in:fly={{ y: -viewOffset, duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+      <div class="notice error" role="alert" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
         <CircleAlert size={18} />
         <span>{error}</span>
       </div>
     {/if}
     {#if success}
-      <div class="notice success" role="status" in:fly={{ y: -viewOffset, duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+      <div class="notice success" role="status" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
         <Check size={18} />
         <span>{success}</span>
       </div>
     {/if}
 
     {#key view}
-      <div class="view-panel" in:fly={{ y: viewOffset, duration: enterDuration }} out:fly={{ y: viewOffset, duration: exitDuration }}>
-    {#if view === 'overview'}
+      <div class="view-panel" in:fade={{ duration: enterDuration }}>
+      {#if view === 'overview'}
       <section class="readiness-panel {readiness.tone}" aria-labelledby="readiness-heading">
         <div class="readiness-primary">
           <div class="readiness-mark" class:ready={readiness.tone === 'ready'}>
@@ -679,7 +672,7 @@
           {/if}
         </li>
       </ol>
-    {/if}
+      {/if}
       </div>
     {/key}
   </main>
@@ -687,7 +680,6 @@
 
 {#if pendingApprovalMethod}
   <dialog
-    bind:this={approvalDialog}
     use:modal
     class="host-dialog keychain-dialog"
     aria-modal="true"
@@ -703,8 +695,7 @@
         dismissApprovalSetup();
       }
     }}
-    onclose={closeApprovalSetup}
-    in:fly={{ y: viewOffset, duration: enterDuration }}
+    in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
     out:fade={{ duration: exitDuration }}
   >
     <div class="keychain-onboarding">

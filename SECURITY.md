@@ -194,7 +194,8 @@ or explicit daemon/process termination remains the termination path.
   cap because a stream may contain any number of frames.
 - Session ring: 256 KiB.
 - `run`/`peek` reply output: approximately 30,000 trailing Unicode characters;
-  the reply reports truncation and points to the bounded spool file.
+  the reply reports truncation and points to the bounded spool file when
+  persistence is available.
 - Spool file: 64 MiB per run, then an explicit truncation marker.
 - Spool retention: 64 MiB budget per session directory, oldest first,
   best-effort.
@@ -311,6 +312,13 @@ lifetime; successful activation transfers cache lifetime to the active lease.
 `SecretString` redacts `Debug` and zeroizes on drop. The daemon logs request
 type, not complete request fields. Audit does not record credentials or command
 output, but it does record command text and transfer paths.
+
+Sloosh retains RSA public-key interoperability for host keys and ssh-agent
+identities, but refuses RSA private-key files before authentication. RSA
+signing remains in the external ssh-agent, avoiding the known timing side
+channel in the local Rust RSA implementation. Direct key-file authentication
+accepts unencrypted Ed25519/ECDSA keys; encrypted and RSA keys must use
+ssh-agent.
 
 Audit writes are best-effort. Audit is operational evidence, not an
 append-only, remote, signed, or tamper-resistant security control.
@@ -448,8 +456,9 @@ relies on local OS isolation and point-to-point socket access.
 
 ## 9. Reporting a vulnerability
 
-Prefer a private GitHub Security Advisory through the repository's Security
-tab when that feature is enabled. Include affected version/commit, platform,
+Prefer a
+[private GitHub Security Advisory](https://github.com/ReiSuzunami/sloosh/security/advisories/new)
+when that feature is enabled. Include affected version/commit, platform,
 reproduction steps, impact, and any proposed fix.
 
 If private advisory reporting is unavailable, contact a maintainer privately

@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::Pty;
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -161,6 +161,13 @@ pub enum SshError {
          Add it to ssh-agent first (`ssh-add {path}`) and sloosh will pick it up automatically."
     )]
     EncryptedIdentity { path: PathBuf },
+
+    #[error(
+        "identity file {path} contains an RSA private key; sloosh refuses local RSA signing \
+         because the available implementation has a timing side channel. Add it to ssh-agent \
+         (`ssh-add {path}`), or use an Ed25519/ECDSA key file."
+    )]
+    UnsafeRsaIdentity { path: PathBuf },
 
     #[error(
         "no working authentication method for {host}. A vault-managed profile uses only its \
@@ -459,13 +466,27 @@ struct HostKeyProbeRoute {
 /// real verification (which rejects a mismatch outright) still happens in
 /// `Handler::check_server_key` at actual connection time.
 pub fn host_has_known_key(hostname: &str, port: u16) -> bool {
-    let in_ssh = russh::keys::known_hosts::known_host_keys(hostname, port).unwrap_or_default();
+    host_has_known_key_at_paths(
+        hostname,
+        port,
+        &ssh_known_hosts_path(),
+        &sloosh_known_hosts_path(),
+    )
+}
+
+fn host_has_known_key_at_paths(
+    hostname: &str,
+    port: u16,
+    openssh_path: &Path,
+    sloosh_path: &Path,
+) -> bool {
+    let in_ssh = russh::keys::known_hosts::known_host_keys_path(hostname, port, openssh_path)
+        .unwrap_or_default();
     if !in_ssh.is_empty() {
         return true;
     }
-    let in_sloosh =
-        russh::keys::known_hosts::known_host_keys_path(hostname, port, sloosh_known_hosts_path())
-            .unwrap_or_default();
+    let in_sloosh = russh::keys::known_hosts::known_host_keys_path(hostname, port, sloosh_path)
+        .unwrap_or_default();
     !in_sloosh.is_empty()
 }
 
@@ -794,7 +815,12 @@ async fn expand_proxy_jump_spec(
 ) -> Result<(), SshError> {
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let alias = parse_proxy_jump_alias(entry).to_string();
-        if chain.len() >= MAX_PROXY_JUMP_HOPS {
+        // `seen` includes the ultimate target plus every hop encountered,
+        // including recursive ancestors that have not been pushed into the
+        // dial-ordered `chain` yet. Counting it closes the nested-chain case
+        // where `chain.len()` stays zero until recursion unwinds.
+        let encountered_hops = seen.len().saturating_sub(1);
+        if encountered_hops >= MAX_PROXY_JUMP_HOPS {
             return Err(SshError::ProxyJumpTooDeep {
                 limit: MAX_PROXY_JUMP_HOPS,
             });
@@ -1129,6 +1155,7 @@ async fn authenticate(
                         });
                     }
                 };
+                reject_unsafe_local_rsa(&key, &path)?;
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
                 match handle.authenticate_publickey(&host_cfg.user, key).await {
                     Ok(result) if result.success() => Ok(()),
@@ -1151,9 +1178,14 @@ async fn authenticate(
     }
 
     let mut encrypted_identities = Vec::new();
+    let mut unsafe_rsa_identities = Vec::new();
     for path in &host_cfg.identity_files {
         match russh::keys::load_secret_key(path, None) {
             Ok(key) => {
+                if reject_unsafe_local_rsa(&key, path).is_err() {
+                    unsafe_rsa_identities.push(path.clone());
+                    continue;
+                }
                 let key = Arc::new(key);
                 let with_hash = PrivateKeyWithHashAlg::new(key, hash_alg);
                 match handle
@@ -1179,9 +1211,25 @@ async fn authenticate(
     if let Some(path) = encrypted_identities.into_iter().next() {
         return Err(SshError::EncryptedIdentity { path });
     }
+    if let Some(path) = unsafe_rsa_identities.into_iter().next() {
+        return Err(SshError::UnsafeRsaIdentity { path });
+    }
     Err(SshError::AuthFailed {
         host: host_cfg.alias.clone(),
     })
+}
+
+fn reject_unsafe_local_rsa(key: &PrivateKey, path: &Path) -> Result<(), SshError> {
+    reject_unsafe_local_rsa_algorithm(key.algorithm(), path)
+}
+
+fn reject_unsafe_local_rsa_algorithm(algorithm: Algorithm, path: &Path) -> Result<(), SshError> {
+    if matches!(algorithm, Algorithm::Rsa { .. }) {
+        return Err(SshError::UnsafeRsaIdentity {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Try every identity ssh-agent offers. Returns `Ok(true)` on success,
@@ -1374,6 +1422,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, SshError::UnknownHostKey { .. }));
+    }
+
+    #[test]
+    fn known_key_probe_uses_the_same_explicit_paths_as_connection_verification() {
+        let fixture = KnownHostsFixture::new("known-key-probe-paths");
+
+        fixture.write(Some(TEST_KEY_A), None);
+        assert!(host_has_known_key_at_paths(
+            "example.com",
+            22,
+            &fixture.openssh,
+            &fixture.sloosh,
+        ));
+
+        fixture.write(None, Some(TEST_KEY_A));
+        assert!(host_has_known_key_at_paths(
+            "example.com",
+            22,
+            &fixture.openssh,
+            &fixture.sloosh,
+        ));
+
+        fixture.write(None, None);
+        assert!(!host_has_known_key_at_paths(
+            "example.com",
+            22,
+            &fixture.openssh,
+            &fixture.sloosh,
+        ));
     }
 
     #[test]
@@ -1755,6 +1832,26 @@ Host bastion
         assert!(matches!(err, SshError::ProxyJumpCycle { alias } if alias == "target"));
     }
 
+    #[tokio::test]
+    async fn lease_scope_rejects_a_nested_proxy_jump_chain_deeper_than_the_cap() {
+        let mut contents = String::from("Host target\n    ProxyJump hop0\n");
+        for index in 0..=MAX_PROXY_JUMP_HOPS {
+            contents.push_str(&format!("Host hop{index}\n"));
+            if index < MAX_PROXY_JUMP_HOPS {
+                contents.push_str(&format!("    ProxyJump hop{}\n", index + 1));
+            }
+        }
+        let config = SshConfig::parse(&contents);
+
+        let err = expand_lease_hosts_with_config(&config, &["target".to_string()])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SshError::ProxyJumpTooDeep { limit } if limit == MAX_PROXY_JUMP_HOPS)
+        );
+    }
+
     #[test]
     fn identity_agent_directive_parses_path_and_expands_tilde() {
         let contents = "\
@@ -1896,5 +1993,23 @@ Host myhost
         assert!(msg.contains("ssh-agent"), "{msg}");
         assert!(msg.contains("IdentityFile"), "{msg}");
         assert!(msg.contains("ssh-add"), "{msg}");
+    }
+
+    #[test]
+    fn rsa_private_key_files_are_rejected_before_authentication() {
+        let path = Path::new("/tmp/id_rsa");
+        let error = reject_unsafe_local_rsa_algorithm(
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+            path,
+        )
+        .expect_err("RSA must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("timing side channel"), "{message}");
+        assert!(message.contains("ssh-add"), "{message}");
+
+        reject_unsafe_local_rsa_algorithm(Algorithm::Ed25519, Path::new("/tmp/id_ed25519"))
+            .expect("Ed25519 remains supported");
     }
 }

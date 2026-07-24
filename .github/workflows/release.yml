@@ -47,6 +47,7 @@ jobs:
             echo "tag $version does not match Cargo.toml $manifest_version" >&2
             exit 1
           fi
+          scripts/check-versions.sh
 
           git rev-parse --verify origin/main >/dev/null
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -277,7 +278,12 @@ jobs:
           test "$("dist/root/$package/sloosh" --version)" = "sloosh $version"
           install -m 0644 README.md LICENSE-APACHE LICENSE-MIT \
             "dist/root/$package/"
-          tar -C dist/root -czf dist/sloosh-macos-universal.tar.gz "$package"
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          archive_time="$(date -u -r "$source_date_epoch" +%Y%m%d%H%M.%S)"
+          find "dist/root/$package" -exec touch -h -t "$archive_time" {} +
+          COPYFILE_DISABLE=1 tar -C dist/root \
+            --uid 0 --gid 0 --uname root --gname root -cf - "$package" |
+            gzip -n > dist/sloosh-macos-universal.tar.gz
           scripts/package-macos.sh \
             "$version" \
             "dist/root/$package/sloosh" \

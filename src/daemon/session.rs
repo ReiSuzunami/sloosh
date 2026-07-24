@@ -2091,6 +2091,50 @@ mod tests {
     }
 
     #[test]
+    fn spool_write_error_detaches_persistence_but_keeps_ring_and_command() {
+        let root = temp_spool_root("write-error-ingest");
+        ensure_private_dir(&root).unwrap();
+        let active = root.join("read-only.log");
+        std::fs::File::create(&active).unwrap();
+        let read_only_file = std::fs::File::open(&active).unwrap();
+
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 64)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&active);
+        }
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_accounting(
+            read_only_file,
+            active.clone(),
+            128,
+            ledger.clone(),
+        ));
+
+        let payload = "output survives spool failure";
+        ingest(
+            &mut state,
+            format!("{payload}\r\n\r\n{sentinel}0{sentinel}\r\n").as_bytes(),
+        );
+
+        assert!(state.spool_file.is_none(), "failed writer must detach");
+        assert!(!state.busy, "marker handling must survive write failure");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(String::from_utf8_lossy(&ring_contents(&state)).contains(payload));
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
+        assert_eq!(lock_spool_ledger(&ledger).total_bytes, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cleanup_failure_stops_persistence_but_not_ring_or_command() {
         let root = temp_spool_root("cleanup-failure-ingest");
         ensure_private_dir(&root).unwrap();

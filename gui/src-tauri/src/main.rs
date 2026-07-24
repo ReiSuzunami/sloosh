@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod desktop_unlock;
+mod dock_icon;
 mod host_commands;
 mod system_lock;
 
@@ -166,7 +167,7 @@ impl Controller {
             .desktop_unlock
             .lock()
             .map(|mut session| {
-                session.set_idle_timeout(timeout.duration());
+                session.sync_idle_timeout(timeout.duration());
                 session.status()
             })
             .unwrap_or(UnlockStatus::Locked);
@@ -472,7 +473,7 @@ fn main() {
         ))),
     };
     system_lock::install(controller.clone());
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(controller)
         .invoke_handler(tauri::generate_handler![
@@ -494,8 +495,9 @@ fn main() {
             update_host,
             remove_host
         ])
-        .run(tauri::generate_context!())
-        .expect("run Sloosh desktop app");
+        .build(tauri::generate_context!())
+        .expect("build Sloosh desktop app");
+    app.run(|app_handle, event| dock_icon::handle_run_event(app_handle, &event));
 }
 
 #[cfg(test)]

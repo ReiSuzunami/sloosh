@@ -2,7 +2,7 @@
 name = "sloosh-desktop"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 
 [features]
@@ -17,11 +17,12 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-sloosh = { path = "../.." }
+sloosh = { version = "=0.1.0", path = "../.." }
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "=0.6.2"
-objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace", "block2"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSNotification", "NSOperation", "NSString", "block2"] }
+objc2 = "=0.6.4"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder", "NSWorkspace", "block2"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSData", "NSNotification", "NSOperation", "NSString", "block2"] }

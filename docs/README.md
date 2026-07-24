@@ -12,6 +12,8 @@ user guides are maintained translations, not separate specifications.
 | Architecture | [`architecture.md`](internals/architecture.md) | — | Component boundaries, ownership, and runtime behavior |
 | Wire protocol | [`protocol.md`](internals/protocol.md) | — | Exact CLI-daemon messages, framing, and sequencing |
 | Contributing and tests | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | — | Development and verification workflow |
+| Support | [`SUPPORT.md`](../SUPPORT.md) | — | User support scope and safe diagnostics |
+| Community conduct | [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | — | Participation and enforcement expectations |
 | Releasing | [`releasing.md`](maintainers/releasing.md) | — | Versioning, crates.io, and GitHub Releases |
 
 Non-canonical research notes:

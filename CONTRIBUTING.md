@@ -28,17 +28,28 @@ cargo +1.85.0 check --all-targets --all-features --locked
 pnpm --dir gui install --frozen-lockfile
 pnpm --dir gui check
 pnpm --dir gui test:unit
+scripts/check-versions.sh
 cargo check --manifest-path gui/src-tauri/Cargo.toml --locked
 # Release binaries must embed the frontend rather than use devUrl:
 cargo build --manifest-path gui/src-tauri/Cargo.toml --locked --release \
   --features custom-protocol
+for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl; do
+  cargo deny --all-features --target "$target" \
+    check advisories bans licenses sources
+done
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+  cargo deny --manifest-path gui/src-tauri/Cargo.toml --all-features \
+    --target "$target" check advisories bans licenses sources
+done
 git diff --check
 ```
 
 Root CLI/daemon code retains MSRV 1.85. The isolated Tauri crate uses current
-stable Rust and its own lockfile. All commands must pass. Hosted CI repeats formatting, lint, unit/integration
-tests on Linux and macOS, MSRV checking, and live SSH coverage against an
-isolated sshd.
+stable Rust and its own lockfile. Install
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) before running the
+dependency checks. All commands must pass. Hosted CI repeats formatting, lint,
+unit/integration tests on Linux and macOS, MSRV checking, dependency policy,
+full-history secret scanning, and live SSH coverage against an isolated sshd.
 
 ## Live SSH tests
 

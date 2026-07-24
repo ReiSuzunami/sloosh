@@ -35,11 +35,25 @@ fn print_run_human(reply: &RunReply) {
         println!("spool: {}", reply.spool_path);
     }
     println!("{}", reply.output);
-    if reply.truncated {
-        println!(
+    if let Some(notice) = run_truncation_notice(reply) {
+        println!("{notice}");
+    }
+}
+
+fn run_truncation_notice(reply: &RunReply) -> Option<String> {
+    if !reply.truncated {
+        return None;
+    }
+    if reply.spool_path.is_empty() {
+        Some(format!(
+            "[output truncated in this reply; {} total bytes]",
+            reply.total_bytes
+        ))
+    } else {
+        Some(format!(
             "[output truncated in this reply; {} total bytes — see spool file for the rest]",
             reply.total_bytes
-        );
+        ))
     }
 }
 
@@ -153,4 +167,39 @@ fn print_session_summary_human(session: &SessionSummary) {
         line.push_str(&format!(" ({reason})"));
     }
     println!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_truncation_notice_points_to_an_available_spool() {
+        let reply = RunReply {
+            truncated: true,
+            total_bytes: 42,
+            spool_path: "/tmp/run.log".to_string(),
+            ..RunReply::default()
+        };
+
+        assert_eq!(
+            run_truncation_notice(&reply).as_deref(),
+            Some("[output truncated in this reply; 42 total bytes — see spool file for the rest]")
+        );
+    }
+
+    #[test]
+    fn run_truncation_notice_does_not_claim_a_missing_spool_exists() {
+        let reply = RunReply {
+            truncated: true,
+            total_bytes: 42,
+            spool_path: String::new(),
+            ..RunReply::default()
+        };
+
+        assert_eq!(
+            run_truncation_notice(&reply).as_deref(),
+            Some("[output truncated in this reply; 42 total bytes]")
+        );
+    }
 }

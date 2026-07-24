@@ -71,13 +71,13 @@ auto-detects Codex and Claude Code; use
 `sloosh skill status` to inspect the result. The binary never invokes `npx` or
 an agent marketplace itself.
 
-After enrollment, `sloosh request` shows a native exact host-list confirmation,
-then completes approval with Touch ID or the optional approval PIN, without
-requiring another terminal. The PIN has persistent backoff and disables after
-15 failed attempts; it is independent from the Master Password attempt budget.
-Cancellation, missing enrollment, and source/archive builds fall back to `sloosh approve`.
-The first request involving an unknown SSH host key also uses terminal approval
-so the human can verify its fingerprint.
+After enrollment, `sloosh request <host-alias>` shows a native exact host-list
+confirmation, then completes approval with Touch ID or the optional approval
+PIN, without requiring another terminal. The PIN has persistent backoff and
+disables after 15 failed attempts; it is independent from the Master Password
+attempt budget. Cancellation, missing enrollment, and source/archive builds
+fall back to `sloosh approve`. The first request involving an unknown SSH host
+key also uses terminal approval so the human can verify its fingerprint.
 
 Linux needs no Keychain, Touch ID, or native-helper permission. At the end of
 `sloosh init`, the CLI explains that later pending leases are approved from
@@ -87,7 +87,8 @@ another terminal with the printed `sloosh approve <ID>` command.
 
 The desktop app includes a locked Hosts view for vault-backed connection
 profiles. Authentication is explicit: SSH agent, an encrypted vault password,
-or an unencrypted private-key path. Routes are direct, through another managed
+or an unencrypted Ed25519/ECDSA private-key path. RSA and encrypted private
+keys must be loaded into ssh-agent. Routes are direct, through another managed
 host, or an advanced OpenSSH ProxyJump expression. Unlock once with Touch ID,
 the 6-digit Sloosh PIN, or Master Password; the Rust desktop process keeps a
 zeroizing session until the shared 1/5/15/30-minute idle timeout. It locks on
@@ -106,6 +107,18 @@ sloosh host edit myhost --auth key-file --key-file ~/.ssh/id_ed25519
 sloosh host rm myhost
 sloosh vault timeout 15
 ```
+
+The smallest first connection after adding `myhost` is:
+
+```sh
+sloosh request myhost
+# If request prints a pending approval command, a human runs it in another terminal:
+sloosh approve REQUEST_ID_FROM_OUTPUT
+sloosh run myhost "uname -a"
+```
+
+Continue only after `request` reports `authorized`. A macOS DMG installation
+may complete approval with Touch ID or PIN without the second terminal.
 
 `sloosh vault timeout` shows the current value. Setting it from either the GUI
 or CLI updates both the desktop vault idle period and idle CLI/Agent leases;
@@ -128,6 +141,11 @@ cargo build --release --locked
 ```
 
 The binary is written to `target/release/sloosh`.
+
+## Community
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md), [SUPPORT.md](./SUPPORT.md), and
+[SECURITY.md](./SECURITY.md) before opening a pull request or issue.
 
 ## License
 

@@ -1027,6 +1027,29 @@ mod tests {
         vault::create(&data, password).expect("create test vault with jump cycle");
     }
 
+    fn create_test_vault_with_deep_jump_chain(password: &[u8]) {
+        const OVER_DEPTH_HOPS: usize = 9;
+
+        let mut data = vault::VaultData::default();
+        data.hosts.insert(
+            "web".to_string(),
+            test_vault_entry("sloosh-test-depth-hop-0"),
+        );
+        for index in 0..OVER_DEPTH_HOPS {
+            let alias = format!("sloosh-test-depth-hop-{index}");
+            let mut entry = if index + 1 < OVER_DEPTH_HOPS {
+                test_vault_entry(&format!("sloosh-test-depth-hop-{}", index + 1))
+            } else {
+                test_vault_entry("")
+            };
+            if index + 1 == OVER_DEPTH_HOPS {
+                entry.route = crate::proto::HostRoute::Direct;
+            }
+            data.hosts.insert(alias, entry);
+        }
+        vault::create(&data, password).expect("create test vault with deep jump chain");
+    }
+
     /// Each `#[tokio::test]` gets its own OS thread by default, but they all
     /// share the one process-wide `state()` mutex — so these tests run
     /// serially against each other via a dedicated lock to avoid
@@ -1558,6 +1581,49 @@ mod tests {
             matches!(
                 error,
                 LeaseError::Route(ssh::SshError::ProxyJumpCycle { ref alias }) if alias == "web"
+            ),
+            "{error}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_over_depth_route_without_consuming_request() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(780, 110, Some("sloosh")),
+            ancestor(779, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_deep_jump_chain(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                LeaseError::Route(ssh::SshError::ProxyJumpTooDeep { limit: 8 })
             ),
             "{error}"
         );
