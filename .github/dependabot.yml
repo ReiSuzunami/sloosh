@@ -1,0 +1,107 @@
+version: 2
+
+updates:
+  # Root CLI and daemon. Security-sensitive runtime crates stay in separate PRs.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: "Asia/Hong_Kong"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - rust
+    groups:
+      root-cargo-patches:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "aws-lc*"
+          - "russh*"
+          - "rustls*"
+          - "tokio*"
+        update-types:
+          - patch
+
+  # Tauri has an independent manifest, lockfile, and Rust 1.88 floor.
+  - package-ecosystem: cargo
+    directory: "/gui/src-tauri"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "04:00"
+      timezone: "Asia/Hong_Kong"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - rust
+    groups:
+      desktop-cargo-patches:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "gio"
+          - "glib"
+          - "gtk"
+          - "serde_with"
+          - "tauri*"
+          - "webkit2gtk"
+          - "wry"
+        update-types:
+          - patch
+
+  # package-ecosystem "npm" also owns the pnpm lockfile.
+  - package-ecosystem: npm
+    directory: "/gui"
+    schedule:
+      interval: weekly
+      day: wednesday
+      time: "04:00"
+      timezone: "Asia/Hong_Kong"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    groups:
+      frontend-development-patches:
+        dependency-type: development
+        patterns:
+          - "*"
+        update-types:
+          - patch
+
+  # Preserve immutable action SHAs; Dependabot updates the pinned revisions.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: thursday
+      time: "04:00"
+      timezone: "Asia/Hong_Kong"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 3
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    groups:
+      github-actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
