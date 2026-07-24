@@ -1,4 +1,4 @@
-//! Entry point: parse the CLI and dispatch (DESIGN.md §8).
+//! Entry point: parse the CLI and dispatch (docs/internals/architecture.md).
 
 use clap::Parser;
 use sloosh::cli::Cli;

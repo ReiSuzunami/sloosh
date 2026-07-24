@@ -1,4 +1,4 @@
-//! Process tree introspection (DESIGN.md §4, §8).
+//! Process tree introspection (docs/internals/architecture.md).
 //!
 //! Lease anchoring walks the caller's process ancestry to find the
 //! human-meaningful "anchor" process (e.g. the `claude` agent process, not
@@ -20,13 +20,33 @@ pub use linux::ProcessTree;
 
 use std::time::SystemTime;
 
+/// Convert kernel clock ticks since boot without collapsing distinct process
+/// instances that started within the same second. Linux lease identity uses
+/// this value to defend against PID reuse.
+#[cfg(any(target_os = "linux", test))]
+fn system_time_from_ticks(
+    boot: SystemTime,
+    ticks_since_boot: u64,
+    ticks_per_sec: u64,
+) -> Option<SystemTime> {
+    if ticks_per_sec == 0 {
+        return None;
+    }
+    let whole_secs = ticks_since_boot / ticks_per_sec;
+    let remaining_ticks = ticks_since_boot % ticks_per_sec;
+    let nanos =
+        (u128::from(remaining_ticks) * 1_000_000_000_u128 / u128::from(ticks_per_sec)) as u64;
+    boot.checked_add(std::time::Duration::from_secs(whole_secs))?
+        .checked_add(std::time::Duration::from_nanos(nanos))
+}
+
 /// Platform-specific process tree queries needed for lease anchoring.
 pub trait ProcessInfo {
     /// Parent PID of `pid`, if it exists and is queryable.
     fn parent_pid(pid: u32) -> Option<u32>;
 
     /// Process start time, used to disambiguate PID reuse when walking the
-    /// ancestor chain (DESIGN.md §4: lease binds to (PID, start time)).
+    /// ancestor chain (docs/internals/architecture.md: lease binds to (PID, start time)).
     fn start_time(pid: u32) -> Option<SystemTime>;
 
     /// Kernel-reported short process name (`p_comm` on macOS,
@@ -223,6 +243,23 @@ mod tests {
         assert_eq!(pids, vec![3, 2, 1]);
         assert_eq!(chain[0].exe_basename.as_deref(), Some("sloosh"));
         assert_eq!(chain[2].exe_basename.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn tick_conversion_preserves_process_start_subseconds() {
+        let boot = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let first = system_time_from_ticks(boot, 12_345, 100).unwrap();
+        let second = system_time_from_ticks(boot, 12_346, 100).unwrap();
+
+        assert_eq!(
+            first,
+            boot + Duration::from_secs(123) + Duration::from_millis(450)
+        );
+        assert_eq!(
+            second.duration_since(first).unwrap(),
+            Duration::from_millis(10)
+        );
+        assert!(system_time_from_ticks(boot, 1, 0).is_none());
     }
 
     #[test]

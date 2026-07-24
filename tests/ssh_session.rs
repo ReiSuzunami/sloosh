@@ -1,11 +1,11 @@
 //! Live-SSH integration tests for the milestone 2/3 session command set
 //! (`run`/`peek`/`send`/`interrupt`/`open`/`ls`/`kill`), now gated behind an
-//! active lease (DESIGN.md §4) same as any other caller.
+//! active lease (docs/internals/architecture.md) same as any other caller.
 //!
 //! These need a real, reachable SSH host to connect to, so they're gated
 //! behind the `SLOOSH_TEST_SSH_HOST` environment variable (an alias
 //! resolvable via `~/.ssh/config` or a literal `user@host`/`host`, per
-//! DESIGN.md §2). Unset in CI/sandboxes: the tests compile and pass
+//! docs/internals/architecture.md). Unset in CI/sandboxes: the tests compile and pass
 //! trivially by skipping, rather than failing or hanging waiting for
 //! network access nobody granted.
 //!
@@ -17,7 +17,7 @@
 //! time.
 
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{Request, Response};
+use sloosh::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
@@ -28,11 +28,19 @@ fn test_host() -> Option<String> {
 }
 
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "sloosh-ssh-itest-{tag}-{}-{}.sock",
+    let dir = std::env::temp_dir().join(format!(
+        "sloosh-ssh-itest-{tag}-{}-{}",
         std::process::id(),
         tag.len()
-    ))
+    ));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    dir.join("sloosh.sock")
 }
 
 /// Point `$SLOOSH_HOME` at a private temp directory for the rest of this
@@ -55,7 +63,7 @@ fn set_test_home(tag: &str) -> std::path::PathBuf {
     home
 }
 
-/// Grant this test process itself a lease for `host` (DESIGN.md §4), calling
+/// Grant this test process itself a lease for `host` (docs/internals/architecture.md), calling
 /// the lease/vault machinery directly in-process rather than going through
 /// `sloosh request`/`sloosh approve` — this test binary *is* the caller
 /// whose ancestry the daemon will check, so `std::process::id()` is the
@@ -89,7 +97,20 @@ async fn grant_lease_for_test(host: &str) {
 async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(path).await {
+        if let Ok(mut chan) = UnixChannel::connect(path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;
@@ -100,7 +121,7 @@ async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
 
 /// Start a fresh daemon on its own temp socket and return a connected
 /// channel to it, having already granted this test process a lease for
-/// `host` (DESIGN.md §4) so the session commands below aren't refused.
+/// `host` (docs/internals/architecture.md) so the session commands below aren't refused.
 /// Each test gets an isolated daemon (and, via `set_test_home`, an isolated
 /// vault) so state never leaks between tests.
 async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf) {

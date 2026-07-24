@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   # Formatting and lints only, on the cheapest runner. Kept separate from
   # `test` so a fmt/clippy nit doesn't block seeing the (much slower) test
@@ -17,19 +20,46 @@ jobs:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Check committed whitespace
+        run: git show --check --format= "$GITHUB_SHA"
+
+  # Keep Cargo.toml's rust-version honest. Stable-only CI cannot catch use
+  # of language or standard-library features newer than the declared MSRV.
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.85.0
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv-1.85
+
+      - name: cargo check --all-targets --all-features
+        run: cargo check --all-targets --all-features --locked
 
   # Unit + non-live integration tests (`cargo test` skips anything gated
   # behind SLOOSH_TEST_SSH_HOST, see the `live-ssh` job below) on both
@@ -42,31 +72,82 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.os }}
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --all-targets --all-features --locked
 
-  # Exercises tests/ssh_session.rs and tests/sftp_transfer.rs against a real
-  # sshd, since they're skipped entirely by the `test` job above whenever
-  # SLOOSH_TEST_SSH_HOST is unset. Runs sshd on the runner itself (no Docker
-  # needed) and points sloosh at it via an ~/.ssh/config alias, the same way
-  # a developer would point it at any other host.
+  desktop:
+    name: Desktop (Svelte + Tauri + native helpers)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check frontend
+        run: |
+          corepack enable
+          corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui check
+          pnpm --dir gui test:unit
+          pnpm --dir gui build
+
+      - name: Check Tauri crate
+        run: |
+          cargo fmt --manifest-path gui/src-tauri/Cargo.toml -- --check
+          cargo clippy --manifest-path gui/src-tauri/Cargo.toml --locked -- -D warnings
+          cargo test --manifest-path gui/src-tauri/Cargo.toml --locked
+          cargo check --manifest-path gui/src-tauri/Cargo.toml --locked
+          cargo build --manifest-path gui/src-tauri/Cargo.toml --locked \
+            --release --features custom-protocol
+
+      - name: Check package versions
+        run: scripts/check-versions.sh
+
+      - name: Check macOS packaging sources
+        run: |
+          bash -n scripts/package-macos.sh
+          xcrun swiftc -typecheck packaging/macos/install-sloosh.swift \
+            -framework AppKit -framework Security
+          xcrun swiftc -typecheck packaging/macos/native-approval.swift \
+            -framework AppKit -framework LocalAuthentication -framework Security
+
+  # Exercises tests/ssh_session.rs, tests/sftp_transfer.rs, and
+  # tests/forward.rs against a real sshd, since they're skipped entirely by
+  # the `test` job above whenever SLOOSH_TEST_SSH_HOST is unset. Runs sshd on
+  # the runner itself (no Docker needed) and points sloosh at it via an
+  # ~/.ssh/config alias, the same way a developer would point it at any other
+  # host.
   live-ssh:
     name: Live SSH integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Ensure openssh-server is installed and running
         run: |
@@ -116,4 +197,68 @@ jobs:
         run: SLOOSH_TEST_SSH_HOST=citest cargo test --test ssh_session -- --test-threads=1
 
       - name: Run live SFTP transfer integration tests
-        run: SLOOSH_TEST_SSH_HOST=citest cargo test --test sftp_transfer -- --test-threads=1
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --features integration-test-hooks --test sftp_transfer -- --test-threads=1
+
+      - name: Run live port-forward integration tests
+        run: SLOOSH_TEST_SSH_HOST=citest cargo test --features integration-test-hooks --test forward -- --test-threads=1
+
+      # tests/proxy_jump.rs additionally requires password SSH auth. Keep it
+      # out of hosted-runner CI until the job uses an isolated localhost-only
+      # sshd; enabling passwords on the runner's system sshd is too broad.
+
+  dependency-audit:
+    name: Dependency audit (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: cli-macos-arm64
+            manifest: Cargo.toml
+            target: aarch64-apple-darwin
+          - package: cli-macos-x86_64
+            manifest: Cargo.toml
+            target: x86_64-apple-darwin
+          - package: cli-linux-musl
+            manifest: Cargo.toml
+            target: x86_64-unknown-linux-musl
+          - package: desktop-macos-arm64
+            manifest: gui/src-tauri/Cargo.toml
+            target: aarch64-apple-darwin
+          - package: desktop-macos-x86_64
+            manifest: gui/src-tauri/Cargo.toml
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features --target ${{ matrix.target }}
+          manifest-path: ${{ matrix.manifest }}
+
+  secret-scan:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          archive="/tmp/gitleaks_${version}_linux_x64.tar.gz"
+          curl -fsSL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            -o "$archive"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C /tmp gitleaks
+          /tmp/gitleaks git --redact --verbose .

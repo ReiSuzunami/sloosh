@@ -1,0 +1,28 @@
+{
+  "name": "sloosh-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:unit": "node --test tests/*.test.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@lucide/svelte": "1.25.0",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "svelte": "5.56.5"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.2.0",
+    "@tauri-apps/cli": "2.11.4",
+    "@types/node": "26.1.1",
+    "svelte-check": "4.7.3",
+    "typescript": "5.9.3",
+    "vite": "8.1.5"
+  },
+  "packageManager": "pnpm@11.8.0"
+}

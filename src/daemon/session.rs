@@ -1,45 +1,52 @@
 //! Persistent PTY session management: sentinel-based command/output framing,
 //! ring buffer + cursor `peek`, spool-to-disk, dead-session semantics, idle
-//! reaping (DESIGN.md §3, §5).
+//! reaping (docs/internals/architecture.md).
 //!
 //! Same interim trust posture as the rest of the daemon (see the note in
 //! `daemon/mod.rs`): any local caller can address any session. No
 //! per-session authorization is enforced here yet.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
-use std::io::Write;
+use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-use russh_sftp::client::SftpSession;
-use russh_sftp::client::error::Error as SftpClientError;
-use russh_sftp::protocol::{OpenFlags, StatusCode};
-use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::time::sleep_until;
 use tracing::{info, warn};
 
 use crate::daemon::audit;
 use crate::daemon::ssh::{self, SshError};
-use crate::proto::{SessionSummary, TransferReply};
-use crate::transport::unix::sloosh_home;
+use crate::proto::SessionSummary;
 
-/// Bound on how much output we keep in memory per session (DESIGN.md §5).
+mod sftp;
+mod spool;
+
+pub use sftp::{DownloadTransfer, UploadTransfer, begin_get, begin_put};
+#[cfg(test)]
+use spool::{
+    MAX_ENCODED_SPOOL_NAME_BYTES, MAX_SPOOL_DIR_BYTES, MAX_SPOOL_FILE_BYTES, MAX_SPOOL_ROOT_BYTES,
+    SPOOL_LIMIT_MARKER, SpoolLedger, cleanup_spool_dir_preserving, cleanup_spool_root,
+    encode_spool_name, ensure_private_dir, lock_spool_ledger, open_spool_file_under,
+    spool_dir_under, spool_ledger,
+};
+use spool::{SpoolWriter, open_spool_file_best_effort};
+
+/// Bound on how much output we keep in memory per session (`SECURITY.md`).
 const RING_CAPACITY: usize = 256 * 1024;
 /// Cap on how much of a single run/peek reply's `output` field we send back
-/// (DESIGN.md §5 "~30k 字符尾部"); the untruncated bytes are always on disk
-/// in the spool file.
+/// (`SECURITY.md`); spool persistence has separate bounded per-run and global
+/// budgets below.
 const MAX_OUTPUT_CHARS: usize = 30_000;
-/// Keep at most this many bytes per session's spool directory before
-/// deleting the oldest files (DESIGN.md §5, "simple size-based cleanup").
-const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
 /// A session with no read or write activity for this long is reaped
-/// (DESIGN.md §3). Configurable only in the sense that it's one constant to
+/// (docs/internals/architecture.md). Configurable only in the sense that it's one constant to
 /// edit — no config surface for it in this milestone.
 const IDLE_REAP_AFTER: Duration = Duration::from_secs(8 * 60 * 60);
 /// How often the idle reaper wakes up to check.
@@ -62,7 +69,7 @@ const INIT_COMMANDS: &str = "stty -echo 2>/dev/null; set +o emacs 2>/dev/null; \
      PS1='' PROMPT_COMMAND=''";
 
 /// Everything that can go wrong operating on a session. Self-teaching
-/// messages per DESIGN.md §7.
+/// messages per docs/internals/architecture.md.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(
@@ -97,35 +104,6 @@ pub enum SessionError {
          directory exists and is writable by this user. (io: {0})"
     )]
     Io(#[from] std::io::Error),
-
-    // -- put/get (DESIGN.md §5-6) -------------------------------------------
-    #[error(
-        "local file '{path}' does not exist or is not readable — check the path (`sloosh put` \
-         resolves relative paths from the directory it's run in, since the daemon's own working \
-         directory is not yours). (io: {source})"
-    )]
-    LocalFileMissing {
-        path: String,
-        source: std::io::Error,
-    },
-
-    #[error(
-        "local destination '{path}' already exists — `sloosh get` refuses to overwrite a file \
-         on your machine unless you pass --force. (Overwriting the *remote* file on `put` is \
-         always allowed: the remote host is the disposable workspace; your local machine is not, \
-         so `get` is more careful about it.) Pass --force to overwrite it, or choose a different \
-         local path."
-    )]
-    LocalDestinationExists { path: String },
-
-    #[error(
-        "could not write local destination '{path}' — check that its containing directory \
-         exists and is writable by this user. (io: {source})"
-    )]
-    LocalDestinationUnwritable {
-        path: String,
-        source: std::io::Error,
-    },
 
     #[error(
         "remote path '{path}' on '{host}' over SFTP: {reason} — check the path, and that the \
@@ -210,7 +188,7 @@ impl RingBuffer {
     /// Bytes since absolute offset `cursor`. Returns `(bytes, dropped)`
     /// where `dropped` is true if `cursor` pointed at data that has already
     /// been evicted from the ring (the caller silently loses that history —
-    /// documented simplification, DESIGN.md §5 ring buffer is best-effort,
+    /// documented simplification, docs/internals/architecture.md ring buffer is best-effort,
     /// not a durable log; the spool file on disk is the durable copy).
     fn since(&self, cursor: u64) -> (Vec<u8>, bool) {
         let start = self.start_offset();
@@ -265,7 +243,7 @@ fn marker_printf(sentinel: &str) -> String {
 
 /// Build the literal line written to the PTY for one `run`: run the
 /// command, then print exit status bracketed by the sentinel so the reader
-/// can find where the command's own output ends (DESIGN.md §3).
+/// can find where the command's own output ends (docs/internals/architecture.md).
 fn frame_command(command: &str, sentinel: &str) -> String {
     format!("{command}; {}", marker_printf(sentinel))
 }
@@ -558,8 +536,8 @@ fn strip_echoed_command(output: &[u8], candidates: &[&str]) -> Vec<u8> {
 /// Shape raw command output for a reply: strip ANSI (unless `raw`), then
 /// cap to `MAX_OUTPUT_CHARS` (keeping the tail, since that's almost always
 /// what's relevant), returning `(shown, truncated, total_bytes)` where
-/// `total_bytes` is the size of the *shaped-but-untruncated* text — i.e.
-/// what you'd get from the spool file after the same ANSI handling.
+/// `total_bytes` is the size of the *shaped-but-untruncated* text. Spool files
+/// retain up to `MAX_SPOOL_FILE_BYTES` raw bytes per run.
 fn shape_output(raw: &[u8], raw_mode: bool) -> (String, bool, u64) {
     let processed = if raw_mode {
         raw.to_vec()
@@ -575,7 +553,7 @@ fn shape_output(raw: &[u8], raw_mode: bool) -> (String, bool, u64) {
         let skip = char_count - MAX_OUTPUT_CHARS;
         let tail: String = text.chars().skip(skip).collect();
         let marker = format!(
-            "... [truncated {skip} chars; {total_bytes} bytes total in this run — see spool file for full output] ...\n"
+            "... [truncated {skip} chars; {total_bytes} bytes total in this run — see spool file for retained output (64 MiB/run cap)] ...\n"
         );
         (marker + &tail, true, total_bytes)
     }
@@ -607,7 +585,7 @@ struct RunOutcome {
 
 struct SessionState {
     ring: RingBuffer,
-    /// Single global read cursor for `peek` (DESIGN.md §5 simplification:
+    /// Single global read cursor for `peek` (docs/internals/architecture.md simplification:
     /// two concurrent `peek` callers on the same session share one cursor,
     /// so the second caller only sees what's new since the *first*
     /// caller's peek, not since its own last peek — documented, not fixed,
@@ -619,7 +597,7 @@ struct SessionState {
     run_seq: u64,
     current_run: Option<CurrentRun>,
     last_result: Option<RunOutcome>,
-    spool_file: Option<std::fs::File>,
+    spool_file: Option<SpoolWriter>,
     /// Removes framing internals from the raw PTY stream before anything
     /// reaches `ring`/`spool_file`.
     scrubber: FrameScrubber,
@@ -673,10 +651,6 @@ fn default_session_name(session: Option<String>) -> String {
     session.unwrap_or_else(|| "default".to_string())
 }
 
-fn spool_dir(host: &str, name: &str) -> PathBuf {
-    sloosh_home().join("spool").join(format!("{host}--{name}"))
-}
-
 fn state_label(state: &SessionState) -> &'static str {
     if state.dead.is_some() {
         "dead"
@@ -711,7 +685,7 @@ async fn get_existing_session(host: &str, name: &str) -> Result<Arc<SessionInner
 
 /// Look up a session, creating it (opening a fresh SSH connection + PTY +
 /// shell) if none exists yet. If one exists but is dead, refuses to
-/// reconnect automatically (DESIGN.md §3) and instead returns a
+/// reconnect automatically (docs/internals/architecture.md) and instead returns a
 /// self-teaching error telling the caller to `kill` it first.
 async fn get_or_create_session(
     host: &str,
@@ -791,7 +765,7 @@ async fn create_session(
     let mut wake_rx = inner.wake_tx.subscribe();
     tokio::spawn(reader_loop(inner.clone(), read_half));
 
-    // Quiesce the shell for scripted use (DESIGN.md §3), framed with its
+    // Quiesce the shell for scripted use (docs/internals/architecture.md), framed with its
     // own sentinel: everything the shell prints before that marker — login
     // banner, MOTD, prompt residue, the init line's own echo — is discarded
     // by the `discard_until_ready` gate, so none of it can ever be
@@ -911,11 +885,19 @@ fn ingest(state: &mut SessionState, data: &[u8]) {
                     continue;
                 }
                 state.ring.push_slice(&bytes);
-                if let Some(file) = state.spool_file.as_mut() {
-                    // Local disk writes are small and fast; a brief
-                    // synchronous write here is simpler and cheaper than
-                    // wiring up tokio::fs for this milestone.
-                    let _ = file.write_all(&bytes);
+                if let Some(writer) = state.spool_file.as_mut() {
+                    // The ledger avoids repeated tree scans; the actual
+                    // append remains synchronous and failures detach only
+                    // this spool while command/ring processing continues.
+                    let path = writer.path.clone();
+                    if let Err(error) = writer.write_payload(&bytes) {
+                        warn!(
+                            spool_path = %path.display(),
+                            %error,
+                            "spool write failed; command and in-memory output continue"
+                        );
+                        state.spool_file = None;
+                    }
                 }
             }
             ScrubEvent::Marker {
@@ -981,58 +963,18 @@ async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
     inner.wake_tx.send_modify(|v| *v = v.wrapping_add(1));
 }
 
-fn open_spool_file(host: &str, name: &str, seq: u64) -> std::io::Result<(PathBuf, std::fs::File)> {
-    let dir = spool_dir(host, name);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{seq:08}.log"));
-    let file = std::fs::File::create(&path)?;
-    cleanup_spool_dir(&dir);
-    Ok((path, file))
-}
-
-/// Simple size-based retention: while the directory holds more than
-/// `MAX_SPOOL_DIR_BYTES`, delete the oldest files (by filename, which is a
-/// zero-padded sequence number so lexicographic order is chronological)
-/// until it doesn't. Best-effort — errors are logged, not propagated,
-/// since spool cleanup should never block a `run` from completing.
-fn cleanup_spool_dir(dir: &std::path::Path) {
-    let mut entries: Vec<(PathBuf, u64)> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                Some((e.path(), meta.len()))
-            })
-            .collect(),
-        Err(e) => {
-            warn!(dir = %dir.display(), error = %e, "could not list spool dir for cleanup");
-            return;
-        }
-    };
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut total: u64 = entries.iter().map(|(_, len)| *len).sum();
-    let mut i = 0;
-    while total > MAX_SPOOL_DIR_BYTES && i < entries.len() {
-        let (path, len) = &entries[i];
-        if std::fs::remove_file(path).is_ok() {
-            total = total.saturating_sub(*len);
-        }
-        i += 1;
-    }
-}
-
 fn dead_reply_output(state: &SessionState, start_offset: u64, raw: bool) -> (String, bool, u64) {
     let (bytes, _dropped) = state.ring.since(start_offset);
     shape_output(&bytes, raw)
 }
 
 // ---------------------------------------------------------------------------
-// Public operations (backing the CLI command set, DESIGN.md §6)
+// Public operations (backing the CLI command set, docs/internals/architecture.md)
 // ---------------------------------------------------------------------------
 
 use crate::proto::{PeekReply, RunReply};
 
-/// `run <host> <command>` — DESIGN.md §3, §6.
+/// `run <host> <command>` — docs/internals/architecture.md.
 pub async fn run(
     host: &str,
     command: &str,
@@ -1059,12 +1001,12 @@ pub async fn run(
                 session: name,
             });
         }
-        state.busy = true;
         state.run_seq += 1;
         start_offset = state.ring.total_written;
-        let (path, file) = open_spool_file(host, &name, state.run_seq)?;
+        let (path, file) = open_spool_file_best_effort(host, &name, state.run_seq);
         spool_path = path;
-        state.spool_file = Some(file);
+        state.spool_file = file;
+        state.busy = true;
         state.current_run = Some(CurrentRun {
             sentinel: sentinel.clone(),
             resync: None,
@@ -1183,7 +1125,7 @@ fn dead_run_reply(
     }
 }
 
-/// `peek <host>` — DESIGN.md §3, §6.
+/// `peek <host>` — docs/internals/architecture.md.
 pub async fn peek(
     host: &str,
     session: Option<String>,
@@ -1216,7 +1158,7 @@ pub async fn peek(
     })
 }
 
-/// `send <host> <keys>` — DESIGN.md §6.
+/// `send <host> <keys>` — docs/internals/architecture.md.
 pub async fn send(
     host: &str,
     keys: &str,
@@ -1247,7 +1189,7 @@ pub async fn send(
     Ok(())
 }
 
-/// `interrupt <host>` — sends Ctrl-C (0x03), DESIGN.md §6.
+/// `interrupt <host>` — sends Ctrl-C (0x03), docs/internals/architecture.md.
 ///
 /// If a run is in flight, Ctrl-C usually aborts the *whole* framed command
 /// line in the interactive shell — including the trailing marker `printf` —
@@ -1273,15 +1215,17 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
                 reason: reason.clone(),
             });
         }
-        if state.busy
-            && let Some(current) = state.current_run.as_mut()
-        {
-            // Re-arming on repeat interrupts replaces the probe sentinel;
-            // an older probe's marker (if its printf still runs) is
-            // scrubbed and swallowed as stale by `handle_marker`.
-            let resync_sentinel = make_sentinel();
-            current.resync = Some(resync_sentinel.clone());
-            Some(marker_printf(&resync_sentinel))
+        if state.busy {
+            if let Some(current) = state.current_run.as_mut() {
+                // Re-arming on repeat interrupts replaces the probe sentinel;
+                // an older probe's marker (if its printf still runs) is
+                // scrubbed and swallowed as stale by `handle_marker`.
+                let resync_sentinel = make_sentinel();
+                current.resync = Some(resync_sentinel.clone());
+                Some(marker_printf(&resync_sentinel))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1302,7 +1246,7 @@ pub async fn interrupt(host: &str, session: Option<String>) -> Result<(), Sessio
 }
 
 /// `open <host> <name>` — explicit create-or-reuse of a named session
-/// (DESIGN.md §6). Unlike `run`, never implicitly targets "default".
+/// (docs/internals/architecture.md). Unlike `run`, never implicitly targets "default".
 pub async fn open(
     host: &str,
     name: &str,
@@ -1313,7 +1257,7 @@ pub async fn open(
     Ok(summarize(host, name, &state))
 }
 
-/// `kill <host>` — DESIGN.md §6. Removes the session from the registry and
+/// `kill <host>` — docs/internals/architecture.md. Removes the session from the registry and
 /// closes its channel; never reconnects (this is the only way back from a
 /// `dead` session, or to end a healthy one).
 pub async fn kill(host: &str, session: Option<String>) -> Result<(), SessionError> {
@@ -1332,15 +1276,15 @@ pub async fn kill(host: &str, session: Option<String>) -> Result<(), SessionErro
     Ok(())
 }
 
-/// `ls [--host]` — DESIGN.md §6.
+/// `ls [--host]` — docs/internals/architecture.md.
 pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
     let reg = registry().lock().await;
     let mut out = Vec::with_capacity(reg.len());
     for ((host, name), inner) in reg.iter() {
-        if let Some(hf) = &host_filter
-            && hf != host
-        {
-            continue;
+        if let Some(hf) = &host_filter {
+            if hf != host {
+                continue;
+            }
         }
         let state = inner.state.lock().await;
         out.push(summarize(host, name, &state));
@@ -1353,208 +1297,6 @@ pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
 /// Summaries of all live sessions, for `status`.
 pub async fn list_summaries() -> Vec<SessionSummary> {
     ls(None).await
-}
-
-// ---------------------------------------------------------------------------
-// `put`/`get` over SFTP (DESIGN.md §5-6)
-// ---------------------------------------------------------------------------
-
-/// Get (or create) the named session, then open a fresh SFTP-subsystem
-/// channel on its *existing* SSH connection (DESIGN.md §5: "put/get 走既有
-/// 连接的 SFTP channel" — reuse the authenticated connection, never redial or
-/// reauthenticate per transfer). Returns the resolved session name alongside
-/// the SFTP handle so callers can echo it back in their reply.
-async fn sftp_session(
-    host: &str,
-    session: Option<String>,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<(String, SftpSession), SessionError> {
-    let name = default_session_name(session);
-    let inner = get_or_create_session(host, &name, &lease_ctx).await?;
-    let channel = inner
-        ._connection
-        .handle
-        .channel_open_session()
-        .await
-        .map_err(SshError::from)?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(SshError::from)?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SessionError::Sftp {
-            host: host.to_string(),
-            reason: e.to_string(),
-        })?;
-    Ok((name, sftp))
-}
-
-/// Translate an SFTP protocol error on `path` into a self-teaching
-/// `SessionError` — `NoSuchFile`/`PermissionDenied` get a specific message
-/// (DESIGN.md §7); anything else falls back to the generic SFTP error.
-fn remote_path_error(host: &str, path: &str, err: SftpClientError) -> SessionError {
-    if let SftpClientError::Status(status) = &err {
-        let reason = match status.status_code {
-            StatusCode::NoSuchFile => Some("no such file or directory"),
-            StatusCode::PermissionDenied => Some("permission denied"),
-            _ => None,
-        };
-        if let Some(reason) = reason {
-            return SessionError::RemotePath {
-                host: host.to_string(),
-                path: path.to_string(),
-                reason: reason.to_string(),
-            };
-        }
-    }
-    SessionError::Sftp {
-        host: host.to_string(),
-        reason: err.to_string(),
-    }
-}
-
-/// `put <host> <local-path> <remote-path>` — upload a local file over SFTP
-/// (DESIGN.md §5-6). `local_path` must already be absolute: the CLI resolves
-/// relative paths before sending, since the daemon's own working directory
-/// is not the caller's. File content is read directly off this process's
-/// local filesystem and written directly to the remote one — it never
-/// crosses the CLI<->daemon socket, only the two paths and the resulting
-/// byte count do. Overwriting an existing file at `remote_path` is always
-/// allowed: the remote host is the disposable workspace.
-pub async fn put(
-    host: &str,
-    session: Option<String>,
-    local_path: &str,
-    remote_path: &str,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<TransferReply, SessionError> {
-    let mut local_file = tokio::fs::File::open(local_path).await.map_err(|source| {
-        SessionError::LocalFileMissing {
-            path: local_path.to_string(),
-            source,
-        }
-    })?;
-
-    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-
-    let mut remote_file = sftp
-        .open_with_flags(
-            remote_path,
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-        )
-        .await
-        .map_err(|e| remote_path_error(host, remote_path, e))?;
-
-    let bytes_transferred = tokio::io::copy(&mut local_file, &mut remote_file)
-        .await
-        .map_err(|source| SessionError::Transfer {
-            host: host.to_string(),
-            local: local_path.to_string(),
-            remote: remote_path.to_string(),
-            source,
-        })?;
-    let _ = remote_file.shutdown().await;
-
-    audit::record(
-        "put",
-        serde_json::json!({
-            "host": host,
-            "session": session_name,
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "bytes": bytes_transferred,
-        }),
-    );
-
-    Ok(TransferReply {
-        host: host.to_string(),
-        session: session_name,
-        local_path: local_path.to_string(),
-        remote_path: remote_path.to_string(),
-        bytes_transferred,
-    })
-}
-
-/// `get <host> <remote-path> <local-path>` — download a remote file over
-/// SFTP (DESIGN.md §5-6), same connection-reuse contract as `put`. Refuses
-/// to overwrite an existing local file unless `force`: unlike `put`, the
-/// destination here is the user's own machine, so an accidental overwrite is
-/// worse than a refusal. The existence check is checked up front (fail fast
-/// without even dialing SFTP) and re-checked atomically via `create_new`
-/// when actually opening the destination, closing the TOCTOU window between
-/// the two.
-pub async fn get(
-    host: &str,
-    session: Option<String>,
-    remote_path: &str,
-    local_path: &str,
-    force: bool,
-    lease_ctx: ssh::LeaseContext,
-) -> Result<TransferReply, SessionError> {
-    if !force && tokio::fs::try_exists(local_path).await.unwrap_or(false) {
-        return Err(SessionError::LocalDestinationExists {
-            path: local_path.to_string(),
-        });
-    }
-
-    let (session_name, sftp) = sftp_session(host, session, lease_ctx).await?;
-
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| remote_path_error(host, remote_path, e))?;
-
-    let mut open_opts = tokio::fs::OpenOptions::new();
-    open_opts.write(true);
-    if force {
-        open_opts.create(true).truncate(true);
-    } else {
-        open_opts.create_new(true);
-    }
-    let mut local_file = match open_opts.open(local_path).await {
-        Ok(f) => f,
-        Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(SessionError::LocalDestinationExists {
-                path: local_path.to_string(),
-            });
-        }
-        Err(source) => {
-            return Err(SessionError::LocalDestinationUnwritable {
-                path: local_path.to_string(),
-                source,
-            });
-        }
-    };
-
-    let bytes_transferred = tokio::io::copy(&mut remote_file, &mut local_file)
-        .await
-        .map_err(|source| SessionError::Transfer {
-            host: host.to_string(),
-            local: local_path.to_string(),
-            remote: remote_path.to_string(),
-            source,
-        })?;
-    let _ = local_file.flush().await;
-
-    audit::record(
-        "get",
-        serde_json::json!({
-            "host": host,
-            "session": session_name,
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "bytes": bytes_transferred,
-        }),
-    );
-
-    Ok(TransferReply {
-        host: host.to_string(),
-        session: session_name,
-        local_path: local_path.to_string(),
-        remote_path: remote_path.to_string(),
-        bytes_transferred,
-    })
 }
 
 /// Spawn the background idle-session reaper. Call once, at daemon startup.
@@ -2006,28 +1748,438 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
     }
 
-    // --- spool cleanup -------------------------------------------------
+    // --- spool safety / cleanup ----------------------------------------
+
+    fn temp_spool_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sloosh-spool-{label}-{}-{}",
+            std::process::id(),
+            make_sentinel()
+        ))
+    }
+
+    #[test]
+    fn spool_paths_encode_untrusted_host_and_session_names() {
+        let sandbox = temp_spool_root("traversal");
+        let root = sandbox.join("spool");
+        let escaped = sandbox.join("escaped");
+        let (path, writer) =
+            open_spool_file_under(&root, "../../escaped/host", "../session/../../outside", 1)
+                .unwrap();
+        drop(writer);
+
+        assert!(path.starts_with(&root));
+        let relative = path.strip_prefix(&root).unwrap();
+        assert_eq!(relative.components().count(), 2);
+        assert!(
+            !escaped.exists(),
+            "untrusted names must not escape spool root"
+        );
+        let session_component = relative.components().next().unwrap().as_os_str();
+        let session_component = session_component.to_string_lossy();
+        assert!(!session_component.contains('/'));
+        assert!(!session_component.contains(".."));
+
+        let long = "../".repeat(500);
+        let encoded = encode_spool_name(&long);
+        assert!(encoded.len() <= MAX_ENCODED_SPOOL_NAME_BYTES);
+        assert!(!encoded.contains('/'));
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn spool_directories_and_files_are_private() {
+        let root = temp_spool_root("permissions");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let (path, writer) = open_spool_file_under(&root, "host", "session", 1).unwrap();
+        drop(writer);
+
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reused_run_sequence_never_truncates_retained_history() {
+        let root = temp_spool_root("sequence-collision");
+        ensure_private_dir(&root).unwrap();
+        let dir = spool_dir_under(&root, "host", "session");
+        ensure_private_dir(&dir).unwrap();
+        let history = dir.join("00000001.log");
+        std::fs::write(&history, b"retained history").unwrap();
+
+        let (new_path, writer) = open_spool_file_under(&root, "host", "session", 1).unwrap();
+
+        assert_ne!(new_path, history, "a reused sequence needs a unique path");
+        assert_eq!(std::fs::read(&history).unwrap(), b"retained history");
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incomplete_initial_scan_pauses_persistence_until_a_complete_retry() {
+        let root = temp_spool_root("scan-retry");
+        ensure_private_dir(&root).unwrap();
+        let unreadable = root.join("unreadable");
+        ensure_private_dir(&unreadable).unwrap();
+        let history = unreadable.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(32).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut ledger = SpoolLedger::new(root.clone(), 64);
+        ledger.initialize();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!ledger.initialized);
+        assert_eq!(ledger.claim_bytes(&root.join("active.log"), 16), 0);
+
+        ledger.next_scan_attempt = None;
+        ledger.initialize();
+        assert!(ledger.initialized);
+        assert_eq!(ledger.total_bytes, 32);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_limit_does_not_stop_ring_or_command_completion() {
+        let root = temp_spool_root("limit");
+        ensure_private_dir(&root).unwrap();
+        let path = root.join("limited.log");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_limit(file, path.clone(), 128));
+
+        let payload = "x".repeat(256);
+        ingest(
+            &mut state,
+            format!("{payload}\r\n\r\n{sentinel}0{sentinel}\r\n").as_bytes(),
+        );
+
+        assert!(!state.busy, "marker handling must continue after spool cap");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(
+            ring_contents(&state).len() > 128,
+            "memory ring must keep output beyond disk cap"
+        );
+        let persisted = std::fs::read(&path).unwrap();
+        assert_eq!(persisted.len(), 128);
+        assert!(persisted.ends_with(SPOOL_LIMIT_MARKER));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn cleanup_spool_dir_removes_oldest_when_over_budget() {
-        let dir = std::env::temp_dir().join(format!(
-            "sloosh-spool-test-{}-{}",
-            std::process::id(),
-            make_sentinel()
-        ));
+        let dir = temp_spool_root("cleanup");
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..3u32 {
             let path = dir.join(format!("{i:08}.log"));
-            std::fs::write(&path, vec![0u8; 10]).unwrap();
+            let file = std::fs::File::create(path).unwrap();
+            file.set_len(32 * 1024 * 1024).unwrap();
         }
         let saved = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(saved, 3);
-        // Directly exercising the real 64MiB budget would require huge
-        // files; this confirms the no-op path (well under budget, nothing
-        // pruned) since that's what every real invocation hits in tests.
-        cleanup_spool_dir(&dir);
-        let remaining = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(remaining, 3, "well under the size budget, nothing pruned");
+        cleanup_spool_dir_preserving(&dir, None);
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        let total: u64 = remaining
+            .iter()
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert!(remaining.len() < 3);
+        assert!(total <= MAX_SPOOL_DIR_BYTES);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_spool_budget_removes_oldest_files_across_sessions() {
+        let root = temp_spool_root("global-cleanup");
+        ensure_private_dir(&root).unwrap();
+        for i in 0..3u32 {
+            let dir = root.join(format!("session-{i}"));
+            ensure_private_dir(&dir).unwrap();
+            let file = std::fs::File::create(dir.join("00000001.log")).unwrap();
+            file.set_len(512 * 1024 * 1024).unwrap();
+        }
+
+        cleanup_spool_root(&root).unwrap();
+        let total: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .flat_map(|dir| {
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+            })
+            .map(|file| file.metadata().unwrap().len())
+            .sum();
+        assert!(total <= MAX_SPOOL_ROOT_BYTES);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn more_than_sixteen_empty_spool_writers_can_run_concurrently() {
+        let root = temp_spool_root("many-empty-writers");
+        let mut writers = Vec::new();
+
+        for i in 0..17 {
+            let opened = open_spool_file_under(&root, "host", &format!("session-{i}"), 1);
+            match opened {
+                Ok((_, writer)) => writers.push(writer),
+                Err(error) => {
+                    panic!("empty run {i} must not consume a phantom 64 MiB reservation: {error}")
+                }
+            }
+        }
+
+        assert_eq!(writers.len(), 17);
+        assert_eq!(
+            lock_spool_ledger(&spool_ledger(&root)).scan_count,
+            1,
+            "root tree must be indexed once, not once per run"
+        );
+        drop(writers);
+        assert_eq!(
+            lock_spool_ledger(&spool_ledger(&root)).scan_count,
+            1,
+            "dropping writers must use the ledger, not rescan the root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_active_writer_does_not_evict_retained_history() {
+        let root = temp_spool_root("empty-writer-history");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(970 * 1024 * 1024).unwrap();
+
+        let (_, writer) = open_spool_file_under(&root, "host", "active", 1).unwrap();
+        assert!(
+            history.exists(),
+            "zero-byte active writer must not evict real retained history"
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_spool_ledger_charges_actual_bytes_and_evicts_oldest_inactive() {
+        let root = temp_spool_root("actual-byte-ledger");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(80).unwrap();
+
+        let active_dir = root.join("active");
+        ensure_private_dir(&active_dir).unwrap();
+        let active = active_dir.join("00000001.log");
+        let active_file = std::fs::File::create(&active).unwrap();
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 128)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&active);
+            assert_eq!(accounting.total_bytes, 80);
+        }
+        let mut writer = SpoolWriter::with_accounting(active_file, active.clone(), 256, ledger);
+
+        writer.write_payload(&[b'x'; 80]).unwrap();
+
+        assert!(
+            !history.exists(),
+            "oldest inactive history should make room"
+        );
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 80);
+        assert_eq!(
+            lock_spool_ledger(writer.ledger.as_ref().unwrap()).total_bytes,
+            80
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_spool_ledger_never_evicts_active_files() {
+        let root = temp_spool_root("active-protection");
+        ensure_private_dir(&root).unwrap();
+        let dir = root.join("sessions");
+        ensure_private_dir(&dir).unwrap();
+        let first_path = dir.join("00000001.log");
+        let second_path = dir.join("00000002.log");
+        let first_file = std::fs::File::create(&first_path).unwrap();
+        let second_file = std::fs::File::create(&second_path).unwrap();
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 100)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&first_path);
+            accounting.register_active(&second_path);
+        }
+        let mut first =
+            SpoolWriter::with_accounting(first_file, first_path.clone(), 256, ledger.clone());
+        let mut second =
+            SpoolWriter::with_accounting(second_file, second_path.clone(), 256, ledger.clone());
+
+        first.write_payload(&[b'a'; 80]).unwrap();
+        second.write_payload(&[b'b'; 80]).unwrap();
+
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert_eq!(std::fs::metadata(&first_path).unwrap().len(), 80);
+        assert_eq!(std::fs::metadata(&second_path).unwrap().len(), 20);
+        assert_eq!(lock_spool_ledger(&ledger).total_bytes, 100);
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_delete_failure_does_not_block_new_spool_writer() {
+        let root = temp_spool_root("cleanup-failure");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("read-only-history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file
+            .set_len(MAX_SPOOL_ROOT_BYTES + MAX_SPOOL_FILE_BYTES)
+            .unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let opened = open_spool_file_under(&root, "host", "new-run", 1);
+
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, writer) = opened.expect("retention cleanup failure must not fail a remote run");
+        cleanup_spool_root(&root).unwrap();
+        assert!(
+            !history.exists(),
+            "a later cleanup pass must retry transient deletion failures"
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spool_write_error_detaches_persistence_but_keeps_ring_and_command() {
+        let root = temp_spool_root("write-error-ingest");
+        ensure_private_dir(&root).unwrap();
+        let active = root.join("read-only.log");
+        std::fs::File::create(&active).unwrap();
+        let read_only_file = std::fs::File::open(&active).unwrap();
+
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 64)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+            accounting.register_active(&active);
+        }
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_accounting(
+            read_only_file,
+            active.clone(),
+            128,
+            ledger.clone(),
+        ));
+
+        let payload = "output survives spool failure";
+        ingest(
+            &mut state,
+            format!("{payload}\r\n\r\n{sentinel}0{sentinel}\r\n").as_bytes(),
+        );
+
+        assert!(state.spool_file.is_none(), "failed writer must detach");
+        assert!(!state.busy, "marker handling must survive write failure");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(String::from_utf8_lossy(&ring_contents(&state)).contains(payload));
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
+        assert_eq!(lock_spool_ledger(&ledger).total_bytes, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_failure_stops_persistence_but_not_ring_or_command() {
+        let root = temp_spool_root("cleanup-failure-ingest");
+        ensure_private_dir(&root).unwrap();
+        let history_dir = root.join("read-only-history");
+        ensure_private_dir(&history_dir).unwrap();
+        let history = history_dir.join("00000001.log");
+        let history_file = std::fs::File::create(&history).unwrap();
+        history_file.set_len(128).unwrap();
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let ledger = Arc::new(Mutex::new(SpoolLedger::new(root.clone(), 64)));
+        {
+            let mut accounting = lock_spool_ledger(&ledger);
+            accounting.initialize();
+        }
+        let active_dir = root.join("active");
+        ensure_private_dir(&active_dir).unwrap();
+        let active = active_dir.join("00000001.log");
+        let active_file = std::fs::File::create(&active).unwrap();
+        lock_spool_ledger(&ledger).register_active(&active);
+
+        let sentinel = make_sentinel();
+        let mut state = test_state();
+        state.busy = true;
+        state.current_run = Some(CurrentRun {
+            sentinel: sentinel.clone(),
+            resync: None,
+        });
+        state.spool_file = Some(SpoolWriter::with_accounting(
+            active_file,
+            active.clone(),
+            128,
+            ledger,
+        ));
+
+        ingest(
+            &mut state,
+            format!("{}\r\n\r\n{sentinel}0{sentinel}\r\n", "x".repeat(256)).as_bytes(),
+        );
+
+        assert!(!state.busy, "marker handling must survive cleanup failure");
+        assert_eq!(state.last_result.as_ref().unwrap().exit_code, Some(0));
+        assert!(!ring_contents(&state).is_empty());
+        assert_eq!(std::fs::metadata(&active).unwrap().len(), 0);
+        std::fs::set_permissions(&history_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

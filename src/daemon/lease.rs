@@ -1,5 +1,5 @@
 //! Authorization leases: process-ancestry anchoring, pending-request /
-//! approval flow, `SLOOSH_LEASE` escape hatch, idle timeout (DESIGN.md §4).
+//! approval flow, `SLOOSH_LEASE` escape hatch, idle timeout (docs/internals/architecture.md).
 //!
 //! Two kinds of state, both in-memory only (a daemon restart means every
 //! pending request and active lease is gone — re-approve; this is documented
@@ -9,9 +9,9 @@
 //!   for a human to run `sloosh approve <id>` in another terminal. Expire
 //!   after [`PENDING_EXPIRY`].
 //! - **Active leases**: created by `approve`, binding a set of hosts to an
-//!   "anchor" process (DESIGN.md §4's ancestry-anchoring scheme) so the
+//!   "anchor" process (docs/internals/architecture.md's ancestry-anchoring scheme) so the
 //!   agent process (and anything it spawns) can keep making requests without
-//!   re-approval, until [`IDLE_TIMEOUT`] of no matching calls.
+//!   re-approval, until the configured vault timeout of no matching calls.
 //!
 //! Anchor **selection** (choosing which process in the caller's ancestry
 //! chain to bind the lease to) happens once, at `request` time. Anchor
@@ -22,21 +22,32 @@
 //! (e.g. subagents) inherit the lease automatically.
 
 use crate::daemon::audit;
+use crate::daemon::ssh;
 use crate::daemon::vault::{self, VaultError};
 use crate::procs::{self, AncestorInfo};
 use crate::proto::{LeaseActivatedInfo, LeaseRequestSummary, LeaseSummary};
+#[cfg(not(test))]
+use crate::vault_settings::{VaultSettingsStore, VaultTimeout};
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex as AsyncMutex;
 
-/// A lease with no matching call for this long is dropped (DESIGN.md §4).
-/// TODO: make configurable; a bare constant is fine for milestone 3.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// Default lease idle timeout when no shared vault setting has been saved.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Hard ceiling for an approved lease, even while actively used. A fresh
+/// human approval is required after this point so long-lived forwards and
+/// busy automation cannot keep credentials authorized indefinitely.
+pub const MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// How often the background expiry sweep prunes leases and, when the last
+/// one expires, clears the cached vault key.
+const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A pending (unapproved) request older than this is dropped and must be
-/// re-requested (DESIGN.md §4).
+/// re-requested (`SECURITY.md`).
 const PENDING_EXPIRY: Duration = Duration::from_secs(15 * 60);
 
 /// Length (in characters) of generated request IDs.
@@ -52,7 +63,7 @@ const SHELL_BASENAMES: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh"];
 const SLOOSH_BASENAME: &str = "sloosh";
 
 // ---------------------------------------------------------------------
-// Errors — self-teaching per DESIGN.md §7.
+// Errors — self-teaching per docs/internals/architecture.md.
 // ---------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +121,20 @@ pub enum LeaseError {
     )]
     TooManyFailedAttempts { attempts: u32 },
 
+    #[error(
+        "the host list changed after vault unlock, so this approval was not activated. You \
+         confirmed [{approved}], but the daemon independently resolved [{resolved}]. The \
+         request is still pending; inspect the full list and run `sloosh approve {id}` again"
+    )]
+    ApprovedHostsMismatch {
+        id: String,
+        approved: String,
+        resolved: String,
+    },
+
+    #[error(transparent)]
+    Route(#[from] ssh::SshError),
+
     #[error(transparent)]
     Vault(#[from] VaultError),
 }
@@ -161,10 +186,32 @@ struct PendingRequest {
 struct ActiveLease {
     anchor: Anchor,
     hosts: HashSet<String>,
+    created_at: Instant,
     last_used: Instant,
     /// Escape-hatch token (`SLOOSH_LEASE=...`), shown once in `approve`'s
-    /// confirmation output (DESIGN.md §4).
+    /// confirmation output (docs/internals/architecture.md).
     token: String,
+}
+
+/// Opaque handle to the exact active lease that authorized one host.
+///
+/// Long-lived daemon work stores this instead of the short-lived CLI PID.
+/// The token never leaves this module, and `host` narrows the handle to the
+/// capability resolved when the work was created.
+#[derive(Clone)]
+pub(crate) struct LeaseGrant {
+    token: String,
+    host: String,
+}
+
+#[cfg(test)]
+impl LeaseGrant {
+    pub(crate) fn invalid_for_test(host: &str) -> Self {
+        Self {
+            token: "test-invalid-grant".to_string(),
+            host: host.to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -178,22 +225,25 @@ fn state() -> &'static AsyncMutex<LeaseState> {
     STATE.get_or_init(|| AsyncMutex::new(LeaseState::default()))
 }
 
-/// Drop pending requests older than [`PENDING_EXPIRY`] and active leases
-/// idle longer than [`IDLE_TIMEOUT`]. If the last active lease is dropped
-/// this way, also clears the cached vault key (DESIGN.md §4: "the derived
-/// key is cached... zeroize + drop when the last lease expires") — no
-/// background sweep task is needed since every entry point below prunes
-/// before reading or mutating state, so expiry is always caught lazily on
-/// next use.
+/// Drop stale pending requests plus active leases past either idle or absolute
+/// lifetime limits. If the last active lease is dropped, also clear the cached
+/// vault key (docs/internals/architecture.md: "the derived key is cached... zeroize + drop when
+/// the last lease expires"). API entry points and [`spawn_reaper`] both use
+/// this one expiry decision.
 async fn prune_expired(st: &mut LeaseState) {
-    let now = Instant::now();
+    prune_expired_at(st, Instant::now(), configured_idle_timeout()).await;
+}
+
+async fn prune_expired_at(st: &mut LeaseState, now: Instant, idle_timeout: Duration) {
     st.pending
         .retain(|_, p| now.duration_since(p.created_at) < PENDING_EXPIRY);
 
     let had_active = !st.active.is_empty();
-    let (kept, expired): (Vec<ActiveLease>, Vec<ActiveLease>) = std::mem::take(&mut st.active)
-        .into_iter()
-        .partition(|l| now.duration_since(l.last_used) < IDLE_TIMEOUT);
+    let (kept, expired): (Vec<ActiveLease>, Vec<ActiveLease>) =
+        std::mem::take(&mut st.active).into_iter().partition(|l| {
+            now.duration_since(l.last_used) < idle_timeout
+                && now.duration_since(l.created_at) < MAX_LIFETIME
+        });
     st.active = kept;
     for l in &expired {
         let mut hosts: Vec<String> = l.hosts.iter().cloned().collect();
@@ -208,6 +258,34 @@ async fn prune_expired(st: &mut LeaseState) {
     if had_active && st.active.is_empty() {
         vault::clear_cache().await;
     }
+}
+
+/// Test-only seam used by the live SFTP suite to cross the real absolute
+/// expiry boundary without sleeping for eight hours. This is not compiled by
+/// default and is never reachable through the daemon wire protocol.
+#[cfg(feature = "integration-test-hooks")]
+#[doc(hidden)]
+pub async fn expire_active_leases_for_integration_test() {
+    let mut st = state().lock().await;
+    let future = Instant::now()
+        .checked_add(MAX_LIFETIME)
+        .expect("an eight-hour monotonic deadline must fit");
+    prune_expired_at(&mut st, future, configured_idle_timeout()).await;
+}
+
+/// Start an expiry sweep. Unlike lazy pruning at API entry
+/// points, this guarantees the cached vault key is cleared after expiry even
+/// when the daemon receives no further requests.
+pub fn spawn_reaper() {
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(EXPIRY_SWEEP_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let mut st = state().lock().await;
+            prune_expired(&mut st).await;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -287,7 +365,7 @@ fn generate_lease_token() -> String {
 #[derive(Debug)]
 pub enum RequestOutcome {
     /// An already-active lease (bound to an anchor in the caller's current
-    /// ancestry) already covers every requested host — DESIGN.md §4's
+    /// ancestry) already covers every requested host — docs/internals/architecture.md's
     /// idempotency guarantee. No human action needed.
     AlreadyAuthorized,
     /// A new pending request was created; a human needs to `approve` it.
@@ -400,11 +478,15 @@ pub async fn approve_lease(
     approver_pid: u32,
     id: &str,
     master_password: &[u8],
+    approved_hosts: &[String],
 ) -> Result<LeaseActivatedInfo, LeaseError> {
-    approve_lease_for_chain(
+    approve_lease_for_chain_checked(
         &procs::ancestry_chain::<procs::ProcessTree>(approver_pid),
         id,
         master_password,
+        Some(approved_hosts),
+        true,
+        true,
     )
     .await
 }
@@ -422,6 +504,93 @@ pub async fn approve_lease_for_chain(
     id: &str,
     master_password: &[u8],
 ) -> Result<LeaseActivatedInfo, LeaseError> {
+    approve_lease_for_chain_checked(approver_chain, id, master_password, None, true, true).await
+}
+
+/// Unlock and resolve exact host scope before native UI asks for final
+/// confirmation. No lease is activated here.
+pub async fn preview_native_approval(
+    id: &str,
+    master_password: &[u8],
+) -> Result<Vec<String>, LeaseError> {
+    let hosts = {
+        let mut st = state().lock().await;
+        prune_expired(&mut st).await;
+        st.pending
+            .get(id)
+            .map(|pending| pending.hosts.clone())
+            .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
+    };
+    if !vault::exists() {
+        return Err(LeaseError::VaultRequired);
+    }
+    match vault::unlock_for_lease(master_password).await {
+        Ok(()) => {
+            let mut st = state().lock().await;
+            prune_expired(&mut st).await;
+            st.pending
+                .get_mut(id)
+                .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
+                .failed_attempts = 0;
+        }
+        Err(VaultError::WrongPassword) => {
+            let mut st = state().lock().await;
+            prune_expired(&mut st).await;
+            let pending = st
+                .pending
+                .get_mut(id)
+                .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?;
+            pending.failed_attempts += 1;
+            if pending.failed_attempts >= MAX_APPROVE_ATTEMPTS {
+                st.pending.remove(id);
+                return Err(LeaseError::TooManyFailedAttempts {
+                    attempts: MAX_APPROVE_ATTEMPTS,
+                });
+            }
+            return Err(LeaseError::WrongPassword {
+                remaining: MAX_APPROVE_ATTEMPTS - pending.failed_attempts,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(ssh::expand_lease_hosts(&hosts).await?)
+}
+
+/// Activate after bundled native UI confirms daemon-resolved host scope.
+/// Helper is daemon-spawned, so CLI process-ancestry self-approval check does
+/// not apply; exact scope comparison and every other lease invariant remain.
+pub async fn approve_lease_native(
+    id: &str,
+    master_password: &[u8],
+    approved_hosts: &[String],
+) -> Result<LeaseActivatedInfo, LeaseError> {
+    approve_lease_for_chain_checked(&[], id, master_password, Some(approved_hosts), false, false)
+        .await
+}
+
+/// Drop cache populated only for an unsuccessful native preview. Preserve it
+/// when another active lease still owns cache lifetime.
+pub async fn discard_native_preview() {
+    let should_clear = state().lock().await.active.is_empty();
+    if should_clear {
+        vault::clear_cache().await;
+    }
+}
+
+/// Approval state machine shared by production and the synthetic-ancestry
+/// integration-test seam. Production always supplies `approved_hosts`; the
+/// compatibility seam passes `None` so existing live tests can approve the
+/// daemon-computed list without emulating an interactive human CLI. Native
+/// approval owns its one outer preview cleanup boundary, while terminal
+/// approval asks this function to clean its daemon-side cache on failure.
+async fn approve_lease_for_chain_checked(
+    approver_chain: &[AncestorInfo],
+    id: &str,
+    master_password: &[u8],
+    approved_hosts: Option<&[String]>,
+    enforce_self_approval: bool,
+    cleanup_failed_preview: bool,
+) -> Result<LeaseActivatedInfo, LeaseError> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
     let pending = st
@@ -433,7 +602,7 @@ pub async fn approve_lease_for_chain(
     // `approve` is a descendant of (or is) the very process this request is
     // anchored to, the "out-of-band human" property is violated — a
     // prompt-injected agent driving `approve` itself would land here.
-    if chain_contains_anchor(&pending.anchor, approver_chain) {
+    if enforce_self_approval && chain_contains_anchor(&pending.anchor, approver_chain) {
         return Err(LeaseError::SelfApproval {
             id: id.to_string(),
             anchor_pid: pending.anchor.pid,
@@ -445,7 +614,12 @@ pub async fn approve_lease_for_chain(
     }
 
     match vault::unlock_for_lease(master_password).await {
-        Ok(()) => {}
+        Ok(()) => {
+            // A verified password breaks any preceding run of typos even if
+            // the approval later fails closed because its host preview is
+            // stale and the human must retry the same pending request.
+            pending.failed_attempts = 0;
+        }
         Err(VaultError::WrongPassword) => {
             pending.failed_attempts += 1;
             if pending.failed_attempts >= MAX_APPROVE_ATTEMPTS {
@@ -460,22 +634,54 @@ pub async fn approve_lease_for_chain(
         Err(e) => return Err(e.into()),
     }
 
+    // The request may have been created while the vault was locked, so its
+    // vault-backed ProxyJump hops were invisible then. Recompute now, from
+    // the daemon's freshly unlocked cache, and compare against the exact
+    // list the human confirmed in the separate CLI process. Any config or
+    // vault change between preview and activation fails closed and leaves
+    // the pending request intact.
+    let resolved_hosts = match ssh::expand_lease_hosts(&pending.hosts).await {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            if cleanup_failed_preview && st.active.is_empty() {
+                vault::clear_cache().await;
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(approved_hosts) = approved_hosts {
+        if approved_hosts != resolved_hosts {
+            let approved = format_host_list(approved_hosts);
+            let resolved = format_host_list(&resolved_hosts);
+            let clear_cache = cleanup_failed_preview && st.active.is_empty();
+            if clear_cache {
+                vault::clear_cache().await;
+            }
+            return Err(LeaseError::ApprovedHostsMismatch {
+                id: id.to_string(),
+                approved,
+                resolved,
+            });
+        }
+    }
+
     let pending = st
         .pending
         .remove(id)
         .expect("still present: the state lock is held continuously since get_mut");
 
     let token = generate_lease_token();
-    let hosts_set: HashSet<String> = pending.hosts.iter().cloned().collect();
+    let hosts_set: HashSet<String> = resolved_hosts.iter().cloned().collect();
     st.active.push(ActiveLease {
         anchor: pending.anchor.clone(),
         hosts: hosts_set,
+        created_at: Instant::now(),
         last_used: Instant::now(),
         token: token.clone(),
     });
 
     Ok(LeaseActivatedInfo {
-        hosts: pending.hosts,
+        hosts: resolved_hosts,
         anchor_name: pending.anchor.name,
         anchor_pid: pending.anchor.pid,
         token,
@@ -483,9 +689,17 @@ pub async fn approve_lease_for_chain(
     })
 }
 
+fn format_host_list(hosts: &[String]) -> String {
+    hosts
+        .iter()
+        .map(|host| format!("{host:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Is `host` authorized for the caller at `caller_pid`, either via the
 /// `SLOOSH_LEASE` escape-hatch token or via ancestry-chain anchor matching?
-/// Touches `last_used` on the matching lease if so (DESIGN.md §4 idle-timeout
+/// Touches `last_used` on the matching lease if so (docs/internals/architecture.md idle-timeout
 /// clock).
 pub async fn check_authorized(caller_pid: u32, host: &str, lease_token: Option<&str>) -> bool {
     // The token check never needs the ancestry walk, but doing the walk
@@ -498,6 +712,34 @@ pub async fn check_authorized(caller_pid: u32, host: &str, lease_token: Option<&
         true,
     )
     .await
+}
+
+/// Resolve the caller's current authorization to the exact active lease that
+/// granted `host`. Long-lived daemon work must retain this grant rather than
+/// retaining `caller_pid`, because the CLI process normally exits as soon as
+/// the work is created.
+pub(crate) async fn resolve_grant(
+    caller_pid: u32,
+    host: &str,
+    lease_token: Option<&str>,
+) -> Option<LeaseGrant> {
+    resolve_grant_for_chain(
+        &procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
+        host,
+        lease_token,
+        true,
+    )
+    .await
+}
+
+/// Revalidate and refresh a previously resolved grant after real use.
+pub(crate) async fn check_grant(grant: &LeaseGrant) -> bool {
+    grant_is_active(grant, true).await
+}
+
+/// Revalidate a previously resolved grant without refreshing its idle clock.
+pub(crate) async fn peek_grant(grant: &LeaseGrant) -> bool {
+    grant_is_active(grant, false).await
 }
 
 /// [`check_authorized`] minus the `last_used` side effect: answers "is this
@@ -524,19 +766,34 @@ async fn authorized_for_chain(
     lease_token: Option<&str>,
     touch: bool,
 ) -> bool {
+    resolve_grant_for_chain(chain, host, lease_token, touch)
+        .await
+        .is_some()
+}
+
+async fn resolve_grant_for_chain(
+    chain: &[AncestorInfo],
+    host: &str,
+    lease_token: Option<&str>,
+    touch: bool,
+) -> Option<LeaseGrant> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
 
-    if let Some(token) = lease_token
-        && let Some(l) = st
+    if let Some(token) = lease_token {
+        if let Some(l) = st
             .active
             .iter_mut()
             .find(|l| l.token == token && l.hosts.contains(host))
-    {
-        if touch {
-            l.last_used = Instant::now();
+        {
+            if touch {
+                l.last_used = Instant::now();
+            }
+            return Some(LeaseGrant {
+                token: l.token.clone(),
+                host: host.to_string(),
+            });
         }
-        return true;
     }
 
     if let Some(l) = st
@@ -547,9 +804,29 @@ async fn authorized_for_chain(
         if touch {
             l.last_used = Instant::now();
         }
-        return true;
+        return Some(LeaseGrant {
+            token: l.token.clone(),
+            host: host.to_string(),
+        });
     }
-    false
+    None
+}
+
+async fn grant_is_active(grant: &LeaseGrant, touch: bool) -> bool {
+    let mut st = state().lock().await;
+    prune_expired(&mut st).await;
+
+    let Some(l) = st
+        .active
+        .iter_mut()
+        .find(|l| l.token == grant.token && l.hosts.contains(&grant.host))
+    else {
+        return false;
+    };
+    if touch {
+        l.last_used = Instant::now();
+    }
+    true
 }
 
 /// Summaries of all active leases, for `status`.
@@ -557,23 +834,41 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
     let now = Instant::now();
+    let idle_timeout = configured_idle_timeout();
     let mut out: Vec<LeaseSummary> = st
         .active
         .iter()
         .map(|l| {
             let idle = now.duration_since(l.last_used);
+            let age = now.duration_since(l.created_at);
             let mut hosts: Vec<String> = l.hosts.iter().cloned().collect();
             hosts.sort();
             LeaseSummary {
                 hosts,
                 anchor_name: l.anchor.name.clone(),
                 anchor_pid: l.anchor.pid,
-                idle_remaining_secs: IDLE_TIMEOUT.saturating_sub(idle).as_secs(),
+                idle_remaining_secs: idle_timeout
+                    .saturating_sub(idle)
+                    .min(MAX_LIFETIME.saturating_sub(age))
+                    .as_secs(),
             }
         })
         .collect();
     out.sort_by_key(|a| a.anchor_pid);
     out
+}
+
+#[cfg(not(test))]
+fn configured_idle_timeout() -> Duration {
+    VaultSettingsStore::current_user()
+        .load()
+        .unwrap_or_else(|_| VaultTimeout::minimum())
+        .duration()
+}
+
+#[cfg(test)]
+fn configured_idle_timeout() -> Duration {
+    DEFAULT_IDLE_TIMEOUT
 }
 
 #[cfg(test)]
@@ -701,6 +996,58 @@ mod tests {
     /// `sloosh vault init` would.
     fn create_test_vault(password: &[u8]) {
         vault::create(&vault::VaultData::default(), password).expect("create test vault");
+    }
+
+    fn test_vault_entry(jump: &str) -> vault::HostEntry {
+        vault::HostEntry {
+            hostname: "web.example.test".to_string(),
+            port: Some(22),
+            user: Some("deploy".to_string()),
+            auth: vault::AuthMethod::Password {
+                password: "ssh-secret".to_string(),
+            },
+            route: crate::proto::HostRoute::ProxyJump {
+                spec: jump.to_string(),
+            },
+        }
+    }
+
+    fn create_test_vault_with_jump(password: &[u8], jump: &str) {
+        let mut data = vault::VaultData::default();
+        data.hosts.insert("web".to_string(), test_vault_entry(jump));
+        vault::create(&data, password).expect("create test vault with jump host");
+    }
+
+    fn create_test_vault_with_jump_cycle(password: &[u8]) {
+        let mut data = vault::VaultData::default();
+        data.hosts
+            .insert("web".to_string(), test_vault_entry("bastion"));
+        data.hosts
+            .insert("bastion".to_string(), test_vault_entry("web"));
+        vault::create(&data, password).expect("create test vault with jump cycle");
+    }
+
+    fn create_test_vault_with_deep_jump_chain(password: &[u8]) {
+        const OVER_DEPTH_HOPS: usize = 9;
+
+        let mut data = vault::VaultData::default();
+        data.hosts.insert(
+            "web".to_string(),
+            test_vault_entry("sloosh-test-depth-hop-0"),
+        );
+        for index in 0..OVER_DEPTH_HOPS {
+            let alias = format!("sloosh-test-depth-hop-{index}");
+            let mut entry = if index + 1 < OVER_DEPTH_HOPS {
+                test_vault_entry(&format!("sloosh-test-depth-hop-{}", index + 1))
+            } else {
+                test_vault_entry("")
+            };
+            if index + 1 == OVER_DEPTH_HOPS {
+                entry.route = crate::proto::HostRoute::Direct;
+            }
+            data.hosts.insert(alias, entry);
+        }
+        vault::create(&data, password).expect("create test vault with deep jump chain");
     }
 
     /// Each `#[tokio::test]` gets its own OS thread by default, but they all
@@ -834,6 +1181,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_grant_survives_short_lived_caller_exit() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let caller_chain = vec![
+            ancestor(350, 310, Some("sloosh")),
+            ancestor(349, 300, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(caller_chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"pw");
+        approve_lease_for_chain(&approver_chain(), &info.id, b"pw")
+            .await
+            .unwrap();
+
+        let grant = resolve_grant_for_chain(&caller_chain, "web", None, true)
+            .await
+            .expect("caller should resolve its active lease to a stable grant");
+
+        // No caller ancestry is consulted here. This models the normal
+        // forward lifecycle after the one-shot CLI process has exited.
+        assert!(peek_grant(&grant).await);
+        assert!(check_grant(&grant).await);
+
+        let wrong_host = LeaseGrant {
+            token: grant.token.clone(),
+            host: "db".to_string(),
+        };
+        assert!(!peek_grant(&wrong_host).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
     async fn describe_pending_reports_not_found_after_expiry_or_bad_id() {
         let _guard = test_lock().lock().await;
         reset_state().await;
@@ -941,13 +1327,13 @@ mod tests {
             .unwrap();
         assert!(vault::is_cached().await);
 
-        // Simulate idle expiry directly (waiting out the real 2h timeout is
+        // Simulate idle expiry directly (waiting out the configured timeout is
         // obviously not something a unit test can do): backdate the lease's
         // `last_used`.
         {
             let mut st = state().lock().await;
             for l in st.active.iter_mut() {
-                l.last_used = Instant::now() - IDLE_TIMEOUT - Duration::from_secs(1);
+                l.last_used = Instant::now() - DEFAULT_IDLE_TIMEOUT - Duration::from_secs(1);
             }
         }
         assert!(!check_authorized_for_chain(&chain, "web", None).await);
@@ -958,6 +1344,39 @@ mod tests {
 
         reset_state().await;
         vault::clear_cache().await;
+    }
+
+    #[tokio::test]
+    async fn active_lease_expires_at_absolute_lifetime_cap() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(550, 110, Some("sloosh")),
+            ancestor(549, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"pw");
+        approve_lease_for_chain(&approver_chain(), &info.id, b"pw")
+            .await
+            .unwrap();
+
+        {
+            let mut st = state().lock().await;
+            st.active[0].created_at = Instant::now() - MAX_LIFETIME - Duration::from_secs(1);
+            st.active[0].last_used = Instant::now();
+        }
+
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
+
+        reset_state().await;
     }
 
     #[tokio::test]
@@ -1020,6 +1439,235 @@ mod tests {
             .await
             .unwrap();
 
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn approval_requires_exact_vault_expanded_host_list() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(750, 110, Some("sloosh")),
+            ancestor(749, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_jump(b"pw", "sloosh-test-bastion-before");
+
+        // This is the list a pre-fix CLI showed while the vault was locked.
+        // The daemon unlocks independently, discovers `bastion`, and must
+        // leave the request pending rather than silently widening approval.
+        let stale_approval = vec!["web".to_string()];
+        let err = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&stale_approval),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, LeaseError::ApprovedHostsMismatch { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("sloosh-test-bastion-before"),
+            "{err}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
+
+        // Model the separate CLI's correct local preview, then change the
+        // vault before the daemon sees ApproveLease. Exact comparison must
+        // catch this TOCTOU and keep the request pending again.
+        vault::unlock_for_lease(b"pw").await.unwrap();
+        let preview = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
+        vault::clear_cache().await;
+        assert!(preview.iter().any(|h| h == "sloosh-test-bastion-before"));
+        vault::add_entry(
+            "web",
+            test_vault_entry("sloosh-test-bastion-after"),
+            b"pw",
+            true,
+        )
+        .await
+        .unwrap();
+
+        let err = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&preview),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, LeaseError::ApprovedHostsMismatch { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("sloosh-test-bastion-after"),
+            "{err}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!vault::is_cached().await);
+
+        vault::unlock_for_lease(b"pw").await.unwrap();
+        let exact_approval = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
+        vault::clear_cache().await;
+        assert!(
+            exact_approval
+                .iter()
+                .any(|h| h == "sloosh-test-bastion-after")
+        );
+        let activated = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&exact_approval),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(activated.hosts, exact_approval);
+        assert!(check_authorized_for_chain(&chain, "web", None).await);
+        assert!(check_authorized_for_chain(&chain, "sloosh-test-bastion-after", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_invalid_vault_route_without_consuming_request() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(775, 110, Some("sloosh")),
+            ancestor(774, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_jump_cycle(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                LeaseError::Route(ssh::SshError::ProxyJumpCycle { ref alias }) if alias == "web"
+            ),
+            "{error}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_over_depth_route_without_consuming_request() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(780, 110, Some("sloosh")),
+            ancestor(779, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_deep_jump_chain(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &approver_chain(),
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            true,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                LeaseError::Route(ssh::SshError::ProxyJumpTooDeep { limit: 8 })
+            ),
+            "{error}"
+        );
+        assert!(describe_pending(&info.id).await.is_ok());
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!vault::is_cached().await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_approval_defers_failed_preview_cleanup_to_its_outer_owner() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let RequestOutcome::Pending(info) = request_lease_for_chain(
+            vec![
+                ancestor(785, 110, Some("sloosh")),
+                ancestor(784, 100, Some("claude")),
+            ],
+            vec!["web".to_string()],
+        )
+        .await
+        .unwrap() else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_jump_cycle(b"pw");
+
+        let error = approve_lease_for_chain_checked(
+            &[],
+            &info.id,
+            b"pw",
+            Some(&["web".to_string()]),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, LeaseError::Route(_)), "{error}");
+        assert!(vault::is_cached().await);
+        assert!(describe_pending(&info.id).await.is_ok());
+
+        discard_native_preview().await;
+        assert!(!vault::is_cached().await);
         reset_state().await;
     }
 
@@ -1124,6 +1772,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LeaseError::NoSuchRequest(_)), "{err}");
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_preview_then_activation_preserves_scope_and_authority() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(950, 110, Some("sloosh")),
+            ancestor(949, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"correct");
+
+        let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+        assert_eq!(preview, vec!["web".to_string()]);
+        let activated = approve_lease_native(&info.id, b"correct", &preview)
+            .await
+            .unwrap();
+        assert_eq!(activated.hosts, preview);
+        assert!(check_authorized_for_chain(&chain, "web", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_preview_wrong_password_counts_toward_attempt_limit() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(960, 110, Some("sloosh")),
+            ancestor(959, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) = request_lease_for_chain(chain, vec!["web".to_string()])
+            .await
+            .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"correct");
+
+        let err = preview_native_approval(&info.id, b"stale-keychain-password")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LeaseError::WrongPassword { remaining }
+                    if remaining == MAX_APPROVE_ATTEMPTS - 1
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            state()
+                .lock()
+                .await
+                .pending
+                .get(&info.id)
+                .expect("request remains pending")
+                .failed_attempts,
+            1
+        );
 
         reset_state().await;
     }

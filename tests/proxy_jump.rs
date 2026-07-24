@@ -1,5 +1,5 @@
-//! Live-SSH integration test for vault-backed ProxyJump chains (DESIGN.md
-//! §4): a vault entry whose `jump` field routes the connection through
+//! Live-SSH integration test for vault-backed ProxyJump chains: a vault
+//! entry whose typed route sends the connection through
 //! another vault entry, with per-hop lease enforcement. Gated behind BOTH
 //! `SLOOSH_TEST_SSH_HOST` (a `user@host` literal or bare host) and
 //! `SLOOSH_TEST_SSH_PASSWORD` (that host's SSH password) — see
@@ -9,7 +9,7 @@
 //! Needs only ONE live host to exercise a real two-hop dial: both entries
 //! point at the same address, so the "chain" is host → direct-tcpip back to
 //! the host's own sshd (hairpin). That still drives the full machinery for
-//! real: vault jump resolution, `channel_open_direct_tcpip` through the
+//! real: vault route resolution, `channel_open_direct_tcpip` through the
 //! hop, a second handshake + password auth over the tunneled stream, host
 //! key verification for the tunneled target, and the per-hop lease check.
 //! (The target deliberately reuses the host's public address rather than
@@ -22,7 +22,7 @@
 //! versa) and assert nothing.
 
 use sloosh::daemon::{lease, vault};
-use sloosh::proto::{Request, Response};
+use sloosh::proto::{Request, Response, WIRE_PROTOCOL_VERSION};
 use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
@@ -56,7 +56,7 @@ fn set_test_home(tag: &str) {
 }
 
 /// Vault with two password entries pointing at the same live host:
-/// `livehop` directly, `livetarget` through `jump = livehop`.
+/// `livehop` directly, `livetarget` through a ProxyJump route to `livehop`.
 fn create_chain_vault(host: &str, user: &Option<String>, password: &str) {
     let entry = |jump: Option<String>| vault::HostEntry {
         hostname: host.to_string(),
@@ -65,7 +65,9 @@ fn create_chain_vault(host: &str, user: &Option<String>, password: &str) {
         auth: vault::AuthMethod::Password {
             password: password.to_string(),
         },
-        jump,
+        route: jump.map_or(sloosh::proto::HostRoute::Direct, |spec| {
+            sloosh::proto::HostRoute::ProxyJump { spec }
+        }),
     };
     let mut data = vault::VaultData::default();
     data.hosts.insert(HOP.to_string(), entry(None));
@@ -90,15 +92,35 @@ async fn grant_lease(hosts: &[&str]) {
 }
 
 async fn start_daemon(tag: &str) -> UnixChannel {
-    let socket_path =
-        std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}.sock", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("secure socket dir");
+    }
+    let socket_path = dir.join("sloosh.sock");
     let daemon_socket = socket_path.clone();
     tokio::spawn(async move {
         let _ = sloosh::daemon::run(daemon_socket).await;
     });
     let mut delay = std::time::Duration::from_millis(10);
     for _ in 0..50 {
-        if let Ok(chan) = UnixChannel::connect(&socket_path).await {
+        if let Ok(mut chan) = UnixChannel::connect(&socket_path).await {
+            chan.send(&Request::Hello {
+                wire_protocol: WIRE_PROTOCOL_VERSION,
+            })
+            .await
+            .expect("send protocol hello");
+            assert_eq!(
+                chan.recv::<Response>()
+                    .await
+                    .expect("receive protocol ready"),
+                Some(Response::ProtocolReady {
+                    wire_protocol: WIRE_PROTOCOL_VERSION,
+                })
+            );
             return chan;
         }
         tokio::time::sleep(delay).await;

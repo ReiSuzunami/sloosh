@@ -1,4 +1,4 @@
-//! Append-only audit log writer, `~/.sloosh/audit.jsonl` (DESIGN.md §4).
+//! Append-only audit log writer, `~/.sloosh/audit.jsonl` (docs/internals/architecture.md).
 //!
 //! One NDJSON line per event: `{"ts":"<RFC3339 UTC>","event":"<tag>", ...}`.
 //! The daemon is the only writer (created 0600, same-user, same posture as
@@ -12,7 +12,7 @@
 //! exit codes, byte counts, path names) — never a password, master
 //! password, vault content, or a command's *output*.
 //!
-//! **Best-effort, by design (DESIGN.md §4):** a write failure (disk full,
+//! **Best-effort, by design (docs/internals/architecture.md):** a write failure (disk full,
 //! permissions, `~/.sloosh` missing and uncreatable) is reported via
 //! `tracing::warn` and otherwise swallowed — it never fails, blocks, or even
 //! slows down the operation being logged. This project's same-user threat
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
-use crate::transport::unix::sloosh_home;
+use crate::transport::unix::{self, sloosh_home};
 
 /// `~/.sloosh/audit.jsonl` (or `$SLOOSH_HOME/audit.jsonl` under test).
 pub fn audit_log_path() -> PathBuf {
@@ -46,7 +46,7 @@ pub fn record(event: &str, fields: Value) {
         warn!(
             error = %e, event,
             "failed to write audit log entry; continuing without it (availability of sloosh \
-             itself over completeness of the audit trail — DESIGN.md §4)"
+             itself over completeness of the audit trail — docs/internals/architecture.md)"
         );
     }
 }
@@ -84,16 +84,26 @@ fn build_line(event: &str, fields: Value) -> Option<String> {
 
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if parent == sloosh_home() {
+            unix::ensure_private_dir(parent).map_err(std::io::Error::other)?;
+        } else {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        unix::clear_extended_acl(&file)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     writeln!(file, "{line}")
 }
 
@@ -246,6 +256,33 @@ mod tests {
         let meta = std::fs::metadata(&path).expect("stat");
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_line_repairs_mode_and_refuses_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let path = temp_log_path("repair-mode");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_line(&path, "{}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let target = temp_log_path("symlink-target");
+        let link = temp_log_path("symlink-link");
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&link);
+        std::fs::write(&target, b"unchanged\n").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(append_line(&link, "must-not-land").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged\n");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
     }
 
     #[test]

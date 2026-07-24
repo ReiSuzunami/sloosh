@@ -1,15 +1,15 @@
-//! Daemon: accept loop and request routing (DESIGN.md §1, §8).
+//! Daemon: accept loop and request routing (docs/internals/architecture.md).
 //!
 //! The daemon is a plain subcommand of the same binary (`sloosh daemon
-//! run`), not a separate crate — see DESIGN.md §1 "single binary". It owns
+//! run`), not a separate crate — see docs/internals/architecture.md "single binary". It owns
 //! the Unix domain socket and answers the phase-1/phase-2 command surface:
 //! `Status`/`Shutdown`, SSH session management (`Run`/`Peek`/`Send`/
 //! `Interrupt`/`Open`/`Ls`/`Kill`), port forwarding (`Forward`/`ForwardLs`/
 //! `ForwardStop`), and the vault/lease authorization flow
 //! (`RequestLease`/`DescribeLeaseRequest`/`ApproveLease`/`VaultExists`/
-//! `InitVault`/`AddCred`/`RmCred`).
+//! `InitVault`/`AddCred`/`ListHosts`/`UpdateHost`/`RmCred`).
 //!
-//! **Trust posture (DESIGN.md §4):** the Unix socket is still mode 0600
+//! **Trust posture (docs/internals/architecture.md):** the Unix socket is still mode 0600
 //! same-user-only (see `transport::unix`) — that's the outer perimeter. On
 //! top of it, every host-touching request (`Run`/`Peek`/`Send`/`Interrupt`/
 //! `Open`/`Kill`/`Forward`) additionally requires an active lease for that
@@ -22,7 +22,7 @@
 //! moment its lease expires or is revoked, even though a shell session
 //! survives that (`daemon::forward`'s module doc explains why).
 //!
-//! CLI-side TTY guards (`approve`/`add`/`rm`/`vault init`) only protect
+//! CLI-side TTY guards (`approve`/`host *`/legacy `add`/`rm`/`vault init`) only protect
 //! those entry points: any same-user process can write raw NDJSON straight
 //! to the socket, so every human-in-the-loop property must also hold
 //! daemon-side. Concretely: `ApproveLease` never creates the vault (a
@@ -42,18 +42,19 @@ pub mod session;
 pub mod ssh;
 pub mod vault;
 
+use crate::native_approval;
 use crate::proto::{self, Request, Response};
-use crate::transport::BindOutcome;
-use crate::transport::Channel;
 use crate::transport::unix;
+use crate::transport::{BindOutcome, Channel, MAX_RAW_FRAME_BYTES};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 /// Self-teaching error for a host-touching request with no matching lease
-/// (DESIGN.md §4, §7).
+/// (docs/internals/architecture.md).
 fn no_lease_message(host: &str) -> String {
     format!(
         "no active lease for '{host}' — run `sloosh request {host}` and show your user the \
@@ -92,12 +93,13 @@ async fn require_lease(
 /// Run the daemon accept loop until SIGTERM or a `Shutdown` request.
 ///
 /// Binds `socket_path`; if another daemon already owns it (lost the
-/// concurrent-auto-spawn race, DESIGN.md §1), exits quietly and lets the
+/// concurrent-auto-spawn race, docs/internals/architecture.md), exits quietly and lets the
 /// winner serve — callers retry `connect`, they don't need this process to
 /// succeed.
 pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     let start = Instant::now();
     let pid = std::process::id();
+    unix::ensure_private_dir(&unix::sloosh_home())?;
 
     let listener = match unix::bind(&socket_path)? {
         BindOutcome::Bound(listener) => listener,
@@ -115,6 +117,7 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     // sessions (a no-op in a real daemon process; see `reset_registry`).
     session::reset_registry().await;
     session::spawn_idle_reaper();
+    lease::spawn_reaper();
     forward::reset_registry().await;
     forward::spawn_reaper();
 
@@ -160,6 +163,7 @@ async fn handle_connection(
     shutdown_tx: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let peer = chan.peer_pid().unwrap_or(None);
+    let mut negotiated = false;
     debug!(?peer, "connection accepted");
 
     loop {
@@ -168,18 +172,38 @@ async fn handle_connection(
             debug!(?peer, "connection closed by peer");
             break;
         };
-        debug!(?req, ?peer, "request received");
+        debug!(request_type = req.kind(), ?peer, "request received");
 
         match req {
             Request::Status => {
                 let reply = proto::StatusReply {
                     pid,
                     version: env!("CARGO_PKG_VERSION").to_string(),
+                    wire_protocol: proto::WIRE_PROTOCOL_VERSION,
                     uptime_secs: start.elapsed().as_secs(),
                     sessions: session::list_summaries().await,
                     leases: lease::list_summaries().await,
                 };
                 chan.send(&Response::Status(reply)).await?;
+            }
+            Request::Hello { wire_protocol } => {
+                if wire_protocol == proto::WIRE_PROTOCOL_VERSION {
+                    negotiated = true;
+                    chan.send(&Response::ProtocolReady {
+                        wire_protocol: proto::WIRE_PROTOCOL_VERSION,
+                    })
+                    .await?;
+                } else {
+                    negotiated = false;
+                    chan.send(&Response::Error {
+                        message: format!(
+                            "incompatible wire protocol {wire_protocol}; this daemon requires {}. \
+                             Run `sloosh daemon stop`, then retry with a matching CLI/daemon binary",
+                            proto::WIRE_PROTOCOL_VERSION
+                        ),
+                    })
+                    .await?;
+                }
             }
             Request::Shutdown => {
                 chan.send(&Response::Ok).await?;
@@ -187,6 +211,17 @@ async fn handle_connection(
                 // accept loop is already gone.
                 let _ = shutdown_tx.send(true);
                 break;
+            }
+            ref request if !negotiated => {
+                chan.send(&Response::Error {
+                    message: format!(
+                        "wire protocol handshake required before {}; use a matching sloosh CLI \
+                         that sends Hello protocol {}",
+                        request.kind(),
+                        proto::WIRE_PROTOCOL_VERSION
+                    ),
+                })
+                .await?;
             }
             Request::Run {
                 host,
@@ -272,7 +307,7 @@ async fn handle_connection(
                     Ok(()) => match session::send(&host, &keys, session, newline).await {
                         Ok(()) => {
                             // Never log `keys`: it can carry a password/answer
-                            // typed into an interactive prompt (DESIGN.md §4).
+                            // typed into an interactive prompt (docs/internals/architecture.md).
                             audit::record(
                                 "send",
                                 serde_json::json!({"host": host, "session": session_hint}),
@@ -365,22 +400,51 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
-                let resp = match require_lease(peer, &host, &lease_token).await {
-                    Err(denied) => denied,
-                    Ok(()) => {
-                        let lease_ctx = ssh::LeaseContext {
-                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
-                            lease_token: lease_token.clone(),
-                        };
-                        match session::put(&host, session, &local_path, &remote_path, lease_ctx)
-                            .await
-                        {
-                            Ok(reply) => Response::Transfer(reply),
-                            Err(e) => Response::Error {
+                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
+                    chan.send(&denied).await?;
+                    continue;
+                }
+                let caller_pid = peer.expect("require_lease Ok implies peer is Some");
+                let lease_ctx = ssh::LeaseContext {
+                    caller_pid,
+                    lease_token: lease_token.clone(),
+                };
+                let mut upload =
+                    match session::begin_put(&host, session, &local_path, &remote_path, lease_ctx)
+                        .await
+                    {
+                        Ok(upload) => upload,
+                        Err(e) => {
+                            chan.send(&Response::Error {
                                 message: e.to_string(),
-                            },
+                            })
+                            .await?;
+                            continue;
                         }
+                    };
+                chan.send(&Response::TransferReady).await?;
+
+                // A transfer is one finite operation authorized at start,
+                // like `run`: lease expiry blocks new operations but does not
+                // impose a time-derived size cap on an in-flight NAS copy.
+                let mut stream_error = None;
+                while let Some(chunk) = chan.recv_raw_frame().await? {
+                    let chunk = Zeroizing::new(chunk);
+                    if stream_error.is_some() {
+                        continue;
                     }
+                    if let Err(e) = upload.write_chunk(&chunk).await {
+                        stream_error = Some(e.to_string());
+                    }
+                }
+                let resp = match stream_error {
+                    Some(message) => Response::Error { message },
+                    None => match upload.finish().await {
+                        Ok(reply) => Response::Transfer(reply),
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    },
                 };
                 chan.send(&resp).await?;
             }
@@ -389,32 +453,46 @@ async fn handle_connection(
                 remote_path,
                 local_path,
                 session,
-                force,
                 lease_token,
             } => {
-                let resp = match require_lease(peer, &host, &lease_token).await {
-                    Err(denied) => denied,
-                    Ok(()) => {
-                        let lease_ctx = ssh::LeaseContext {
-                            caller_pid: peer.expect("require_lease Ok implies peer is Some"),
-                            lease_token: lease_token.clone(),
-                        };
-                        match session::get(
-                            &host,
-                            session,
-                            &remote_path,
-                            &local_path,
-                            force,
-                            lease_ctx,
-                        )
+                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
+                    chan.send(&denied).await?;
+                    continue;
+                }
+                let caller_pid = peer.expect("require_lease Ok implies peer is Some");
+                let lease_ctx = ssh::LeaseContext {
+                    caller_pid,
+                    lease_token: lease_token.clone(),
+                };
+                let mut download =
+                    match session::begin_get(&host, session, &remote_path, &local_path, lease_ctx)
                         .await
-                        {
-                            Ok(reply) => Response::Transfer(reply),
-                            Err(e) => Response::Error {
+                    {
+                        Ok(download) => download,
+                        Err(e) => {
+                            chan.send(&Response::Error {
                                 message: e.to_string(),
-                            },
+                            })
+                            .await?;
+                            continue;
                         }
+                    };
+                chan.send(&Response::TransferReady).await?;
+
+                // Keep the start-time grant for the complete stream. New
+                // transfers after expiry still fail at `require_lease` above.
+                let mut buffer = Zeroizing::new(vec![0u8; MAX_RAW_FRAME_BYTES]);
+                let stream_error = loop {
+                    match download.read_chunk(buffer.as_mut_slice()).await {
+                        Ok(0) => break None,
+                        Ok(read) => chan.send_raw_frame(&buffer[..read]).await?,
+                        Err(e) => break Some(e.to_string()),
                     }
+                };
+                chan.send_raw_frame(&[]).await?;
+                let resp = match stream_error {
+                    Some(message) => Response::Error { message },
+                    None => Response::Transfer(download.finish()),
                 };
                 chan.send(&resp).await?;
             }
@@ -478,10 +556,19 @@ async fn handle_connection(
                     .await?;
                     continue;
                 };
-                // DESIGN.md §4: expand every requested host's ProxyJump
+                // docs/internals/architecture.md: expand every requested host's ProxyJump
                 // chain so the human approving this request sees (and
                 // grants) coverage for the whole path, not just the target.
-                let expanded_hosts = ssh::expand_lease_hosts(&hosts).await;
+                let expanded_hosts = match ssh::expand_lease_hosts(&hosts).await {
+                    Ok(hosts) => hosts,
+                    Err(error) => {
+                        chan.send(&Response::Error {
+                            message: error.to_string(),
+                        })
+                        .await?;
+                        continue;
+                    }
+                };
                 let resp = match lease::request_lease(caller_pid, expanded_hosts.clone()).await {
                     Ok(outcome) => {
                         audit::record(
@@ -491,7 +578,30 @@ async fn handle_connection(
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
                             lease::RequestOutcome::Pending(info) => {
-                                Response::LeaseRequestPending(info)
+                                if info.vault_exists {
+                                    match native_approval::try_approve(&info).await {
+                                        Ok(activated) => {
+                                            audit::record(
+                                                "lease_approved_native",
+                                                serde_json::json!({
+                                                    "hosts": activated.hosts,
+                                                    "anchor_name": activated.anchor_name,
+                                                    "anchor_pid": activated.anchor_pid,
+                                                }),
+                                            );
+                                            // Native approval occurs on requesting
+                                            // connection. Return existing idempotent success
+                                            // shape, never bearer escape-hatch token.
+                                            Response::Ok
+                                        }
+                                        Err(error) => {
+                                            debug!(%error, request_id = %info.id, "native approval unavailable; keeping request pending");
+                                            Response::LeaseRequestPending(info)
+                                        }
+                                    }
+                                } else {
+                                    Response::LeaseRequestPending(info)
+                                }
                             }
                         }
                     }
@@ -513,6 +623,7 @@ async fn handle_connection(
             Request::ApproveLease {
                 id,
                 master_password,
+                approved_hosts,
             } => {
                 let Some(approver_pid) = peer else {
                     chan.send(&Response::Error {
@@ -528,6 +639,7 @@ async fn handle_connection(
                     approver_pid,
                     &id,
                     master_password.expose_secret().as_bytes(),
+                    &approved_hosts,
                 )
                 .await
                 {
@@ -539,7 +651,7 @@ async fn handle_connection(
                                 "anchor_pid": info.anchor_pid,
                             }),
                         );
-                        // DESIGN.md §4: with the vault now unlocked, resolve
+                        // docs/internals/architecture.md: with the vault now unlocked, resolve
                         // each granted host the same way a real connection
                         // will (vault entry first) and tell the CLI which
                         // endpoints still need a host-key confirmation.
@@ -595,25 +707,95 @@ async fn handle_connection(
                 hostname,
                 port,
                 user,
-                ssh_password,
+                auth,
                 master_password,
                 replace,
-                jump,
+                route,
             } => {
+                let auth = match auth {
+                    proto::HostAuth::Agent => vault::AuthMethod::Agent,
+                    proto::HostAuth::Password { password } => vault::AuthMethod::Password {
+                        password: password.into_string(),
+                    },
+                    proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                };
                 let entry = vault::HostEntry {
                     hostname,
                     port,
                     user,
-                    auth: vault::AuthMethod::Password {
-                        password: ssh_password.into_string(),
-                    },
-                    jump,
+                    auth,
+                    route,
                 };
                 let resp = match vault::add_entry(
                     &alias,
                     entry,
                     master_password.expose_secret().as_bytes(),
                     replace,
+                )
+                .await
+                {
+                    Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::ListHosts { master_password } => {
+                let inventory = tokio::task::spawn_blocking(move || {
+                    vault::list_entries(master_password.expose_secret().as_bytes())
+                })
+                .await;
+                let resp = match inventory {
+                    Ok(Ok(hosts)) => Response::Hosts {
+                        hosts: hosts
+                            .into_iter()
+                            .map(|host| proto::HostSummary {
+                                alias: host.alias,
+                                hostname: host.hostname,
+                                port: host.port,
+                                user: host.user,
+                                auth: host.auth,
+                                route: host.route,
+                            })
+                            .collect(),
+                    },
+                    Ok(Err(e)) => Response::Error {
+                        message: e.to_string(),
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("host inventory worker failed: {e}"),
+                    },
+                };
+                chan.send(&resp).await?;
+            }
+            Request::UpdateHost {
+                alias,
+                hostname,
+                port,
+                user,
+                route,
+                auth,
+                master_password,
+            } => {
+                let metadata = vault::HostUpdate {
+                    alias,
+                    hostname,
+                    port,
+                    user,
+                    route,
+                };
+                let auth = auth.map(|auth| match auth {
+                    proto::HostAuth::Agent => vault::AuthMethod::Agent,
+                    proto::HostAuth::Password { password } => vault::AuthMethod::Password {
+                        password: password.into_string(),
+                    },
+                    proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                });
+                let resp = match vault::update_entry(
+                    metadata,
+                    auth,
+                    master_password.expose_secret().as_bytes(),
                 )
                 .await
                 {

@@ -9,22 +9,21 @@
 //! though it isn't reachable from a Rust-facing header:
 //!
 //! - `sizeof(struct kinfo_proc)` = 648 bytes
-//! - `kp_proc.p_starttime` (a `struct timeval`; its first 8 bytes are
-//!   `tv_sec`, an `i64` seconds-since-epoch) at absolute offset 0
+//! - `kp_proc.p_starttime` (a `struct timeval`; `tv_sec` is an `i64` at
+//!   absolute offset 0 and `tv_usec` is an `i32` at absolute offset 8)
 //! - `kp_proc.p_pid` (`i32`) at absolute offset 40
 //! - `kp_proc.p_comm` (17-byte NUL-terminated string, `MAXCOMLEN` 16 + NUL)
 //!   at absolute offset 243
 //! - `kp_eproc.e_ppid` (`i32`) at absolute offset 560
 //!
-//! Confirmed on arm64 macOS; x86_64 Macs are assumed to share this layout
-//! since it's a long-frozen kernel ABI that userspace tooling depends on
-//! for cross-version compatibility.
+//! Confirmed against the current macOS SDK for both arm64 and x86_64.
 
 use super::ProcessInfo;
 use std::time::{Duration, SystemTime};
 
 const KINFO_PROC_SIZE: usize = 648;
 const OFFSET_P_STARTTIME: usize = 0;
+const OFFSET_P_STARTTIME_USEC: usize = OFFSET_P_STARTTIME + 8;
 const OFFSET_P_PID: usize = 40;
 const OFFSET_P_COMM: usize = 243;
 const COMM_LEN: usize = 17;
@@ -168,6 +167,29 @@ struct RawProc {
     comm: Option<String>,
 }
 
+fn system_time_from_timeval(tv_sec: i64, tv_usec: i32) -> Option<SystemTime> {
+    if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(tv_sec as u64))?
+        .checked_add(Duration::from_micros(tv_usec as u64))
+}
+
+fn start_time_from_kinfo_bytes(buf: &[u8]) -> Option<SystemTime> {
+    let tv_sec = i64::from_ne_bytes(
+        buf.get(OFFSET_P_STARTTIME..OFFSET_P_STARTTIME + 8)?
+            .try_into()
+            .ok()?,
+    );
+    let tv_usec = i32::from_ne_bytes(
+        buf.get(OFFSET_P_STARTTIME_USEC..OFFSET_P_STARTTIME_USEC + 4)?
+            .try_into()
+            .ok()?,
+    );
+    system_time_from_timeval(tv_sec, tv_usec)
+}
+
 fn query(pid: u32) -> Option<RawProc> {
     let mut mib: [libc::c_int; 4] = [
         libc::CTL_KERN,
@@ -207,15 +229,7 @@ fn query(pid: u32) -> Option<RawProc> {
         return None;
     }
 
-    let tv_sec = i64::from_ne_bytes(
-        buf[OFFSET_P_STARTTIME..OFFSET_P_STARTTIME + 8]
-            .try_into()
-            .ok()?,
-    );
-    if tv_sec < 0 {
-        return None;
-    }
-    let start_time = SystemTime::UNIX_EPOCH + Duration::from_secs(tv_sec as u64);
+    let start_time = start_time_from_kinfo_bytes(&buf)?;
 
     let ppid = i32::from_ne_bytes(buf[OFFSET_E_PPID..OFFSET_E_PPID + 4].try_into().ok()?);
     if ppid < 0 {
@@ -299,5 +313,39 @@ mod tests {
         // an implausibly large pid instead, which the kernel should report
         // as not found.
         assert!(ProcessTree::start_time(u32::MAX - 1).is_none());
+    }
+
+    #[test]
+    fn timeval_conversion_preserves_process_start_microseconds() {
+        let first = system_time_from_timeval(1_700_000_000, 123_456).unwrap();
+        let second = system_time_from_timeval(1_700_000_000, 123_457).unwrap();
+
+        assert_eq!(
+            first,
+            SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_700_000_000)
+                + Duration::from_micros(123_456)
+        );
+        assert_eq!(
+            second.duration_since(first).unwrap(),
+            Duration::from_micros(1)
+        );
+        assert!(system_time_from_timeval(1_700_000_000, -1).is_none());
+        assert!(system_time_from_timeval(1_700_000_000, 1_000_000).is_none());
+    }
+
+    #[test]
+    fn kinfo_start_time_parser_reads_tv_usec_at_offset_eight() {
+        let mut bytes = [0_u8; 12];
+        bytes[..8].copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&123_456_i32.to_ne_bytes());
+
+        assert_eq!(
+            start_time_from_kinfo_bytes(&bytes).unwrap(),
+            SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1_700_000_000)
+                + Duration::from_micros(123_456)
+        );
+        assert!(start_time_from_kinfo_bytes(&bytes[..11]).is_none());
     }
 }

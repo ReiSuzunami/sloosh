@@ -1,31 +1,30 @@
-//! Port forwarding: `-L` (local) and `-R` (remote/reverse) tunnels through a
-//! leased host (DESIGN.md §6).
+//! Local (`-L`) and remote (`-R`) port forwarding through a leased host
+//! (docs/internals/architecture.md).
 //!
 //! Each forward owns a dedicated [`ssh::Connection`], independent of any
 //! shell session's (`daemon::session`) — a tunnel's lifecycle is simpler
 //! (no PTY, no output framing) but its *fate on lease expiry* is different:
-//! a shell session survives its creator's lease expiring (DESIGN.md §4), but
+//! a shell session survives its creator's lease expiring (docs/internals/architecture.md), but
 //! a forward is live network access sitting open on a socket, so it MUST be
 //! torn down the moment the lease that justified it goes away.
 //!
 //! **Lease-expiry teardown** is driven by [`spawn_reaper`], a periodic sweep
-//! that re-checks every live forward's lease via [`lease::peek_authorized`],
+//! that re-checks every live forward's resolved [`lease::LeaseGrant`] via
+//! [`lease::peek_grant`],
 //! mirroring `session::spawn_idle_reaper`'s style rather than a push
 //! notification *from* `lease.rs`: this module already depends on `lease.rs`
-//! for the per-connection re-check (see `ssh::ForwardRoute` and the
-//! accept-loop below), so a `lease.rs -> forward.rs` dependency the other
-//! way would be a cycle. Polling reuses lease.rs's one authoritative expiry
-//! decision instead of duplicating it, at the cost of teardown lagging real
-//! expiry by up to [`REAP_SWEEP_INTERVAL`]. `-L` additionally re-checks on
-//! every accepted connection (belt-and-suspenders — the reaper alone already
-//! bounds the exposure window).
+//! for the accept-loop check below, so a `lease.rs -> forward.rs` dependency
+//! the other way would be a cycle. Polling reuses lease.rs's one authoritative
+//! expiry decision instead of duplicating it, at the cost of teardown lagging
+//! real expiry by up to [`REAP_SWEEP_INTERVAL`]. Each direction additionally
+//! re-checks on every accepted connection (belt-and-suspenders — the reaper
+//! alone already bounds the exposure window).
 //!
 //! **Idle refresh:** the sweep deliberately uses the non-touching
-//! `peek_authorized` — a poll that refreshed `last_used` would keep every
+//! `peek_grant` — a poll that refreshed `last_used` would keep every
 //! forward-backed lease alive forever. Only real traffic winds the idle
-//! clock: the accept-loop's per-connection `lease::check_authorized` (and
-//! the equivalent check on incoming `-R` connections) touches the lease,
-//! matching `run`'s idle-refresh behavior (DESIGN.md §4).
+//! clock: each direction's per-connection `lease::check_grant` touches the
+//! lease, matching `run`'s idle-refresh behavior (docs/internals/architecture.md).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -41,18 +40,21 @@ use tracing::{info, warn};
 
 use crate::daemon::audit;
 use crate::daemon::lease;
-use crate::daemon::ssh::{self, ForwardRoute, LeaseContext, SshError};
+#[cfg(test)]
+use crate::daemon::ssh::ForwardRouteState;
+use crate::daemon::ssh::{self, ForwardRoute, ForwardRouteLifecycle, LeaseContext, SshError};
 use crate::proto::ForwardSummary;
 
 /// How often [`spawn_reaper`] re-checks every live forward's lease
-/// (DESIGN.md §4). Much tighter than `session`'s 5-minute idle sweep: a
+/// (docs/internals/architecture.md). Much tighter than `session`'s 5-minute idle sweep: a
 /// forward is live network access, not an idle PTY, so the exposure window
 /// after a lease expires/is revoked matters more than the sweep's overhead.
 const REAP_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// How often each forward's owner task polls its own SSH connection for
-/// liveness, to notice a network drop (DESIGN.md §6 "SSH connection death")
+/// liveness, to notice a network drop (docs/internals/architecture.md)
 /// even when no tunnel traffic is flowing to reveal it another way.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const REMOTE_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Crockford base32 (excludes I/L/O/U to avoid visual ambiguity), same
 /// hand-rolled scheme as `lease::generate_request_id` — not shared as a
@@ -79,7 +81,7 @@ fn generate_forward_id() -> String {
 pub enum ForwardError {
     #[error(
         "invalid -L forward spec '{spec}' — expected `[bind_addr:]local_port:remote_host:remote_port` \
-         (e.g. `8080:127.0.0.1:80`, or `0.0.0.0:8080:127.0.0.1:80` to bind every local interface); \
+         (e.g. `8080:127.0.0.1:80`, or `127.0.0.2:8080:127.0.0.1:80`); \
          got {parts} colon-separated field(s), expected 3 or 4"
     )]
     BadLocalSpec { spec: String, parts: usize },
@@ -110,6 +112,20 @@ pub enum ForwardError {
     BadBindAddr { spec: String, addr: String },
 
     #[error(
+        "local forward bind address '{addr}' in spec '{spec}' is not loopback — sloosh currently \
+         permits `-L` listeners only on loopback (omit the bind address, or use 127.0.0.1). \
+         Exposing a tunnel to the LAN or public network needs capability-specific human approval, \
+         which is not implemented yet"
+    )]
+    NonLoopbackBind { spec: String, addr: String },
+
+    #[error(
+        "the lease that authorized host '{host}' ended while the forward was being created — \
+         request/approve a fresh lease, then retry"
+    )]
+    LeaseEnded { host: String },
+
+    #[error(
         "could not bind {addr} for the local forward — {source}. Something else may already be \
          listening on that port; pick a different local_port, or use 0 to let the OS choose one"
     )]
@@ -130,6 +146,12 @@ pub enum ForwardError {
         #[source]
         source: russh::Error,
     },
+
+    #[error(
+        "{host} returned invalid allocated remote port {port}; closing the SSH connection instead \
+         of tracking or cancelling the wrong listener"
+    )]
+    InvalidAllocatedRemotePort { host: String, port: u32 },
 
     #[error(
         "unknown forward id '{id}' — `sloosh forward ls` lists the live ones; it may already have \
@@ -196,10 +218,19 @@ pub fn parse_local_spec(spec: &str) -> Result<LocalForwardSpec, ForwardError> {
             spec: spec.to_string(),
         });
     }
+    let bind_addr = bind.unwrap_or("127.0.0.1");
+    let bind_ip: IpAddr = bind_addr.parse().map_err(|_| ForwardError::BadBindAddr {
+        spec: spec.to_string(),
+        addr: bind_addr.to_string(),
+    })?;
+    if !bind_ip.is_loopback() {
+        return Err(ForwardError::NonLoopbackBind {
+            spec: spec.to_string(),
+            addr: bind_addr.to_string(),
+        });
+    }
     Ok(LocalForwardSpec {
-        bind_addr: bind
-            .map(str::to_string)
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        bind_addr: bind_addr.to_string(),
         local_port,
         remote_host: host.to_string(),
         remote_port,
@@ -232,6 +263,23 @@ pub fn parse_remote_spec(spec: &str) -> Result<RemoteForwardSpec, ForwardError> 
         local_host: host.to_string(),
         local_port,
     })
+}
+
+fn effective_remote_port(
+    host: &str,
+    requested_port: u16,
+    allocated_port: u32,
+) -> Result<u16, ForwardError> {
+    if requested_port != 0 {
+        return Ok(requested_port);
+    }
+    match u16::try_from(allocated_port) {
+        Ok(port) if port != 0 => Ok(port),
+        _ => Err(ForwardError::InvalidAllocatedRemotePort {
+            host: host.to_string(),
+            port: allocated_port,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,15 +319,15 @@ impl StopReason {
 }
 
 /// Registry entry: only what `ls` needs to display plus the handle to ask
-/// the owner task to stop. No secrets — hosts/specs/ids only (DESIGN.md §7).
+/// the owner task to stop. No secrets — hosts/specs/ids only (docs/internals/architecture.md).
 struct ForwardEntry {
     host: String,
     direction: Direction,
     spec: String,
     created_at: Instant,
     tunnel_count: Arc<AtomicUsize>,
-    caller_pid: u32,
-    lease_token: Option<String>,
+    grant: lease::LeaseGrant,
+    route_lifecycle: Option<ForwardRouteLifecycle>,
     /// Sent exactly once, by whichever caller (`stop`, or the reaper) wins
     /// the race to `remove` this entry from the registry — removal doubles
     /// as the single-consumption guard, so no separate `Option`/lock is
@@ -296,7 +344,13 @@ fn registry() -> &'static AsyncMutex<HashMap<String, ForwardEntry>> {
 /// this daemon process just started, so there are none). Mirrors
 /// `session::reset_registry`'s role at daemon startup.
 pub async fn reset_registry() {
-    registry().lock().await.clear();
+    let mut registry = registry().lock().await;
+    for entry in registry.values() {
+        if let Some(lifecycle) = &entry.route_lifecycle {
+            lifecycle.close();
+        }
+    }
+    registry.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -334,8 +388,14 @@ pub async fn create_local(
         .unwrap_or(spec.local_port);
     let listen_addr = format!("{}:{}", spec.bind_addr, actual_port);
 
+    let grant = lease::resolve_grant(lease_ctx.caller_pid, host, lease_ctx.lease_token.as_deref())
+        .await
+        .ok_or_else(|| ForwardError::LeaseEnded {
+            host: host.to_string(),
+        })?;
+
     // Connect *after* the bind succeeds, so a busy local port fails fast
-    // without ever touching the network (DESIGN.md §7: cheap failures first).
+    // without ever touching the network.
     let conn = ssh::connect(host, &lease_ctx).await?;
 
     let id = generate_forward_id();
@@ -349,8 +409,8 @@ pub async fn create_local(
         spec: spec_text.to_string(),
         created_at: Instant::now(),
         tunnel_count: tunnel_count.clone(),
-        caller_pid: lease_ctx.caller_pid,
-        lease_token: lease_ctx.lease_token.clone(),
+        grant: grant.clone(),
+        route_lifecycle: None,
         stop_tx,
     };
     registry().lock().await.insert(id.clone(), entry);
@@ -369,8 +429,7 @@ pub async fn create_local(
         conn,
         spec.remote_host,
         spec.remote_port,
-        lease_ctx.caller_pid,
-        lease_ctx.lease_token,
+        grant,
         tunnel_count,
         closed_tx,
         closed_rx,
@@ -392,35 +451,59 @@ pub async fn create_remote(
     lease_ctx: LeaseContext,
 ) -> Result<Opened, ForwardError> {
     let spec = parse_remote_spec(spec_text)?;
+    let grant = lease::resolve_grant(lease_ctx.caller_pid, host, lease_ctx.lease_token.as_deref())
+        .await
+        .ok_or_else(|| ForwardError::LeaseEnded {
+            host: host.to_string(),
+        })?;
     let tunnel_count = Arc::new(AtomicUsize::new(0));
-    let (closed_tx, closed_rx) = watch::channel(false);
-
+    let lifecycle = ForwardRouteLifecycle::new();
     let route = ForwardRoute {
         local_host: spec.local_host.clone(),
         local_port: spec.local_port,
-        caller_pid: lease_ctx.caller_pid,
-        lease_host: host.to_string(),
-        lease_token: lease_ctx.lease_token.clone(),
+        grant: grant.clone(),
         tunnel_count: tunnel_count.clone(),
-        closed: closed_rx.clone(),
+        lifecycle: lifecycle.clone(),
     };
     let conn = ssh::connect_with_route(host, &lease_ctx, Some(route)).await?;
 
-    let bound_port = conn
+    if !lease::check_grant(&grant).await {
+        lifecycle.close();
+        return Err(ForwardError::LeaseEnded {
+            host: host.to_string(),
+        });
+    }
+    let bound_port = match conn
         .handle
         .tcpip_forward(spec.bind_addr.clone(), spec.remote_port as u32)
         .await
-        .map_err(|source| ForwardError::RemoteForwardRefused {
-            host: host.to_string(),
-            port: spec.remote_port,
-            source,
-        })?;
-    let actual_port = if spec.remote_port == 0 {
-        bound_port as u16
-    } else {
-        spec.remote_port
+    {
+        Ok(port) => port,
+        Err(source) => {
+            lifecycle.close();
+            return Err(ForwardError::RemoteForwardRefused {
+                host: host.to_string(),
+                port: spec.remote_port,
+                source,
+            });
+        }
     };
-    let listen_addr = format!("{}:{}", spec.bind_addr, actual_port);
+    let actual_port = match effective_remote_port(host, spec.remote_port, bound_port) {
+        Ok(port) => port,
+        Err(error) => {
+            lifecycle.close();
+            return Err(error);
+        }
+    };
+    if !lease::check_grant(&grant).await {
+        lifecycle.close();
+        cancel_remote_listener(&conn, host, &spec.bind_addr, actual_port).await;
+        drop(conn);
+        return Err(ForwardError::LeaseEnded {
+            host: host.to_string(),
+        });
+    }
+    let listen_addr = format!("{}:{actual_port}", spec.bind_addr);
 
     let id = generate_forward_id();
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -429,12 +512,21 @@ pub async fn create_remote(
         direction: Direction::Remote,
         spec: spec_text.to_string(),
         created_at: Instant::now(),
-        tunnel_count: tunnel_count.clone(),
-        caller_pid: lease_ctx.caller_pid,
-        lease_token: lease_ctx.lease_token.clone(),
+        tunnel_count,
+        grant,
+        route_lifecycle: Some(lifecycle.clone()),
         stop_tx,
     };
     registry().lock().await.insert(id.clone(), entry);
+
+    if !lifecycle.activate() {
+        registry().lock().await.remove(&id);
+        cancel_remote_listener(&conn, host, &spec.bind_addr, actual_port).await;
+        drop(conn);
+        return Err(ForwardError::LeaseEnded {
+            host: host.to_string(),
+        });
+    }
 
     audit::record(
         "forward_opened",
@@ -449,7 +541,7 @@ pub async fn create_remote(
         conn,
         spec.bind_addr,
         actual_port,
-        closed_tx,
+        lifecycle,
         stop_rx,
     ));
 
@@ -474,8 +566,7 @@ async fn run_local_forward(
     conn: ssh::Connection,
     remote_host: String,
     remote_port: u16,
-    caller_pid: u32,
-    lease_token: Option<String>,
+    grant: lease::LeaseGrant,
     tunnel_count: Arc<AtomicUsize>,
     closed_tx: watch::Sender<bool>,
     closed_rx: watch::Receiver<bool>,
@@ -500,7 +591,7 @@ async fn run_local_forward(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer_addr)) => {
-                        if !lease::check_authorized(caller_pid, &host, lease_token.as_deref()).await {
+                        if !lease::check_grant(&grant).await {
                             registry().lock().await.remove(&id);
                             break StopReason::LeaseExpired;
                         }
@@ -559,17 +650,48 @@ async fn run_local_tunnel(
     }
 }
 
+async fn cancel_remote_listener(
+    conn: &ssh::Connection,
+    host: &str,
+    bind_addr: &str,
+    remote_port: u16,
+) {
+    match tokio::time::timeout(
+        REMOTE_CANCEL_TIMEOUT,
+        conn.handle
+            .cancel_tcpip_forward(bind_addr.to_string(), remote_port as u32),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(
+            host,
+            bind_addr,
+            remote_port,
+            error = %error,
+            "remote forward: server rejected listener cancellation; closing SSH connection"
+        ),
+        Err(_) => warn!(
+            host,
+            bind_addr,
+            remote_port,
+            timeout_secs = REMOTE_CANCEL_TIMEOUT.as_secs(),
+            "remote forward: listener cancellation timed out; closing SSH connection"
+        ),
+    }
+}
+
 async fn run_remote_forward(
     id: String,
     host: String,
     conn: ssh::Connection,
     bind_addr: String,
     remote_port: u16,
-    closed_tx: watch::Sender<bool>,
+    lifecycle: ForwardRouteLifecycle,
     mut stop_rx: oneshot::Receiver<StopReason>,
 ) {
     let mut health = tokio::time::interval(HEALTH_POLL_INTERVAL);
-    health.tick().await; // consume the immediate first tick
+    health.tick().await;
 
     let reason = loop {
         tokio::select! {
@@ -579,6 +701,7 @@ async fn run_remote_forward(
             }
             _ = health.tick() => {
                 if conn.handle.is_closed() {
+                    lifecycle.close();
                     registry().lock().await.remove(&id);
                     break StopReason::ConnectionLost;
                 }
@@ -586,13 +709,8 @@ async fn run_remote_forward(
         }
     };
 
-    let _ = closed_tx.send(true);
-    // Best-effort: if the connection already died, cancelling the forward
-    // request on it will simply fail too — nothing left to clean up remotely.
-    let _ = conn
-        .handle
-        .cancel_tcpip_forward(bind_addr, remote_port as u32)
-        .await;
+    lifecycle.close();
+    cancel_remote_listener(&conn, &host, &bind_addr, remote_port).await;
     drop(conn);
     audit::record(
         "forward_stopped",
@@ -605,12 +723,15 @@ async fn run_remote_forward(
 // Stop / list
 // ---------------------------------------------------------------------------
 
-/// Stop an active forward (DESIGN.md §6). No lease required: stopping only
+/// Stop an active forward (docs/internals/architecture.md). No lease required: stopping only
 /// ever reduces access.
 pub async fn stop(id: &str) -> Result<(), ForwardError> {
     let entry = registry().lock().await.remove(id);
     match entry {
         Some(entry) => {
+            if let Some(lifecycle) = &entry.route_lifecycle {
+                lifecycle.close();
+            }
             // Ignore send failure: the owner task may have already exited
             // (e.g. it just self-detected connection loss and removed
             // itself) — nothing left to tell.
@@ -621,7 +742,7 @@ pub async fn stop(id: &str) -> Result<(), ForwardError> {
     }
 }
 
-/// List active forwards (DESIGN.md §6). No lease required: read-only.
+/// List active forwards (docs/internals/architecture.md). No lease required: read-only.
 pub async fn ls() -> Vec<ForwardSummary> {
     let reg = registry().lock().await;
     let mut out: Vec<ForwardSummary> = reg
@@ -645,7 +766,7 @@ pub async fn ls() -> Vec<ForwardSummary> {
 // ---------------------------------------------------------------------------
 
 /// Spawn the background sweep that tears down any forward whose creator's
-/// lease for its host has expired or been revoked (DESIGN.md §4, and the
+/// lease for its host has expired or been revoked (docs/internals/architecture.md, and the
 /// module doc comment above for why this is a poll rather than a callback
 /// from `lease.rs`).
 pub fn spawn_reaper() {
@@ -658,30 +779,32 @@ pub fn spawn_reaper() {
 }
 
 async fn reap_expired_leases() {
-    let candidates: Vec<(String, String, u32, Option<String>)> = {
+    let candidates: Vec<(String, lease::LeaseGrant, Option<ForwardRouteLifecycle>)> = {
         let reg = registry().lock().await;
         reg.iter()
-            .map(|(id, e)| {
-                (
-                    id.clone(),
-                    e.host.clone(),
-                    e.caller_pid,
-                    e.lease_token.clone(),
-                )
-            })
+            .map(|(id, e)| (id.clone(), e.grant.clone(), e.route_lifecycle.clone()))
             .collect()
     };
-    for (id, host, caller_pid, lease_token) in candidates {
+    for (id, grant, route_lifecycle) in candidates {
         // peek, not check: this sweep must observe the idle clock, not wind
         // it — polling through the touching variant would keep every
         // forward-backed lease alive forever.
-        if !lease::peek_authorized(caller_pid, &host, lease_token.as_deref()).await {
+        if !lease::peek_grant(&grant).await {
+            if let Some(lifecycle) = route_lifecycle {
+                lifecycle.close();
+            }
             let entry = registry().lock().await.remove(&id);
             if let Some(entry) = entry {
                 let _ = entry.stop_tx.send(StopReason::LeaseExpired);
             }
         }
     }
+}
+
+#[cfg(feature = "integration-test-hooks")]
+#[doc(hidden)]
+pub async fn reap_expired_leases_for_integration_test() {
+    reap_expired_leases().await;
 }
 
 #[cfg(test)]
@@ -701,11 +824,23 @@ mod tests {
 
     #[test]
     fn parses_local_spec_with_explicit_bind_addr() {
-        let s = parse_local_spec("0.0.0.0:8080:127.0.0.1:80").unwrap();
-        assert_eq!(s.bind_addr, "0.0.0.0");
+        let s = parse_local_spec("127.0.0.2:8080:127.0.0.1:80").unwrap();
+        assert_eq!(s.bind_addr, "127.0.0.2");
         assert_eq!(s.local_port, 8080);
         assert_eq!(s.remote_host, "127.0.0.1");
         assert_eq!(s.remote_port, 80);
+    }
+
+    #[test]
+    fn rejects_local_spec_bound_beyond_loopback() {
+        for spec in [
+            "0.0.0.0:8080:127.0.0.1:80",
+            "192.168.1.20:8080:127.0.0.1:80",
+        ] {
+            let e = parse_local_spec(spec).unwrap_err();
+            assert!(matches!(e, ForwardError::NonLoopbackBind { .. }));
+            assert!(e.to_string().contains("capability-specific"));
+        }
     }
 
     #[test]
@@ -785,6 +920,37 @@ mod tests {
     }
 
     #[test]
+    fn validates_server_allocated_remote_port_without_truncation() {
+        assert_eq!(effective_remote_port("box", 0, 43210).unwrap(), 43210);
+        assert_eq!(effective_remote_port("box", 9000, 0).unwrap(), 9000);
+        for invalid in [0, u16::MAX as u32 + 1, u32::MAX] {
+            let error = effective_remote_port("box", 0, invalid).unwrap_err();
+            assert!(matches!(
+                error,
+                ForwardError::InvalidAllocatedRemotePort { port, .. } if port == invalid
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_creation_requires_a_stable_grant_before_network() {
+        let result = create_remote(
+            "remote-forward-no-grant.invalid",
+            "9000:127.0.0.1:3000",
+            LeaseContext {
+                caller_pid: u32::MAX,
+                lease_token: None,
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("remote forwarding must resolve its lease before connecting");
+        };
+
+        assert!(matches!(error, ForwardError::LeaseEnded { .. }));
+    }
+
+    #[test]
     fn rejects_remote_spec_with_empty_host() {
         let e = parse_remote_spec("9000::3000").unwrap_err();
         assert!(matches!(e, ForwardError::EmptyHost { .. }));
@@ -803,16 +969,20 @@ mod tests {
 
     // -- registry stop/ls semantics -------------------------------------
 
-    async fn insert_dummy_entry(id: &str, host: &str) -> oneshot::Receiver<StopReason> {
+    async fn insert_dummy_entry(
+        id: &str,
+        host: &str,
+        direction: Direction,
+    ) -> oneshot::Receiver<StopReason> {
         let (stop_tx, stop_rx) = oneshot::channel();
         let entry = ForwardEntry {
             host: host.to_string(),
-            direction: Direction::Local,
+            direction,
             spec: "8080:127.0.0.1:80".to_string(),
             created_at: Instant::now(),
             tunnel_count: Arc::new(AtomicUsize::new(0)),
-            caller_pid: 1,
-            lease_token: None,
+            grant: lease::LeaseGrant::invalid_for_test(host),
+            route_lifecycle: None,
             stop_tx,
         };
         registry().lock().await.insert(id.to_string(), entry);
@@ -839,7 +1009,7 @@ mod tests {
     async fn stop_known_id_signals_owner_and_removes_from_ls() {
         let _guard = test_lock().lock().await;
         reset_registry().await;
-        let mut stop_rx = insert_dummy_entry("fwd-test1", "box").await;
+        let mut stop_rx = insert_dummy_entry("fwd-test1", "box", Direction::Local).await;
 
         let before = ls().await;
         assert_eq!(before.len(), 1);
@@ -860,7 +1030,7 @@ mod tests {
     async fn stopping_twice_is_not_found_the_second_time() {
         let _guard = test_lock().lock().await;
         reset_registry().await;
-        let _stop_rx = insert_dummy_entry("fwd-test2", "box").await;
+        let _stop_rx = insert_dummy_entry("fwd-test2", "box", Direction::Local).await;
         stop("fwd-test2").await.unwrap();
         let e = stop("fwd-test2").await.unwrap_err();
         assert!(matches!(e, ForwardError::NotFound { .. }));
@@ -870,11 +1040,67 @@ mod tests {
     async fn ls_reflects_multiple_forwards_sorted_by_id() {
         let _guard = test_lock().lock().await;
         reset_registry().await;
-        let _a = insert_dummy_entry("fwd-bbbbbb", "host-b").await;
-        let _b = insert_dummy_entry("fwd-aaaaaa", "host-a").await;
+        let _a = insert_dummy_entry("fwd-bbbbbb", "host-b", Direction::Local).await;
+        let _b = insert_dummy_entry("fwd-aaaaaa", "host-a", Direction::Local).await;
         let summaries = ls().await;
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].id, "fwd-aaaaaa");
         assert_eq!(summaries[1].id, "fwd-bbbbbb");
+    }
+
+    #[tokio::test]
+    async fn expired_remote_grant_removes_forward_and_signals_owner() {
+        let _guard = test_lock().lock().await;
+        reset_registry().await;
+        let lifecycle = ForwardRouteLifecycle::new();
+        assert!(lifecycle.activate());
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        registry().lock().await.insert(
+            "fwd-remote".to_string(),
+            ForwardEntry {
+                host: "box".to_string(),
+                direction: Direction::Remote,
+                spec: "9000:127.0.0.1:3000".to_string(),
+                created_at: Instant::now(),
+                tunnel_count: Arc::new(AtomicUsize::new(0)),
+                grant: lease::LeaseGrant::invalid_for_test("box"),
+                route_lifecycle: Some(lifecycle.clone()),
+                stop_tx,
+            },
+        );
+
+        reap_expired_leases().await;
+
+        assert!(ls().await.is_empty());
+        assert_eq!(lifecycle.state(), ForwardRouteState::Closed);
+        let reason = stop_rx.try_recv().expect("owner task should be signalled");
+        assert!(matches!(reason, StopReason::LeaseExpired));
+    }
+
+    #[tokio::test]
+    async fn stopping_remote_forward_closes_route_before_signalling_owner() {
+        let _guard = test_lock().lock().await;
+        reset_registry().await;
+        let lifecycle = ForwardRouteLifecycle::new();
+        assert!(lifecycle.activate());
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        registry().lock().await.insert(
+            "fwd-remote-close".to_string(),
+            ForwardEntry {
+                host: "box".to_string(),
+                direction: Direction::Remote,
+                spec: "9000:127.0.0.1:3000".to_string(),
+                created_at: Instant::now(),
+                tunnel_count: Arc::new(AtomicUsize::new(0)),
+                grant: lease::LeaseGrant::invalid_for_test("box"),
+                route_lifecycle: Some(lifecycle.clone()),
+                stop_tx,
+            },
+        );
+
+        stop("fwd-remote-close").await.unwrap();
+
+        assert_eq!(lifecycle.state(), ForwardRouteState::Closed);
+        assert!(matches!(stop_rx.try_recv(), Ok(StopReason::Requested)));
     }
 }

@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a scoped improvement to sloosh.
+title: "feature: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem needs solving?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe behavior and user-visible boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and scope impact
+      description: Note changes to authority, credentials, protocol, filesystem access, forwarding, or resource bounds.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+  - type: checkboxes
+    id: existing
+    attributes:
+      label: Existing work
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true

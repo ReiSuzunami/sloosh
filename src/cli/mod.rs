@@ -1,32 +1,55 @@
 //! CLI: clap command definitions, client-side dispatch, daemon auto-spawn
-//! (DESIGN.md §6, §8).
+//! (docs/internals/architecture.md).
 
+mod approval;
 mod args;
-mod client;
+pub mod client;
+mod daemon_cmd;
+mod forward;
+mod host;
+mod log;
+mod session;
+mod skill;
+mod transfer;
 
 pub use args::Cli;
 use args::{
-    AddArgs, ApproveArgs, Command, DaemonAction, ForwardAction, ForwardLsArgs, ForwardOpenArgs,
-    ForwardStopArgs, GetArgs, InterruptArgs, KillArgs, LogArgs, LsArgs, OpenArgs, PeekArgs,
-    PutArgs, RequestArgs, RmArgs, RunArgs, SendArgs, StatusArgs, VaultAction,
+    Command, HostAction, InitArgs, SkillAction, SkillAgent, SkillInstallArgs, SkillStatusArgs,
+    VaultAction, VaultTimeoutArgs,
 };
 
-use crate::daemon::audit;
-use crate::daemon::ssh;
-use crate::proto::{
-    self, ForwardDirection, LeaseActivatedInfo, LeaseRequestSummary, PeekReply, Request, Response,
-    RunReply, SecretString, SessionSummary, StatusReply,
-};
+#[cfg(test)]
+use crate::proto::{self, HostRoute, HostSummary};
+use crate::proto::{Request, Response, SecretString};
 use crate::transport::Channel;
-use crate::transport::unix::{self, UnixChannel};
-use clap::Parser as _;
-use std::io::{IsTerminal, Write as _};
+use crate::transport::unix;
 use std::path::Path;
+
+use approval::{
+    cmd_approve, cmd_request, cmd_vault_init_inner, display_host_list, prompt_master_password,
+    require_tty,
+};
+use daemon_cmd::{cmd_daemon, cmd_status};
+#[cfg(test)]
+use daemon_cmd::{daemon_connect_error, daemon_is_not_running_error};
+use forward::cmd_forward;
+use host::{cmd_add, cmd_host_edit, cmd_host_list, cmd_host_show, cmd_rm};
+#[cfg(test)]
+use host::{display_host_endpoint, escape_terminal_controls};
+use log::cmd_log;
+#[cfg(test)]
+use log::render_field_value;
+use session::{cmd_interrupt, cmd_kill, cmd_ls, cmd_open, cmd_peek, cmd_run, cmd_send};
+#[cfg(test)]
+use transfer::{LocalDownload, open_local_upload, resolve_local_path};
+use transfer::{cmd_get, cmd_put};
 
 /// Run the parsed CLI command. Errors are rendered by `main` and always
 /// exit non-zero; nothing in here panics or uses `todo!()`.
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Command::Init(args) => cmd_init(args).await,
+        Command::Skill(args) => cmd_skill(args.action),
         Command::Status(args) => cmd_status(args).await,
         Command::Daemon(args) => cmd_daemon(args.action).await,
 
@@ -39,10 +62,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Kill(args) => cmd_kill(args).await,
         Command::Request(args) => cmd_request(args).await,
         Command::Approve(args) => cmd_approve(args).await,
+        Command::Host(args) => match args.action {
+            HostAction::List(args) => cmd_host_list(args).await,
+            HostAction::Show(args) => cmd_host_show(args).await,
+            HostAction::Add(args) => cmd_add(args).await,
+            HostAction::Edit(args) => cmd_host_edit(args).await,
+            HostAction::Rm(args) => cmd_rm(args).await,
+        },
         Command::Add(args) => cmd_add(args).await,
         Command::Rm(args) => cmd_rm(args).await,
         Command::Vault(args) => match args.action {
             VaultAction::Init => cmd_vault_init().await,
+            VaultAction::Timeout(args) => cmd_vault_timeout(args),
         },
         Command::Put(args) => cmd_put(args).await,
         Command::Get(args) => cmd_get(args).await,
@@ -51,111 +82,28 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
-    let socket_path = unix::resolve_socket_path();
-    let mut chan = client::connect_or_spawn(&socket_path).await?;
-    let reply = request_status(&mut chan).await?;
+fn cmd_vault_timeout(args: VaultTimeoutArgs) -> anyhow::Result<()> {
+    use crate::vault_settings::{VaultSettingsStore, VaultTimeout};
 
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&reply)?);
-    } else {
-        print_status_human(&reply, &socket_path);
-    }
-    Ok(())
-}
-
-async fn cmd_daemon(action: DaemonAction) -> anyhow::Result<()> {
-    let socket_path = unix::resolve_socket_path();
-    match action {
-        DaemonAction::Run => crate::daemon::run(socket_path).await,
-        DaemonAction::Start => cmd_daemon_start(&socket_path).await,
-        DaemonAction::Stop => cmd_daemon_stop(&socket_path).await,
-        DaemonAction::Status => cmd_daemon_status(&socket_path).await,
-    }
-}
-
-async fn cmd_daemon_start(socket_path: &Path) -> anyhow::Result<()> {
-    if UnixChannel::connect(socket_path).await.is_ok() {
-        println!(
-            "sloosh daemon is already running (socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
-    }
-    client::spawn_daemon_detached(socket_path)?;
-    client::wait_for_daemon(socket_path).await?;
+    let store = VaultSettingsStore::current_user();
+    let timeout = match args.minutes {
+        Some(minutes) => {
+            let timeout = VaultTimeout::try_from(minutes)?;
+            store.save(timeout)?;
+            timeout
+        }
+        None => store.load()?,
+    };
     println!(
-        "sloosh daemon started (socket at {})",
-        socket_path.display()
+        "vault timeout: {} minute{}",
+        timeout.minutes(),
+        if timeout.minutes() == 1 { "" } else { "s" }
     );
     Ok(())
 }
 
-async fn cmd_daemon_stop(socket_path: &Path) -> anyhow::Result<()> {
-    let Ok(mut chan) = UnixChannel::connect(socket_path).await else {
-        println!(
-            "sloosh daemon is not running (no socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
-    };
-    chan.send(&Request::Shutdown).await?;
-    // Best-effort: read the Ok ack, but a closed connection is also a valid
-    // sign the daemon shut down before flushing its reply.
-    let _: Option<Response> = chan.recv().await.unwrap_or(None);
-    println!("sloosh daemon stopped");
-    Ok(())
-}
-
-async fn cmd_daemon_status(socket_path: &Path) -> anyhow::Result<()> {
-    let Ok(mut chan) = UnixChannel::connect(socket_path).await else {
-        println!(
-            "sloosh daemon is not running (no socket at {})",
-            socket_path.display()
-        );
-        return Ok(());
-    };
-    let reply = request_status(&mut chan).await?;
-    print_status_human(&reply, socket_path);
-    Ok(())
-}
-
-async fn request_status(chan: &mut UnixChannel) -> anyhow::Result<StatusReply> {
-    chan.send(&Request::Status).await?;
-    match chan.recv().await? {
-        Some(Response::Status(reply)) => Ok(reply),
-        Some(Response::Error { message }) => anyhow::bail!("daemon reported an error: {message}"),
-        Some(other) => anyhow::bail!("daemon sent an unexpected reply: {other:?}"),
-        None => anyhow::bail!(
-            "daemon closed the connection without responding to Status; \
-             check ~/.sloosh/daemon.log for a crash"
-        ),
-    }
-}
-
-fn print_status_human(reply: &proto::StatusReply, socket_path: &Path) {
-    println!("sloosh daemon: running (pid {})", reply.pid);
-    println!("  version:  {}", reply.version);
-    println!("  uptime:   {}s", reply.uptime_secs);
-    println!("  socket:   {}", socket_path.display());
-    println!("  sessions: {}", reply.sessions.len());
-    for s in &reply.sessions {
-        println!("    - {} @ {} [{}]", s.name, s.host, s.state);
-    }
-    println!("  leases:   {}", reply.leases.len());
-    for l in &reply.leases {
-        println!(
-            "    - {} — {} (pid {}), idle timeout in {}s",
-            l.hosts.join(", "),
-            l.anchor_name.as_deref().unwrap_or("unknown process"),
-            l.anchor_pid,
-            l.idle_remaining_secs,
-        );
-    }
-}
-
 /// `SLOOSH_LEASE` escape-hatch token from the environment, if this process
-/// has one set (DESIGN.md §4) — forwarded on every host-touching request so
+/// has one set (docs/internals/architecture.md) — forwarded on every host-touching request so
 /// the daemon can check it before falling back to ancestry matching.
 fn lease_token_from_env() -> Option<String> {
     std::env::var("SLOOSH_LEASE").ok()
@@ -183,653 +131,154 @@ fn bail_on_error_or_unexpected(resp: Response) -> anyhow::Result<Response> {
     Ok(resp)
 }
 
-async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
-    let req = Request::Run {
-        host: args.host,
-        command: args.command,
-        session: args.session,
-        timeout_secs: args.timeout,
-        raw: args.raw,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Run(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Run: {resp:?}");
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&reply)?);
-    } else {
-        print_run_human(&reply);
-    }
-    Ok(())
-}
-
-fn print_run_human(reply: &RunReply) {
-    println!("{} @ {} [{}]", reply.host, reply.session, reply.state);
-    if let Some(code) = reply.exit_code {
-        println!("exit code: {code}");
-    }
-    if let Some(reason) = &reply.dead_reason {
-        println!("dead reason: {reason}");
-    }
-    if !reply.spool_path.is_empty() {
-        println!("spool: {}", reply.spool_path);
-    }
-    println!("{}", reply.output);
-    if reply.truncated {
-        println!(
-            "[output truncated in this reply; {} total bytes — see spool file for the rest]",
-            reply.total_bytes
-        );
-    }
-}
-
-async fn cmd_peek(args: PeekArgs) -> anyhow::Result<()> {
-    let req = Request::Peek {
-        host: args.host,
-        session: args.session,
-        tail: args.tail,
-        raw: args.raw,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Peek(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Peek: {resp:?}");
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&reply)?);
-    } else {
-        print_peek_human(&reply);
-    }
-    Ok(())
-}
-
-fn print_peek_human(reply: &PeekReply) {
-    println!("{} @ {} [{}]", reply.host, reply.session, reply.state);
-    if let Some(reason) = &reply.dead_reason {
-        println!("dead reason: {reason}");
-    }
-    println!("{}", reply.output);
-    if reply.truncated {
-        println!(
-            "[output truncated in this reply; {} total bytes]",
-            reply.total_bytes
-        );
-    }
-}
-
-async fn cmd_send(args: SendArgs) -> anyhow::Result<()> {
-    let req = Request::Send {
-        host: args.host,
-        keys: args.keys,
-        session: args.session,
-        newline: args.newline,
-        lease_token: lease_token_from_env(),
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("sent");
-    Ok(())
-}
-
-async fn cmd_interrupt(args: InterruptArgs) -> anyhow::Result<()> {
-    let req = Request::Interrupt {
-        host: args.host,
-        session: args.session,
-        lease_token: lease_token_from_env(),
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("interrupted");
-    Ok(())
-}
-
-async fn cmd_open(args: OpenArgs) -> anyhow::Result<()> {
-    let req = Request::Open {
-        host: args.host,
-        name: args.name,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Session(summary) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Open: {resp:?}");
-    };
-    print_session_summary_human(&summary);
-    Ok(())
-}
-
-async fn cmd_kill(args: KillArgs) -> anyhow::Result<()> {
-    let req = Request::Kill {
-        host: args.host,
-        session: args.session,
-        lease_token: lease_token_from_env(),
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("killed");
-    Ok(())
-}
-
-async fn cmd_ls(args: LsArgs) -> anyhow::Result<()> {
-    let req = Request::Ls { host: args.host };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Ls { sessions } = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Ls: {resp:?}");
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-    } else if sessions.is_empty() {
-        println!("no sessions");
-    } else {
-        for s in &sessions {
-            print_session_summary_human(s);
-        }
-    }
-    Ok(())
-}
-
-fn print_session_summary_human(s: &SessionSummary) {
-    let mut line = format!(
-        "{} @ {} [{}] idle {}s",
-        s.name, s.host, s.state, s.idle_secs
-    );
-    if let Some(reason) = &s.dead_reason {
-        line.push_str(&format!(" ({reason})"));
-    }
-    println!("{line}");
-}
-
-// ---------------------------------------------------------------------
-// Vault + lease authorization flow (DESIGN.md §4).
-// ---------------------------------------------------------------------
-
-/// Refuse to run a human-only command outside a real terminal (DESIGN.md
-/// §2, §4): credential enrollment and lease approval are never meant to be
-/// driven by an agent, so a non-interactive caller gets a self-teaching
-/// error instead of a hung prompt or (worse) an ignored secret.
-fn require_tty(command: &str) -> anyhow::Result<()> {
-    if std::io::stdin().is_terminal() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "`sloosh {command}` is a human-only command and refuses to run without a real \
-             terminal attached to stdin (DESIGN.md §4). If you are a coding agent: do not try to \
-             work around this — ask your user to run `sloosh {command}` themselves, in their own \
-             terminal."
-        )
-    }
-}
-
-async fn cmd_request(args: RequestArgs) -> anyhow::Result<()> {
-    let req = Request::RequestLease {
-        hosts: args.hosts.clone(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    match resp {
-        Response::Ok => {
-            println!(
-                "already authorized: an active lease already covers {}",
-                args.hosts.join(", ")
-            );
-        }
-        Response::LeaseRequestPending(info) => print_pending_request_instructions(&info),
-        other => anyhow::bail!("daemon sent an unexpected reply to RequestLease: {other:?}"),
-    }
-    Ok(())
-}
-
-fn print_pending_request_instructions(info: &LeaseRequestSummary) {
-    let anchor = info.anchor_name.as_deref().unwrap_or("an unknown process");
-    println!(
-        "Approval needed. Ask your user to run this in ANOTHER terminal:\n\n    sloosh approve {}\n\nGrants: {} — requested by {} (pid {}). Then wait; do not poll.",
-        info.id,
-        info.hosts.join(", "),
-        anchor,
-        info.anchor_pid,
-    );
-    if !info.vault_exists {
-        println!(
-            "\nNote: no credential vault exists yet, so the approve will be refused until your \
-             user first runs `sloosh vault init` (also in their own terminal) to set a master \
-             password."
-        );
-    }
-}
-
-async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
-    require_tty("approve")?;
-
-    let describe_req = Request::DescribeLeaseRequest {
-        id: args.request_id.clone(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&describe_req).await?)?;
-    let Response::LeaseRequestPending(info) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to DescribeLeaseRequest: {resp:?}");
-    };
-
-    println!("Lease request {}", info.id);
-    println!("  hosts:        {}", info.hosts.join(", "));
-    println!(
-        "  requested by: {} (pid {})",
-        info.anchor_name.as_deref().unwrap_or("unknown process"),
-        info.anchor_pid
-    );
-    println!("  age:          {}s", info.age_secs);
-    if !info.vault_exists {
-        anyhow::bail!(
-            "no credential vault exists yet, so this request can't be approved (approval \
-             verifies your master password, and there isn't one set) — run `sloosh vault init` \
-             first to create the vault, then re-run `sloosh approve {}`",
-            info.id
-        );
-    }
-    println!();
-
-    let master_password = prompt_master_password(true)?;
-
-    let approve_req = Request::ApproveLease {
-        id: args.request_id,
-        master_password,
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&approve_req).await?)?;
-    let Response::LeaseActivated(activated) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
-    };
-
-    // Host-key confirmation happens after the lease is activated, because
-    // only then can the daemon resolve vault-only aliases (the vault is
-    // unlocked by the approval itself). The daemon reports which resolved
-    // endpoints have no recorded key yet; this process dials each one
-    // directly (a read-only probe, no secrets involved) so the human can
-    // confirm its fingerprint (DESIGN.md §4).
-    for unverified in &activated.unverified_hosts {
-        confirm_and_record_host_key(&unverified.host, &unverified.hostname, unverified.port)
-            .await?;
-    }
-
-    print_lease_activated(&activated);
-    Ok(())
-}
-
 async fn cmd_vault_init() -> anyhow::Result<()> {
     require_tty("vault init")?;
-
-    let vault_exists_resp =
-        bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
-    let Response::VaultExists { exists } = vault_exists_resp else {
-        anyhow::bail!("daemon sent an unexpected reply to VaultExists: {vault_exists_resp:?}");
-    };
-    if exists {
-        println!(
-            "a credential vault already exists — nothing to do. Use `sloosh add`/`sloosh rm` to \
-             manage its entries."
-        );
-        return Ok(());
-    }
-
-    println!("Creating the sloosh credential vault (~/.sloosh/vault).");
-    let master_password = prompt_master_password(false)?;
-    bail_on_error_or_unexpected(send_request(&Request::InitVault { master_password }).await?)?;
-    println!(
-        "vault created. You can now approve lease requests (`sloosh approve <ID>`) and add \
-         credentials (`sloosh add <alias> --hostname <host>`)."
-    );
-    Ok(())
+    let native_approval_available = explain_native_approval_setup();
+    let password = cmd_vault_init_inner().await?;
+    enroll_native_approval(password, native_approval_available).await
 }
 
-/// Prompt for the master password: a single prompt if a vault already
-/// exists, or a "set + confirm twice" flow for first-time setup (DESIGN.md
-/// §1 "首次使用时提示设置主密码, 确认两次").
-fn prompt_master_password(vault_exists: bool) -> anyhow::Result<SecretString> {
-    if vault_exists {
-        let pw = rpassword::prompt_password("Master password: ")?;
-        return Ok(SecretString::new(pw));
-    }
-    loop {
-        let pw1 = rpassword::prompt_password("Set a new master password: ")?;
-        if pw1.is_empty() {
-            println!("master password cannot be empty; try again.");
-            continue;
-        }
-        let pw2 = rpassword::prompt_password("Confirm master password: ")?;
-        if pw1 == pw2 {
-            return Ok(SecretString::new(pw1));
-        }
-        println!("passwords did not match; try again.");
-    }
-}
-
-/// Dial `hostname:port` directly (not through the daemon — this is a plain
-/// read-only network probe with no secrets involved), show the human the
-/// host key's SHA256 fingerprint, and on confirmation record it in
-/// `~/.sloosh/known_hosts` (DESIGN.md §4). The endpoint comes pre-resolved
-/// from the daemon's `ApproveLease` reply, which applies the same precedence
-/// a real connection will (vault entry — visible to the daemon now the
-/// approval unlocked it — then `~/.ssh/config`, then the literal alias), so
-/// vault-only aliases get their real address confirmed too.
-async fn confirm_and_record_host_key(host: &str, hostname: &str, port: u16) -> anyhow::Result<()> {
-    print!("Fetching host key for {host} ({hostname}:{port})... ");
-    std::io::stdout().flush().ok();
-    let key = match ssh::fetch_host_key(hostname, port).await {
-        Ok(key) => key,
-        Err(e) => {
-            println!("failed.");
-            println!(
-                "warning: could not fetch a host key for '{host}' to record automatically \
-                 ({e}); continuing without recording one — the connection will still refuse to \
-                 trust an unrecorded key. Run `ssh {host}` by hand once if you need to accept it \
-                 manually."
-            );
-            return Ok(());
-        }
-    };
-    println!("done.");
-
-    let fingerprint = key.fingerprint(russh::keys::HashAlg::Sha256);
-    print!(
-        "Host key fingerprint for {host} ({hostname}:{port}):\n    {fingerprint}\nTrust this key and remember it? [y/N] "
-    );
-    std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if answer.trim().eq_ignore_ascii_case("y") {
-        ssh::record_sloosh_known_host(hostname, port, &key)?;
-        println!("recorded in ~/.sloosh/known_hosts");
-    } else {
-        println!(
-            "not recorded — connecting to '{host}' will refuse to trust its key until this is \
-             resolved (record it here, or add it to ~/.ssh/known_hosts by hand)."
-        );
-    }
-    Ok(())
-}
-
-fn print_lease_activated(info: &LeaseActivatedInfo) {
-    println!(
-        "approved: {} (pid {}) can now access {}",
-        info.anchor_name.as_deref().unwrap_or("unknown process"),
-        info.anchor_pid,
-        info.hosts.join(", "),
-    );
-    println!(
-        "\nEscape hatch, only if needed (e.g. the caller isn't a descendant of this approval's \
-         anchor process): set SLOOSH_LEASE={} in that process's environment. This token is shown \
-         only this once.",
-        info.token
-    );
-}
-
-async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
-    require_tty("add")?;
-
-    let ssh_password = rpassword::prompt_password(format!("SSH password for {}: ", args.alias))?;
-
-    let vault_exists_resp =
-        bail_on_error_or_unexpected(send_request(&Request::VaultExists).await?)?;
-    let Response::VaultExists { exists } = vault_exists_resp else {
-        anyhow::bail!("daemon sent an unexpected reply to VaultExists: {vault_exists_resp:?}");
-    };
-    if !exists {
-        println!("No credential vault exists yet — this creates one.");
-    }
-    let master_password = prompt_master_password(exists)?;
-
-    let req = Request::AddCred {
-        alias: args.alias.clone(),
-        hostname: args.hostname,
-        port: args.port,
-        user: args.user,
-        ssh_password: SecretString::new(ssh_password),
-        master_password,
-        replace: false,
-        jump: args.jump,
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("added '{}' to the vault", args.alias);
-    Ok(())
-}
-
-async fn cmd_rm(args: RmArgs) -> anyhow::Result<()> {
-    require_tty("rm")?;
-
-    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
-    let req = Request::RmCred {
-        alias: args.alias.clone(),
-        master_password,
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("removed '{}' from the vault", args.alias);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------
-// put/get over SFTP (DESIGN.md §5-6).
-// ---------------------------------------------------------------------
-
-/// Resolve `path` to an absolute path against *this* process's current
-/// directory. Required before sending a local path to the daemon: the
-/// daemon reads/writes the local filesystem directly on the CLI's behalf
-/// (file content never crosses the socket), but the daemon's own working
-/// directory is not the caller's, so a relative path would resolve
-/// somewhere else entirely on that side. Existence is not required here —
-/// `get`'s local destination may not exist yet — this is pure path
-/// arithmetic, not a filesystem check.
-fn resolve_local_path(path: &str) -> anyhow::Result<String> {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        return Ok(path.to_string());
-    }
-    let cwd = std::env::current_dir().map_err(|e| {
-        anyhow::anyhow!(
-            "could not resolve local path '{path}' to an absolute path: could not determine \
-             the current directory ({e})"
-        )
+async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
+    require_tty("init")?;
+    cmd_skill_install(SkillInstallArgs {
+        agent: args.agent,
+        force: args.force_skill,
     })?;
-    Ok(cwd.join(p).to_string_lossy().into_owned())
+    let native_approval_available = explain_native_approval_setup();
+    let password = cmd_vault_init_inner().await?;
+    enroll_native_approval(password, native_approval_available).await
 }
 
-async fn cmd_put(args: PutArgs) -> anyhow::Result<()> {
-    let local_path = resolve_local_path(&args.local_path)?;
-    let req = Request::Put {
-        host: args.host,
-        local_path,
-        remote_path: args.remote_path,
-        session: args.session,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Transfer(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Put: {resp:?}");
-    };
-    println!(
-        "put: {} -> {}:{} ({} bytes)",
-        reply.local_path, reply.host, reply.remote_path, reply.bytes_transferred
-    );
-    Ok(())
-}
+const MACOS_NATIVE_APPROVAL_SETUP: &str = "Native approval setup (macOS):\n  Sloosh will store a protected copy of the vault Master Password in your login Keychain.\n  macOS may ask whether \"Sloosh Approval\" may access it. Choose \"Always Allow\" to avoid repeated prompts, or \"Allow\" for one-time access.\n  Follow any CLI Master Password prompt, then complete Touch ID.\n  Setup imports no SSH private keys and grants no host access. Each lease shows its exact host scope before biometric or PIN verification.";
 
-async fn cmd_get(args: GetArgs) -> anyhow::Result<()> {
-    let local_path = resolve_local_path(&args.local_path)?;
-    let req = Request::Get {
-        host: args.host,
-        remote_path: args.remote_path,
-        local_path,
-        session: args.session,
-        force: args.force,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Transfer(reply) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Get: {resp:?}");
-    };
-    println!(
-        "get: {}:{} -> {} ({} bytes)",
-        reply.host, reply.remote_path, reply.local_path, reply.bytes_transferred
-    );
-    Ok(())
-}
+const TERMINAL_APPROVAL_SETUP: &str = "Native approval is unavailable in this installation.\n  No Keychain or biometric setup is required. This is the normal flow on Linux and standalone/source builds.\n  Approve each pending lease in another terminal with the printed `sloosh approve <ID>` command.";
 
-// ---------------------------------------------------------------------
-// Port forwarding (DESIGN.md §6).
-// ---------------------------------------------------------------------
-
-async fn cmd_forward(action: ForwardAction) -> anyhow::Result<()> {
-    match action {
-        ForwardAction::Ls(args) => cmd_forward_ls(args).await,
-        ForwardAction::Stop(args) => cmd_forward_stop(args).await,
-        // `ls`/`stop` are the only real subcommand keywords (see
-        // `ForwardAction`'s doc comment); everything else is `<host>
-        // -L/-R spec`, captured raw and re-parsed here as `ForwardOpenArgs`.
-        ForwardAction::Open(raw_args) => cmd_forward_open(raw_args).await,
-    }
-}
-
-async fn cmd_forward_open(raw_args: Vec<String>) -> anyhow::Result<()> {
-    let ForwardOpenArgs {
-        host,
-        local,
-        remote,
-        json,
-    } = ForwardOpenArgs::try_parse_from(&raw_args).unwrap_or_else(|e| e.exit());
-    let direction = match (local, remote) {
-        (Some(spec), None) => ForwardDirection::Local { spec },
-        (None, Some(spec)) => ForwardDirection::Remote { spec },
-        _ => unreachable!("ForwardOpenArgs's ArgGroup enforces exactly one of -L/-R"),
-    };
-    let req = Request::Forward {
-        host,
-        direction,
-        lease_token: lease_token_from_env(),
-    };
-    let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
-    let Response::Forward(opened) = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to Forward: {resp:?}");
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&opened)?);
+fn native_approval_setup_message(available: bool) -> &'static str {
+    if available {
+        MACOS_NATIVE_APPROVAL_SETUP
     } else {
-        print_forward_opened_human(&opened);
+        TERMINAL_APPROVAL_SETUP
     }
-    Ok(())
 }
 
-fn print_forward_opened_human(o: &proto::ForwardOpened) {
-    println!(
-        "{}  {} -{} {}  listening on {}",
-        o.id, o.host, o.direction, o.spec, o.listen_addr
-    );
-    println!(
-        "(the daemon keeps this forward alive in the background; `sloosh forward stop {}` to end it)",
-        o.id
-    );
+fn explain_native_approval_setup() -> bool {
+    let available = crate::native_approval::is_available();
+    let message = native_approval_setup_message(available);
+    println!("{message}");
+    available
 }
 
-async fn cmd_forward_ls(args: ForwardLsArgs) -> anyhow::Result<()> {
-    let resp = bail_on_error_or_unexpected(send_request(&Request::ForwardLs).await?)?;
-    let Response::ForwardLs { forwards } = resp else {
-        anyhow::bail!("daemon sent an unexpected reply to ForwardLs: {resp:?}");
-    };
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&forwards)?);
-    } else if forwards.is_empty() {
-        println!("no active forwards");
-    } else {
-        for f in &forwards {
-            print_forward_summary_human(f);
-        }
-    }
-    Ok(())
-}
-
-fn print_forward_summary_human(f: &proto::ForwardSummary) {
-    println!(
-        "{}  {} -{} {}  {} open tunnel(s)  age {}s",
-        f.id, f.host, f.direction, f.spec, f.tunnel_count, f.age_secs
-    );
-}
-
-async fn cmd_forward_stop(args: ForwardStopArgs) -> anyhow::Result<()> {
-    let req = Request::ForwardStop {
-        id: args.id.clone(),
-    };
-    bail_on_error_or_unexpected(send_request(&req).await?)?;
-    println!("stopped {}", args.id);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------
-// `sloosh log` (DESIGN.md §4) — reads ~/.sloosh/audit.jsonl directly, no
-// daemon round-trip needed: the CLI and daemon run as the same user.
-// ---------------------------------------------------------------------
-
-async fn cmd_log(args: LogArgs) -> anyhow::Result<()> {
-    let path = audit::audit_log_path();
-    let raw_lines = audit::read_raw_lines(&path)
-        .map_err(|e| anyhow::anyhow!("could not read audit log at {}: {e}", path.display()))?;
-
-    let mut parsed: Vec<(String, serde_json::Value)> = Vec::new();
-    for line in raw_lines {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            parsed.push((line, v));
-        }
-        // Malformed lines are silently skipped here (audit::record's own
-        // best-effort posture means a torn write is expected to be rare and
-        // not worth failing `sloosh log` over).
-    }
-
-    let filtered: Vec<(String, serde_json::Value)> = parsed
-        .into_iter()
-        .filter(|(_, v)| {
-            args.host
-                .as_deref()
-                .is_none_or(|h| v.get("host").and_then(|x| x.as_str()) == Some(h))
-        })
-        .collect();
-
-    let start = filtered.len().saturating_sub(args.count);
-    let tail = &filtered[start..];
-
-    if tail.is_empty() {
-        match &args.host {
-            Some(h) => println!("no audit log entries for host '{h}'"),
-            None => println!("no audit log entries yet (~/.sloosh/audit.jsonl)"),
-        }
+async fn enroll_native_approval(
+    password: Option<SecretString>,
+    available: bool,
+) -> anyhow::Result<()> {
+    if !available {
         return Ok(());
     }
-
-    if args.json {
-        for (raw, _) in tail {
-            println!("{raw}");
+    let password = match password {
+        Some(password) => password,
+        None => {
+            println!("Enter the vault Master Password once to continue.");
+            prompt_master_password(true)?
         }
-    } else {
-        for (_, v) in tail {
-            print_audit_event_human(v);
+    };
+    crate::native_approval::enroll(&password)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not enable Touch ID approval: {error}"))?;
+    println!("Touch ID approval enabled. Future requests show the exact host scope first.");
+    Ok(())
+}
+
+fn cmd_skill(action: SkillAction) -> anyhow::Result<()> {
+    match action {
+        SkillAction::Install(args) => cmd_skill_install(args),
+        SkillAction::Status(args) => cmd_skill_status(args),
+    }
+}
+
+fn cmd_skill_install(args: SkillInstallArgs) -> anyhow::Result<()> {
+    for target in skill_targets(args.agent)? {
+        let outcome = skill::install_target(&target, args.force)?;
+        let path = target.directory.display();
+        match outcome {
+            skill::InstallOutcome::Installed => {
+                println!("installed sloosh Skill for {} at {path}", target.agent);
+            }
+            skill::InstallOutcome::Current => {
+                println!("sloosh Skill for {} is current at {path}", target.agent);
+            }
+            skill::InstallOutcome::CurrentExternal => {
+                println!(
+                    "externally managed Skill for {} already matches this sloosh version at {path}",
+                    target.agent
+                );
+            }
+            skill::InstallOutcome::Updated => {
+                println!("updated sloosh Skill for {} at {path}", target.agent);
+            }
+            skill::InstallOutcome::PreservedExternal => {
+                println!(
+                    "kept externally managed Skill for {} at {path}; use --force to replace it",
+                    target.agent
+                );
+            }
+            skill::InstallOutcome::PreservedModified => {
+                println!(
+                    "kept locally modified sloosh Skill for {} at {path}; use --force to replace it",
+                    target.agent
+                );
+            }
         }
     }
     Ok(())
 }
 
-fn print_audit_event_human(v: &serde_json::Value) {
-    let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("?");
-    let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("?");
-    let mut fields = String::new();
-    if let Some(obj) = v.as_object() {
-        let mut keys: Vec<&String> = obj.keys().filter(|k| *k != "ts" && *k != "event").collect();
-        keys.sort();
-        for k in keys {
-            fields.push_str(&format!(" {k}={}", render_field_value(&obj[k])));
-        }
+fn cmd_skill_status(args: SkillStatusArgs) -> anyhow::Result<()> {
+    for target in skill_targets(args.agent)? {
+        let state = match skill::inspect_target(&target)? {
+            skill::SkillStatus::Missing => "missing",
+            skill::SkillStatus::CurrentManaged => "current (managed by sloosh)",
+            skill::SkillStatus::CurrentExternal => "current (externally managed)",
+            skill::SkillStatus::UpgradeAvailable => "upgrade available",
+            skill::SkillStatus::Modified => "locally modified",
+            skill::SkillStatus::External => "externally managed",
+        };
+        println!("{}: {state} ({})", target.agent, target.directory.display());
     }
-    println!("{ts}  {event}{fields}");
+    Ok(())
 }
 
-fn render_field_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+fn skill_targets(agent: SkillAgent) -> anyhow::Result<Vec<skill::SkillTarget>> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("HOME is not set; cannot locate the Agent Skill directory")
+        })?;
+    skill::resolve_targets_from_home(Path::new(&home), agent)
+}
+
+/// Read-only desktop seam for the embedded Skill's auto-detected targets.
+pub fn embedded_skill_ready() -> anyhow::Result<bool> {
+    Ok(skill_targets(SkillAgent::Auto)?.iter().all(|target| {
+        matches!(
+            skill::inspect_target(target),
+            Ok(skill::SkillStatus::CurrentManaged | skill::SkillStatus::CurrentExternal)
+        )
+    }))
+}
+
+/// Install/update the embedded Skill without exposing a general process API.
+pub fn install_embedded_skill() -> anyhow::Result<bool> {
+    for target in skill_targets(SkillAgent::Auto)? {
+        skill::install_target(&target, false)?;
     }
+    embedded_skill_ready()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     // These tests deliberately never call `std::env::set_current_dir` (that
     // mutates process-global state and would race with every other test
@@ -865,5 +314,183 @@ mod tests {
         let cwd = std::env::current_dir().expect("current dir");
         let expected = cwd.join("file.txt").to_string_lossy().into_owned();
         assert_eq!(resolve_local_path("file.txt").unwrap(), expected);
+    }
+
+    #[test]
+    fn daemon_identity_refusal_is_not_reported_as_not_running() {
+        let denied = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "server identity could not be verified",
+        );
+        assert!(!daemon_is_not_running_error(&denied));
+        let message = daemon_connect_error(Path::new("/tmp/sloosh.sock"), denied).to_string();
+        assert!(message.contains("refusing to use the daemon socket"));
+        assert!(message.contains("server identity could not be verified"));
+
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(daemon_is_not_running_error(&std::io::Error::new(
+                kind,
+                "daemon absent"
+            )));
+        }
+        assert!(!daemon_is_not_running_error(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "connect timed out"
+        )));
+    }
+
+    #[test]
+    fn audit_string_fields_escape_terminal_controls() {
+        let rendered = render_field_value(&serde_json::Value::String(
+            "host\n\u{1b}[31mforged".to_string(),
+        ));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn legacy_host_metadata_escapes_terminal_controls() {
+        let host = HostSummary {
+            alias: "web\nforged".to_string(),
+            hostname: "server\u{1b}[31m.example".to_string(),
+            port: Some(22),
+            user: Some("deploy\tadmin".to_string()),
+            auth: proto::HostAuthKind::Agent,
+            route: HostRoute::Direct,
+        };
+
+        assert_eq!(escape_terminal_controls(&host.alias), "web\\nforged");
+        assert_eq!(display_host_endpoint(&host), "server\\u{1b}[31m.example:22");
+        assert_eq!(
+            escape_terminal_controls(host.user.as_deref().unwrap()),
+            "deploy\\tadmin"
+        );
+    }
+
+    #[test]
+    fn native_approval_setup_explains_macos_keychain_before_biometrics() {
+        let message = native_approval_setup_message(true);
+        assert!(message.contains("login Keychain"));
+        assert!(message.contains("Sloosh Approval"));
+        assert!(message.contains("Always Allow"));
+        assert!(message.contains("exact host scope before biometric or PIN verification"));
+    }
+
+    #[test]
+    fn terminal_approval_setup_explains_linux_without_keychain_work() {
+        let message = native_approval_setup_message(false);
+        assert!(message.contains("normal flow on Linux and standalone/source builds"));
+        assert!(message.contains("No Keychain or biometric setup is required"));
+        assert!(message.contains("sloosh approve <ID>"));
+        assert!(!message.contains("Touch ID approval enabled"));
+    }
+
+    fn transfer_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sloosh-cli-transfer-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+
+    #[tokio::test]
+    async fn upload_file_is_opened_by_cli_without_total_size_limit() {
+        let path = transfer_test_path("upload");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        let file = open_local_upload(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 128 * 1024 * 1024);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn download_write_is_atomic_and_refuses_clobber_without_force() {
+        let path = transfer_test_path("download");
+        std::fs::write(&path, b"keep-me").unwrap();
+
+        let err = match LocalDownload::open(&path, false).await {
+            Ok(_) => panic!("existing destination should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--force"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep-me");
+
+        let mut download = LocalDownload::open(&path, true).await.unwrap();
+        download.write_chunk(b"replace").await.unwrap();
+        download.write_chunk(b"ment").await.unwrap();
+        download.finish().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn download_mode_follows_caller_umask() {
+        const CHILD_MARKER: &str = "SLOOSH_DOWNLOAD_UMASK_CHILD";
+        const DESTINATION: &str = "SLOOSH_DOWNLOAD_UMASK_DESTINATION";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(DESTINATION).expect("child destination path"),
+            );
+            let mut download = LocalDownload::open(&path, false).await.unwrap();
+            download.write_chunk(b"umask").await.unwrap();
+            download.finish().await.unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "0666 creation mode under umask 027");
+
+            let force_path = path.with_extension("force");
+            std::fs::write(&force_path, b"old").unwrap();
+            std::fs::set_permissions(&force_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let mut forced = LocalDownload::open(&force_path, true).await.unwrap();
+            forced.write_chunk(b"new").await.unwrap();
+            forced.finish().await.unwrap();
+            let force_mode = std::fs::metadata(&force_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(force_mode, 0o640, "forced replacement follows umask");
+
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(force_path);
+            return;
+        }
+
+        let path = transfer_test_path("download-umask");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 027; exec \"$@\"")
+            .arg("sh")
+            .arg(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("cli::tests::download_mode_follows_caller_umask")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(DESTINATION, &path)
+            .status()
+            .expect("run isolated-umask child test");
+        assert!(status.success(), "isolated-umask child test failed");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_removes_temp_without_creating_destination() {
+        let path = transfer_test_path("interrupted-download");
+        let _ = std::fs::remove_file(&path);
+
+        let mut download = LocalDownload::open(&path, false).await.unwrap();
+        download.write_chunk(b"partial bytes").await.unwrap();
+        let temp = download.temp.clone();
+        assert!(temp.exists());
+        drop(download);
+
+        assert!(!temp.exists(), "partial temp file must be removed");
+        assert!(
+            !path.exists(),
+            "an interrupted download must not create the final destination"
+        );
     }
 }

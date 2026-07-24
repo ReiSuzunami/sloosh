@@ -1,228 +1,152 @@
 # sloosh
 
+English | [简体中文](./README.zh-CN.md)
+
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
-`sloosh` is an SSH operations tool built for coding agents. It fixes two
-pain points that plain `ssh`/subprocess calls have when an agent drives
-them: **state doesn't persist** — every shell call starts fresh, losing
-`cwd`, environment variables, and background jobs — and **credentials
-aren't isolated** — the agent typically needs the password or key inline
-to connect at all. `sloosh` keeps a long-lived remote shell per host behind
-a background daemon, and gates all host access behind a human-approved,
-out-of-band lease so the agent never sees a credential.
+Persistent SSH sessions with human-approved credential access for coding agents.
 
 ## Install
 
-```
-cargo build --release
-# binary at target/release/sloosh — put it on your PATH
-```
+Download the release file for your platform from the
+[latest GitHub Release](https://github.com/ReiSuzunami/sloosh/releases/latest):
 
-## 60-second quickstart
+- macOS DMG (Apple silicon or Intel): `Sloosh-<version>-macos-universal.dmg`
+- macOS CLI archive (Apple silicon or Intel): `sloosh-macos-universal.tar.gz`
+- Linux x86_64: `sloosh-linux-x86_64-musl.tar.gz`
 
-**Human steps** (one-time setup, run in your own terminal):
+For the DMG, double-click `Install Sloosh`. It copies `Sloosh.app` to
+Applications, creates `~/.local/bin/sloosh` when that path is available,
+ejects the disk image, and offers to move the DMG to Trash. An unrelated item
+already at the CLI path is preserved. Open Sloosh to install the embedded
+Agent Skill, initialize the vault, and enable Touch ID or an optional 6-digit
+approval PIN. Before enrollment, the app explains what is stored in the macOS
+login Keychain and what to expect from its native access prompt. The complete
+CLI remains installed alongside the app.
+During an update, the installer explicitly asks before quitting a running
+Sloosh app; it force quits only after a 5-second graceful-exit timeout.
 
-```
-sloosh vault init                              # set a master password for the credential vault
-sloosh add myhost --hostname 1.2.3.4 --user deploy   # enroll a host under an alias
-# ... an agent now runs `sloosh request myhost`, prints an approval command ...
-sloosh approve <request-id>                    # paste it here, enter the master password
-```
+For an archive, extract it, then install the binary somewhere on `PATH`:
 
-**Agent steps:**
-
-```
-sloosh request myhost                          # ask for access; show the printed command to your human, then stop and wait
-sloosh run myhost "npm test"                   # once approved, run commands in a persistent shell
-```
-
-See `sloosh <command> --help` for the full flag reference on any subcommand.
-
-## Security model
-
-- The daemon holds SSH credentials (in an encrypted vault); the agent
-  process never sees a password, key, or vault content — only host
-  aliases.
-- Access is granted per-host via a **lease**, not a blanket unlock —
-  requesting one host never authorizes another.
-- Bastion paths are first-class: `ProxyJump` chains (multi-hop) and
-  vault-level jump hosts are followed automatically, a lease request
-  expands to cover every hop on the path, and each vault-backed hop is
-  re-checked right before it's dialed.
-- Leases are approved out of band, by a human, in a separate terminal —
-  the agent cannot approve its own request.
-- A lease is bound to the requesting process's ancestry (PID + start
-  time), so subagents spawned under an authorized agent inherit access
-  automatically, with zero extra configuration.
-- Leases expire on idle timeout; expiry revokes host access but never
-  kills the underlying shell session, which reconnects cleanly once
-  access is re-approved. Port forwards are the one exception: a tunnel is
-  live network access, so it's torn down the moment its lease goes away.
-
-## How it works
-
-`sloosh` is a single binary that runs as both the CLI you invoke and a
-long-lived background daemon (`sloosh daemon run`), auto-started on first
-use. The CLI and daemon talk over a Unix domain socket (mode `0600`,
-same-user only) using a newline-delimited JSON protocol, so the exchange
-stays debuggable with plain tools like `nc -U`.
-
-The daemon keeps one persistent PTY shell per host session alive on the
-remote end — `cd`, exported environment variables, and background jobs
-all survive across separate `sloosh run` calls, because each call talks
-to the same living shell rather than opening a fresh subprocess. Command
-output is framed with a generated sentinel marker so the daemon can tell
-exactly where a command's output ends and what its exit code was, even
-though everything arrives as one raw PTY byte stream; a scrubber strips
-those markers (and ANSI noise) before anything reaches you.
-
-Access to a host is never implicit. An agent calls `sloosh request <host>`,
-which prints an approval command; a human runs that command in a
-*separate* terminal and enters the vault's master password to grant a
-time-limited lease. The daemon uses kernel-level peer credentials
-(`SO_PEERCRED`/`LOCAL_PEERPID`) to identify the calling process's ancestry
-and binds the lease to it, so subagents spawned by an already-authorized
-agent inherit access automatically — with zero extra configuration — while
-credentials themselves never leave the vault or cross into agent-visible
-output.
-
-For the full design (wire protocol, session/output model, audit log, vault
-crypto), see [`DESIGN.md`](./DESIGN.md) (the authoritative design document,
-in Chinese) or [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) (an English
-overview).
-
-## Commands
-
-One line per subcommand — see `sloosh <command> --help` for the full flag
-reference on any of them.
-
-| Command | Description |
-|---|---|
-| `run` | Run a command in a host's default (or named) session, blocking until it finishes or times out. |
-| `peek` | Fetch output a session has produced since the last peek. |
-| `send` | Send raw keystrokes to a session's PTY (e.g. to answer an interactive prompt). |
-| `interrupt` | Send Ctrl-C to a session. |
-| `open` | Explicitly open a new named parallel session on a host. |
-| `ls` | List known sessions and their state. |
-| `kill` | Kill a session (terminates the remote shell). |
-| `request` | Request an access lease for one or more hosts (agent side of authorization). |
-| `approve` | Approve a pending lease request (human side, run in another terminal). |
-| `add` | Add a credential to the vault. Interactive and human-only: there is no flag to pass a secret. |
-| `rm` | Remove a credential from the vault. |
-| `vault` | Manage the credential vault itself (e.g. first-time initialization). |
-| `put` | Upload a local file to a host over SFTP. |
-| `get` | Download a remote file from a host over SFTP. |
-| `forward` | Open a lease-gated `-L`/`-R` port forward through a host; `forward ls` and `forward stop` manage them. |
-| `status` | Show daemon/session/lease status — the anchor command when unsure what's going on. |
-| `daemon` | Manage the sloosh daemon process directly (normally auto-started on demand). |
-| `log` | Show the audit log. |
-
-## Using with coding agents
-
-`skills/sloosh/` is a ready-made [Agent Skill](https://agentskills.io)
-that teaches an agent `sloosh`'s mental model (sessions are persistent
-shells; every host needs a human-approved lease; run `sloosh status` when
-lost) without duplicating the `--help` flag reference. The same skill
-works in every agent that speaks the SKILL.md standard — install it
-whichever way fits your setup:
-
-**Claude Code** — via the [nerv](https://github.com/ReiSuzunami/nerv)
-plugin marketplace:
-
-```
-/plugin marketplace add ReiSuzunami/nerv
-/plugin install sloosh@nerv
+```sh
+install -d "$HOME/.local/bin"
+install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
+sloosh --version
 ```
 
-**Codex** — same marketplace, via the Codex CLI:
+See the [installation guide](./docs/getting-started/installation.md) for checksum
+verification and platform notes.
 
-```
+## First-time setup
+
+The recommended agent-first flow is to install the Agent Skill, then let it
+check for the `sloosh` binary and guide the human through installation:
+
+```sh
+# Codex
 codex plugin marketplace add ReiSuzunami/nerv
 codex plugin add sloosh@nerv
-```
 
-**Any agent, via the [skills CLI](https://github.com/vercel-labs/skills)**
-(Claude Code, Codex, Cursor, and ~70 others):
-
-```
+# Any Agent Skills-compatible agent
 npx skills add ReiSuzunami/sloosh
 ```
 
-**Manually** — copy the skill directory into your agent's skills folder:
+Claude Code users can add `ReiSuzunami/nerv` as a plugin marketplace and
+install `sloosh@nerv`. These package commands distribute the Skill only; the
+Skill asks before proposing any binary installation.
 
-```
-cp -r skills/sloosh ~/.claude/skills/sloosh   # Claude Code
-cp -r skills/sloosh ~/.agents/skills/sloosh   # Codex (and other .agents/skills readers)
-```
+If the binary is installed first, run this in a human terminal:
 
-## Development
-
-```
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all --check
+```sh
+sloosh init
 ```
 
-All three gates (tests, clippy, fmt) must pass cleanly; they're what CI
-runs on every PR.
+`sloosh init` installs the Skill embedded in the binary and initializes the
+credential vault. The macOS DMG build also enrolls Touch ID for later lease
+requests; before enrollment, the CLI explains the login Keychain item, the
+possible `Sloosh Approval` prompt, and the difference between `Allow` and
+`Always Allow`. Rerunning `sloosh init` enables it for an existing vault. It
+auto-detects Codex and Claude Code; use
+`sloosh skill status` to inspect the result. The binary never invokes `npx` or
+an agent marketplace itself.
 
-Most of the test suite runs without any external dependency. The
-integration tests in `tests/ssh_session.rs`, `tests/forward.rs`, and
-`tests/proxy_jump.rs` exercise a real SSH host end-to-end (sessions,
-tunnels, and vault-backed jump chains respectively) and are gated behind
-environment variables so they don't run (or hang) in CI/sandboxes by
-default:
+After enrollment, `sloosh request <host-alias>` shows a native exact host-list
+confirmation, then completes approval with Touch ID or the optional approval
+PIN, without requiring another terminal. The PIN has persistent backoff and
+disables after 15 failed attempts; it is independent from the Master Password
+attempt budget. Cancellation, missing enrollment, and source/archive builds
+fall back to `sloosh approve`. The first request involving an unknown SSH host
+key also uses terminal approval so the human can verify its fingerprint.
 
+Linux needs no Keychain, Touch ID, or native-helper permission. At the end of
+`sloosh init`, the CLI explains that later pending leases are approved from
+another terminal with the printed `sloosh approve <ID>` command.
+
+## Manage hosts
+
+The desktop app includes a locked Hosts view for vault-backed connection
+profiles. Authentication is explicit: SSH agent, an encrypted vault password,
+or an unencrypted Ed25519/ECDSA private-key path. RSA and encrypted private
+keys must be loaded into ssh-agent. Routes are direct, through another managed
+host, or an advanced OpenSSH ProxyJump expression. Unlock once with Touch ID,
+the 6-digit Sloosh PIN, or Master Password; the Rust desktop process keeps a
+zeroizing session until the shared 1/5/15/30-minute idle timeout. It locks on
+macOS sleep, screen lock or user switch, manual lock, app exit, or the fixed
+8-hour ceiling. Master Password and PIN entry stay in the native helper. The
+desktop SSH Password field is transient, crosses the
+local Tauri command boundary as a redacted secret, and is cleared after submit.
+The CLI provides the same human-only management surface:
+
+```sh
+sloosh host list
+sloosh host show myhost
+sloosh host add myhost --hostname server.example.com --user deploy --auth agent
+sloosh host edit myhost --port 2222 --via bastion
+sloosh host edit myhost --auth key-file --key-file ~/.ssh/id_ed25519
+sloosh host rm myhost
+sloosh vault timeout 15
 ```
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test ssh_session -- --test-threads=1
-SLOOSH_TEST_SSH_HOST=myhost cargo test --test forward -- --test-threads=1
-# proxy_jump additionally needs the host's SSH password (it builds a
-# throwaway vault to exercise password auth through the chain):
-SLOOSH_TEST_SSH_HOST=user@host SLOOSH_TEST_SSH_PASSWORD=... \
-  cargo test --test proxy_jump -- --test-threads=1
+
+The smallest first connection after adding `myhost` is:
+
+```sh
+sloosh request myhost
+# If request prints a pending approval command, a human runs it in another terminal:
+sloosh approve REQUEST_ID_FROM_OUTPUT
+sloosh run myhost "uname -a"
 ```
 
-`myhost` can be an alias resolvable via `~/.ssh/config` or a literal
-`user@host`/`host`. Single-threaded is required — each test points
-`$SLOOSH_HOME` at its own temp directory, and that isolation (which keeps
-the run from ever touching your real `~/.sloosh/vault`) only holds with one
-test running at a time. See the module doc comment in
-[`tests/ssh_session.rs`](./tests/ssh_session.rs) for details.
+Continue only after `request` reports `authorized`. A macOS DMG installation
+may complete approval with Touch ID or PIN without the second terminal.
 
-See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full contribution flow,
-including which areas of the codebase get extra review scrutiny.
+`sloosh vault timeout` shows the current value. Setting it from either the GUI
+or CLI updates both the desktop vault idle period and idle CLI/Agent leases;
+per-request host approval and the 8-hour absolute lease limit remain separate.
 
-## Platform support
+Aliases are stable lease and ProxyJump identities, so editing cannot rename an
+alias. Existing `sloosh add` and `sloosh rm` commands remain available for
+compatibility. None of these commands prints authentication material.
+ProxyJump cycles and routes deeper than eight hops fail before approval; Sloosh
+never asks a human to approve a silently truncated host list.
 
-macOS and Linux today. Windows support (a Named Pipe transport in place of
-Unix domain sockets, plus a PID-reuse-aware process-ancestry check) is
-planned — see Roadmap below.
+## Build from source
 
-## Roadmap
+Requires Rust 1.85 or newer and a working C/C++ build toolchain.
 
-Phase 2, roughly in order:
+```sh
+git clone https://github.com/ReiSuzunami/sloosh.git
+cd sloosh
+cargo build --release --locked
+```
 
-- Windows support (Named Pipe transport).
-- `--resilient` sessions anchored to a remote `tmux`, so a dropped SSH
-  connection doesn't kill the session.
-- Touch ID / Windows Hello-gated approvals, so re-approving doesn't mean
-  re-typing the master password (the vault's own encryption stays
-  self-contained — no OS keychain involved).
-- Verified compatibility with 1Password/Bitwarden `ssh-agent`
-  implementations (the ssh_config `IdentityAgent` directive is already
-  honored).
+The binary is written to `target/release/sloosh`.
+
+## Community
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md), [SUPPORT.md](./SUPPORT.md), and
+[SECURITY.md](./SECURITY.md) before opening a pull request or issue.
 
 ## License
 
-Licensed under either of
-
-- [MIT license](./LICENSE-MIT)
-- [Apache License, Version 2.0](./LICENSE-APACHE)
-
-at your option, per the usual Rust convention. Unless you explicitly state
-otherwise, any contribution intentionally submitted for inclusion in this
-project shall be dual-licensed as above, without any additional terms or
-conditions.
+Licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at your option.

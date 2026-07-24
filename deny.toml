@@ -1,0 +1,43 @@
+[advisories]
+version = 2
+unmaintained = "workspace"
+unused-ignored-advisory = "allow"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Local RSA private-key signing is rejected; RSA remains only for host keys and external ssh-agent identities." },
+    { id = "RUSTSEC-2026-0194", reason = "Transitive plist XML parsing is limited to trusted local Tauri build and bundle metadata until plist upgrades quick-xml." },
+    { id = "RUSTSEC-2026-0195", reason = "plist uses quick_xml::Reader, not the affected NsReader namespace resolver; remove after the next compatible plist upgrade." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
