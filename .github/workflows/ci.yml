@@ -103,6 +103,7 @@ jobs:
       - name: Check frontend
         run: |
           corepack enable
+          corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui check
           pnpm --dir gui test:unit

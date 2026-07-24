@@ -71,6 +71,7 @@ jobs:
       - name: Check desktop frontend
         run: |
           corepack enable
+          corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui check
           pnpm --dir gui test:unit
@@ -107,6 +108,7 @@ jobs:
         run: |
           cargo build --release --locked --target aarch64-apple-darwin
           corepack enable
+          corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui build
           cargo build --manifest-path gui/src-tauri/Cargo.toml \
@@ -154,6 +156,7 @@ jobs:
         run: |
           cargo build --release --locked --target x86_64-apple-darwin
           corepack enable
+          corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
           pnpm --dir gui build
           cargo build --manifest-path gui/src-tauri/Cargo.toml \
