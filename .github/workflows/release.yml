@@ -228,7 +228,7 @@ jobs:
           mkdir -p "dist/root/$package"
           install -m 0755 target/x86_64-unknown-linux-musl/release/sloosh \
             "dist/root/$package/sloosh"
-          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT \
+          install -m 0644 README.md README.en.md LICENSE-APACHE LICENSE-MIT \
             "dist/root/$package/"
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime="@$source_date_epoch" -C dist/root -cf - "$package" |
@@ -279,7 +279,7 @@ jobs:
           [[ " $archs " == *" arm64 "* ]]
           [[ " $archs " == *" x86_64 "* ]]
           test "$("dist/root/$package/sloosh" --version)" = "sloosh $version"
-          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT \
+          install -m 0644 README.md README.en.md LICENSE-APACHE LICENSE-MIT \
             "dist/root/$package/"
           source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
           archive_time="$(date -u -r "$source_date_epoch" +%Y%m%d%H%M.%S)"

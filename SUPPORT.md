@@ -6,7 +6,7 @@ branch. Supported platforms and prerequisites are listed in the
 
 Before opening an issue:
 
-1. Read the [README](README.md), installation guide, and command `--help`.
+1. Read the [README](README.en.md), installation guide, and command `--help`.
 2. Search existing issues.
 3. Retry with the latest supported release when practical.
 

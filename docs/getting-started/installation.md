@@ -2,13 +2,15 @@
 
 English | [简体中文](installation.zh-CN.md)
 
-GitHub Releases are the primary installation channel. They provide prebuilt
-binaries, so users do not need Rust or a C compiler. crates.io is a planned
-secondary source-install channel for Rust users and always compiles locally.
+GitHub Releases are the primary installation channel once a release is
+available. They provide prebuilt binaries, so users do not need Rust or a C
+compiler. If the latest-release page has no version yet, use the source-build
+steps below. crates.io is a planned secondary source-install channel for Rust
+users and always compiles locally.
 
 ## Prebuilt binaries
 
-Download these files from the
+When available, download these files from the
 [latest release](https://github.com/ReiSuzunami/sloosh/releases/latest):
 
 | Platform | File |
@@ -183,4 +185,4 @@ The installed binary normally lands in `$HOME/.cargo/bin`. crates.io is useful
 for Rust developers, but it is not the no-build installation path.
 
 For a repository checkout, follow the concise
-[source-build steps in the README](../../README.md#build-from-source).
+[source-build steps in the README](../../README.en.md#build-from-source).

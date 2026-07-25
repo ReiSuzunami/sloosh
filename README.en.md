@@ -1,0 +1,168 @@
+# sloosh
+
+[简体中文](./README.md) | English
+
+[![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+Persistent SSH sessions with human-approved credential access for coding agents.
+
+## Install
+
+Once prebuilt versions are available, download the file for your platform from
+the [latest GitHub Release](https://github.com/ReiSuzunami/sloosh/releases/latest).
+If that page has no release yet, use the source-build instructions below:
+
+- macOS DMG (Apple silicon or Intel): `Sloosh-<version>-macos-universal.dmg`
+- macOS CLI archive (Apple silicon or Intel): `sloosh-macos-universal.tar.gz`
+- Linux x86_64: `sloosh-linux-x86_64-musl.tar.gz`
+
+For the DMG, double-click `Install Sloosh`. It copies `Sloosh.app` to
+Applications, creates `~/.local/bin/sloosh` when that path is available,
+ejects the disk image, and offers to move the DMG to Trash. An unrelated item
+already at the CLI path is preserved. Open Sloosh to install the embedded
+Agent Skill, initialize the vault, and enable Touch ID or an optional 6-digit
+approval PIN. Before enrollment, the app explains what is stored in the macOS
+login Keychain and what to expect from its native access prompt. The complete
+CLI remains installed alongside the app.
+During an update, the installer explicitly asks before quitting a running
+Sloosh app; it force quits only after a 5-second graceful-exit timeout.
+
+For an archive, extract it, then install the binary somewhere on `PATH`:
+
+```sh
+install -d "$HOME/.local/bin"
+install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
+sloosh --version
+```
+
+See the [installation guide](./docs/getting-started/installation.md) for checksum
+verification and platform notes.
+
+## Agent-guided setup
+
+**Paste the entire prompt below to your agent. / 将下面的完整 Prompt 粘贴给你的 Agent。**
+
+```text
+You are helping me install and initialize sloosh.
+
+1. Detect my operating system and architecture. Run
+   `command -v sloosh && sloosh --version` to check whether sloosh is already
+   installed. If it is missing or outdated, use only the official repository
+   at `https://github.com/ReiSuzunami/sloosh`. Check
+   `https://github.com/ReiSuzunami/sloosh/releases/latest`: when a release
+   exists, explain the suitable DMG or archive and verify `SHA256SUMS`; when no
+   release exists, explain the Rust 1.85+ source-build option. Ask before any
+   installation. Never use `curl | sh`, silently invoke a package manager,
+   bypass Gatekeeper or other platform protections, or request/display
+   passwords, SSH keys, vault secrets, or lease tokens.
+2. Once the binary is available, explain what `sloosh init` will do and ask me
+   to run it in my own interactive terminal. Do not run `sloosh init`, fake a
+   TTY, or enter, read, or repeat any secret. On macOS, explain the Keychain,
+   `Sloosh Approval`, Touch ID, and optional approval PIN prompts when relevant.
+   On Linux or a standalone build, explain that later lease approval happens
+   in another human terminal.
+3. Wait for me to confirm initialization is complete. Then run only the
+   read-only checks `sloosh skill status --agent auto` and `sloosh status`,
+   report the results, and explain the next safe step. Host access must always
+   remain subject to out-of-band human approval.
+```
+
+The agent guides installation and verifies the result, but the human retains
+all credential and approval authority. No external Agent marketplace is
+required: the installed binary embeds the Skill.
+
+If you are setting up without an agent, run this in your own terminal:
+
+```sh
+sloosh init
+```
+
+`sloosh init` installs the Skill embedded in the binary and initializes the
+credential vault. The macOS DMG build also enrolls Touch ID for later lease
+requests; before enrollment, the CLI explains the login Keychain item, the
+possible `Sloosh Approval` prompt, and the difference between `Allow` and
+`Always Allow`. Rerunning `sloosh init` enables it for an existing vault. It
+auto-detects Codex and Claude Code; use
+`sloosh skill status` to inspect the result. The binary never invokes `npx` or
+an agent marketplace itself.
+
+After enrollment, `sloosh request <host-alias>` shows a native exact host-list
+confirmation, then completes approval with Touch ID or the optional approval
+PIN, without requiring another terminal. The PIN has persistent backoff and
+disables after 15 failed attempts; it is independent from the Master Password
+attempt budget. Cancellation, missing enrollment, and source/archive builds
+fall back to `sloosh approve`. The first request involving an unknown SSH host
+key also uses terminal approval so the human can verify its fingerprint.
+
+Linux needs no Keychain, Touch ID, or native-helper permission. At the end of
+`sloosh init`, the CLI explains that later pending leases are approved from
+another terminal with the printed `sloosh approve <ID>` command.
+
+## Manage hosts
+
+The desktop app includes a locked Hosts view for vault-backed connection
+profiles. Authentication is explicit: SSH agent, an encrypted vault password,
+or an unencrypted Ed25519/ECDSA private-key path. RSA and encrypted private
+keys must be loaded into ssh-agent. Routes are direct, through another managed
+host, or an advanced OpenSSH ProxyJump expression. Unlock once with Touch ID,
+the 6-digit Sloosh PIN, or Master Password; the Rust desktop process keeps a
+zeroizing session until the shared 1/5/15/30-minute idle timeout. It locks on
+macOS sleep, screen lock or user switch, manual lock, app exit, or the fixed
+8-hour ceiling. Master Password and PIN entry stay in the native helper. The
+desktop SSH Password field is transient, crosses the
+local Tauri command boundary as a redacted secret, and is cleared after submit.
+The CLI provides the same human-only management surface:
+
+```sh
+sloosh host list
+sloosh host show myhost
+sloosh host add myhost --hostname server.example.com --user deploy --auth agent
+sloosh host edit myhost --port 2222 --via bastion
+sloosh host edit myhost --auth key-file --key-file ~/.ssh/id_ed25519
+sloosh host rm myhost
+sloosh vault timeout 15
+```
+
+The smallest first connection after adding `myhost` is:
+
+```sh
+sloosh request myhost
+# If request prints a pending approval command, a human runs it in another terminal:
+sloosh approve REQUEST_ID_FROM_OUTPUT
+sloosh run myhost "uname -a"
+```
+
+Continue only after `request` reports `authorized`. A macOS DMG installation
+may complete approval with Touch ID or PIN without the second terminal.
+
+`sloosh vault timeout` shows the current value. Setting it from either the GUI
+or CLI updates both the desktop vault idle period and idle CLI/Agent leases;
+per-request host approval and the 8-hour absolute lease limit remain separate.
+
+Aliases are stable lease and ProxyJump identities, so editing cannot rename an
+alias. Existing `sloosh add` and `sloosh rm` commands remain available for
+compatibility. None of these commands prints authentication material.
+ProxyJump cycles and routes deeper than eight hops fail before approval; Sloosh
+never asks a human to approve a silently truncated host list.
+
+## Build from source
+
+Requires Rust 1.85 or newer and a working C/C++ build toolchain.
+
+```sh
+git clone https://github.com/ReiSuzunami/sloosh.git
+cd sloosh
+cargo build --release --locked
+```
+
+The binary is written to `target/release/sloosh`.
+
+## Community
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md), [SUPPORT.md](./SUPPORT.md), and
+[SECURITY.md](./SECURITY.md) before opening a pull request or issue.
+
+## License
+
+Licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at your option.

@@ -6,7 +6,7 @@ changes and test their failure paths.
 ## Setup
 
 Requires current stable Rust plus MSRV 1.85. The
-[README](README.md#build-from-source) covers checkout and release builds.
+[README](README.en.md#build-from-source) covers checkout and release builds.
 
 ```sh
 rustup toolchain install stable 1.85.0

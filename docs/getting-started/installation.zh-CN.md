@@ -2,12 +2,14 @@
 
 [English](installation.md) | 简体中文
 
-GitHub Releases 是主要安装渠道，提供预编译二进制，用户无需 Rust 或 C 编译器。
-crates.io 是为 Rust 用户准备的次要源码安装渠道，始终会在本机编译。
+GitHub Releases 是有版本发布后的主要安装渠道，提供预编译二进制，用户无需 Rust 或 C
+编译器。如果 latest-release 页面尚无版本，请使用下文的源码构建步骤。crates.io 是为
+Rust 用户准备的次要源码安装渠道，始终会在本机编译。
 
 ## 预编译二进制
 
-从 [最新 Release](https://github.com/ReiSuzunami/sloosh/releases/latest) 下载：
+版本可用时，从
+[最新 Release](https://github.com/ReiSuzunami/sloosh/releases/latest) 下载：
 
 | 平台 | 文件 |
 |---|---|
@@ -30,8 +32,9 @@ open "$dmg"
 是否把下载的 DMG 移到废纸篓。如果 CLI 路径上已有不相关的文件或链接，安装器会保留它并
 提示链接未改变。
 
-App、CLI 与 daemon 故意共用同一份真实 executable。不要把 CLI 另行复制出来；CLI 会拒绝
-从不同 executable path 运行的 daemon。
+App bundle 中的 Tauri 桌面程序位于 `Contents/MacOS/Sloosh`，完整 CLI/daemon helper
+位于 `Contents/Helpers/sloosh`。CLI 链接应始终指向该 helper，不要把它另行复制出来；
+桌面端与 CLI 都会验证 daemon 确实是 bundle 中的 helper executable。
 
 macOS 压缩包备选方式：
 
@@ -157,4 +160,4 @@ cargo install sloosh --locked
 二进制通常安装到 `$HOME/.cargo/bin`。此渠道适合 Rust 用户，不是免构建安装方式。
 
 从仓库 checkout 构建时，见 README 中的
-[源码构建步骤](../../README.zh-CN.md#从源码构建)。
+[源码构建步骤](../../README.md#从源码构建)。

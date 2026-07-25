@@ -20,7 +20,7 @@ Read each owner relevant to the change:
 
 | Owner | Contract |
 |---|---|
-| [`README.md`](README.md) and `--help` | User-visible behavior |
+| [`README.md`](README.md), [`README.en.md`](README.en.md), and `--help` | User-visible behavior |
 | [`SECURITY.md`](SECURITY.md) | Threat model, guarantees, limits, permissions |
 | [`architecture.md`](docs/internals/architecture.md) | Components, data ownership, runtime |
 | [`protocol.md`](docs/internals/protocol.md) | Wire schema, framing, sequencing |
