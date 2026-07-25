@@ -102,19 +102,10 @@ remains installed and the command can be retried. Changing enrolled fingerprints
 invalidates the Keychain item; rerun `sloosh init` to enroll again.
 
 The DMG app exposes the same setup as focused native actions: Setup installs the
-embedded Skill and initializes the vault; Security enables Touch ID or an
-optional 6-digit PIN; Hosts manages vault-backed connection profiles. Master
-Password enrollment starts with a Keychain onboarding step that explains the
-stored local credential, the possible `Sloosh Approval` access prompt, and the
-difference between one-time `Allow` and `Always Allow`. It also makes clear that
-setup neither imports SSH private keys nor approves a host. Master
-Password and PIN entry stay in the bundled native helper and never enter the
-WebView. A desktop SSH Password is entered in the local Hosts form, sent as a
-redacted secret, and cleared after submission. A device without Touch ID can
-use PIN. Hosts can be unlocked once with Touch ID, Sloosh PIN, or Master
-Password. Security offers a shared 1/5/15/30-minute vault timeout, also
-available as `sloosh vault timeout [minutes]`; it governs the desktop session
-and idle daemon leases without bypassing per-request approval.
+embedded Skill and initializes the vault; Security configures native unlock and
+the shared timeout; Hosts manages connection profiles. Setup neither imports
+SSH private keys nor approves a host. Continue with the
+[desktop app section of the manual](../manual.md#desktop-app).
 
 By default, `--agent auto` installs for every detected agent. It uses these
 locations:
@@ -186,3 +177,4 @@ for Rust developers, but it is not the no-build installation path.
 
 For a repository checkout, follow the concise
 [source-build steps in the README](../../README.en.md#build-from-source).
+After installation, continue with the [manual](../manual.md).

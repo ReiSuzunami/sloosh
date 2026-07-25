@@ -5,128 +5,43 @@
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
-为 Coding Agent 提供持久 SSH 会话与人类批准的凭据访问。
+为 Coding Agent 提供持久 SSH 会话与带外人工批准；Agent 无需接触密码或私钥。
 
 ## 安装
 
-预编译版本发布后，可从
+预编译版本发布后，从
 [最新 GitHub Release](https://github.com/ReiSuzunami/sloosh/releases/latest)
-下载对应平台的包；如果页面尚无版本，请使用下文的源码构建方式：
+下载：
 
-- macOS DMG（Apple silicon 或 Intel）：`Sloosh-<version>-macos-universal.dmg`
-- macOS CLI 压缩包（Apple silicon 或 Intel）：`sloosh-macos-universal.tar.gz`
+- macOS 桌面 App 与 CLI：`Sloosh-<version>-macos-universal.dmg`
+- macOS 独立 CLI：`sloosh-macos-universal.tar.gz`
 - Linux x86_64：`sloosh-linux-x86_64-musl.tar.gz`
 
-使用 DMG 时，双击 `Install Sloosh`。安装器会把 `Sloosh.app` 复制到“应用程序”，在路径
-可用时创建 `~/.local/bin/sloosh`，推出磁盘映像，并询问是否把 DMG 移到废纸篓。CLI
-路径上已有的不相关项目会保留。
-打开 Sloosh 后，可以安装内置 Agent Skill、初始化 vault，并启用 Touch ID 或可选的 6 位
-审批 PIN。登记前，App 会说明 macOS login Keychain 中保存的内容，以及随后可能出现的原生
-访问提示。完整 CLI 会与 App 一起安装并继续保留。
-更新时若 Sloosh 正在运行，安装器会先明确确认；正常退出等待 5 秒后仍未关闭，才会强制退出。
+校验和、平台要求与升级步骤见[安装指南](./docs/getting-started/installation.zh-CN.md)。
 
-使用压缩包时，解压后将二进制安装到 `PATH` 中：
+## 交给 Agent 安装
 
-```sh
-install -d "$HOME/.local/bin"
-install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
-sloosh --version
-```
-
-校验和与平台说明见[安装指南](./docs/getting-started/installation.zh-CN.md)。
-
-## Agent 引导安装
-
-**将下面的完整 Prompt 粘贴给你的 Agent。/ Paste the entire prompt below to your agent.**
+**将下面的完整 Prompt 粘贴给你的 Agent。/ Paste this prompt to your agent.**
 
 ```text
-你正在帮助我安装并初始化 sloosh。
+你是我的 sloosh 安装向导。
 
-1. 检测我的操作系统与架构，执行
-   `command -v sloosh && sloosh --version`，确认是否已经安装 sloosh。若缺失或版本
-   过旧，仅使用官方仓库 `https://github.com/ReiSuzunami/sloosh`。先检查
-   `https://github.com/ReiSuzunami/sloosh/releases/latest`：如有 Release，说明适合
-   当前平台的 DMG 或压缩包方案并验证 `SHA256SUMS`；如尚无 Release，说明使用 Rust
-   1.85+ 从源码构建的方案。执行任何安装前都要征得我的同意。禁止使用 `curl | sh`、
-   静默调用包管理器、绕过 Gatekeeper 或其他平台保护，也不得索取或显示密码、SSH
-   密钥、vault secret 或 lease token。
-2. 二进制可用后，解释 `sloosh init` 会做什么，并让我在自己的交互式终端中运行。
-   你不得代跑 `sloosh init`、伪造 TTY，也不得输入、读取或重复任何 secret。macOS
-   环境下，按需解释 Keychain、`Sloosh Approval`、Touch ID 与可选审批 PIN 提示；
-   Linux 或 standalone build 则说明后续 lease 由人类在另一终端批准。
-3. 等我确认初始化完成后，仅运行只读检查
-   `sloosh skill status --agent auto` 与 `sloosh status`，报告结果并说明下一步安全
-   操作。任何主机访问都必须继续接受带外人工批准。
+1. 检测操作系统与架构，执行 `command -v sloosh && sloosh --version`。仅使用官方仓库
+   `https://github.com/ReiSuzunami/sloosh`。若未安装或版本过旧，检查最新 Release：
+   有 Release 时选择对应 DMG/压缩包并验证 `SHA256SUMS`；没有时说明 Rust 1.85+
+   源码构建方案。任何安装前先征得我同意。禁止 `curl | sh`、静默调用包管理器、
+   绕过平台保护，禁止索取或显示密码、SSH 密钥、vault secret 或 lease token。
+2. 二进制可用后，解释 `sloosh init`，让我在自己的交互式终端运行。你不得代跑、
+   伪造 TTY、输入或读取 secret。
+3. 等我确认完成后，只读运行 `sloosh skill status --agent auto` 和 `sloosh status`，
+   报告结果。任何主机访问仍须带外人工批准。
 ```
 
-Agent 负责指导安装并验证结果；凭据与审批权限始终由人类掌握。无需外部 Agent
-marketplace：安装后的二进制已内嵌 Skill。
-
-如果不使用 Agent，请在人类自己的终端中运行：
-
-```sh
-sloosh init
-```
-
-`sloosh init` 会安装二进制内嵌的 Skill，并初始化凭据 vault。macOS DMG 版本还会登记
-Touch ID，用于后续 lease 请求；登记前 CLI 会解释 login Keychain 条目、可能出现的
-`Sloosh Approval` 提示，以及 `Allow` 和 `Always Allow` 的区别。已有 vault 时重新运行
-`sloosh init` 即可启用。它自动检测
-Codex 与 Claude Code；可用 `sloosh skill status` 检查结果。二进制本身不会调用 `npx`
-或任何 Agent marketplace。
-
-登记后，`sloosh request <host-alias>` 会先显示原生的精确主机列表确认，再以 Touch ID
-或可选审批 PIN 完成授权，不再要求另开终端。PIN 使用持久退避，连续失败 15 次后禁用，
-并且不会消耗 Master Password 的失败次数。取消、未登记以及源码/压缩包构建会退回
-`sloosh approve`。首次遇到未知 SSH host key 时也仍使用终端审批，以便人类核对指纹。
-
-Linux 不需要 Keychain、Touch ID 或原生 helper 权限。`sloosh init` 结束时会明确说明：后续
-pending lease 需要由人类在另一终端执行输出中的 `sloosh approve <ID>` 命令。
-
-## 管理主机
-
-桌面 App 提供锁定的 Hosts 页面，用于管理 vault 中的连接配置。认证方式可明确选择 SSH
-agent、vault 加密密码或未加密 Ed25519/ECDSA 私钥路径；RSA 与加密私钥必须先载入
-ssh-agent。路由可选择直连、经过另一条受管主机配置，或高级 OpenSSH ProxyJump。使用 Touch
-ID、6 位 Sloosh PIN 或 Master Password 解锁一次后，Rust
-桌面进程会在共用的 1/5/15/30 分钟空闲期内保留可零化会话；macOS 睡眠、锁屏或切换用户、
-手动锁定、退出 App 或达到固定 8 小时上限都会清除它。Master Password 与 PIN 始终由原生
-helper 输入。桌面端 SSH Password 仅短暂
-存在于本地表单，通过 Tauri 命令边界时由脱敏 secret 类型承载，提交后立即清空。CLI 提供
-相同的人类专用管理能力：
-
-```sh
-sloosh host list
-sloosh host show myhost
-sloosh host add myhost --hostname server.example.com --user deploy --auth agent
-sloosh host edit myhost --port 2222 --via bastion
-sloosh host edit myhost --auth key-file --key-file ~/.ssh/id_ed25519
-sloosh host rm myhost
-sloosh vault timeout 15
-```
-
-添加 `myhost` 后，首次连接的最小流程为：
-
-```sh
-sloosh request myhost
-# 如果 request 输出 pending 审批命令，由人类在另一终端执行：
-sloosh approve REQUEST_ID_FROM_OUTPUT
-sloosh run myhost "uname -a"
-```
-
-仅在 `request` 报告 `authorized` 后继续。macOS DMG 安装可通过 Touch ID 或 PIN 完成
-审批，无需第二终端。
-
-`sloosh vault timeout` 可查看当前值。在 GUI 或 CLI 中修改后，桌面 vault 与空闲的 CLI/Agent
-lease 会共用该值；逐请求主机审批与 8 小时绝对 lease 上限仍然独立。
-
-alias 是稳定的 lease 与 ProxyJump 身份，因此编辑时不能改名。旧的 `sloosh add` 与
-`sloosh rm` 仍为兼容保留。所有管理命令都不会输出认证材料。
-ProxyJump 循环和超过 8 跳的路由会在审批前失败；Sloosh 不会让人类审批被静默截断的主机列表。
+不使用 Agent 时，按[使用手册](./docs/manual.zh-CN.md)完成初始化与首次连接。
 
 ## 从源码构建
 
-需要 Rust 1.85 或更高版本，以及可用的 C/C++ 构建工具链。
+需要 Rust 1.85+ 与 C/C++ 构建工具链：
 
 ```sh
 git clone https://github.com/ReiSuzunami/sloosh.git
@@ -134,13 +49,17 @@ cd sloosh
 cargo build --release --locked
 ```
 
-生成的二进制位于 `target/release/sloosh`。
+二进制位于 `target/release/sloosh`。
 
-## 社区
+## 文档
 
-提交 pull request 或 issue 前，请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)、
-[SUPPORT.md](./SUPPORT.md) 与 [SECURITY.md](./SECURITY.md)。
+- [使用手册](./docs/manual.zh-CN.md)
+- [安装与升级](./docs/getting-started/installation.zh-CN.md)
+- [安全模型](./SECURITY.md)
+- [架构](./docs/internals/architecture.md) · [协议](./docs/internals/protocol.md)
+- [贡献](./CONTRIBUTING.md) · [支持](./SUPPORT.md)
+- [完整文档索引](https://github.com/ReiSuzunami/sloosh/blob/main/docs/README.md)
 
 ## 许可证
 
-可任选 [MIT](./LICENSE-MIT) 或 [Apache-2.0](./LICENSE-APACHE) 许可证。
+[MIT](./LICENSE-MIT) 或 [Apache-2.0](./LICENSE-APACHE)，任选其一。

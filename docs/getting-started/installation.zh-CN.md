@@ -89,16 +89,9 @@ sloosh init
 随后报错，已经安装的 Skill 会保留，修复问题后可直接重试。系统中登记的指纹变化会使
 Keychain 项目失效；重新运行 `sloosh init` 即可登记。
 
-DMG App 也提供相同的设置能力：Setup 安装内置 Skill 并初始化 vault，Security 启用 Touch ID
-或可选的 6 位 PIN，Hosts 管理 vault 中的连接配置。登记 Master Password 前会先显示
-Keychain onboarding，说明本地保存的凭据、可能出现的 `Sloosh Approval` 访问提示，以及
-一次性 `Allow` 与 `Always Allow` 的区别；同时明确 setup 不会导入 SSH 私钥，也不会批准
-任何主机。Master Password 与 PIN 只在内置原生
-helper 中输入，不会进入 WebView。桌面端 SSH Password 在本地 Hosts 表单中输入，以脱敏
-secret 类型提交，并在提交后立即清空。没有 Touch ID 的设备可以使用 PIN。
-Hosts 可以用 Touch ID、Sloosh PIN 或 Master Password 解锁一次。Security 提供共用的
-1/5/15/30 分钟 vault 空闲期，也可通过 `sloosh vault timeout [分钟]` 查看或修改；它同时
-约束桌面会话与空闲 daemon lease，但不会绕过每次请求的人工审批。
+DMG App 也提供相同的设置能力：Setup 安装内置 Skill 并初始化 vault，Security 配置原生
+解锁与共用空闲期，Hosts 管理连接配置。Setup 不会导入 SSH 私钥，也不会批准主机。后续见
+[使用手册的桌面 App 章节](../manual.zh-CN.md#桌面-app)。
 
 默认的 `--agent auto` 会为检测到的所有 Agent 安装，路径如下：
 
@@ -161,3 +154,4 @@ cargo install sloosh --locked
 
 从仓库 checkout 构建时，见 README 中的
 [源码构建步骤](../../README.md#从源码构建)。
+安装完成后，继续阅读[使用手册](../manual.zh-CN.md)。

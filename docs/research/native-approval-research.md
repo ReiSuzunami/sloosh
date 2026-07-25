@@ -1,5 +1,8 @@
 # macOS/Windows 无付费开发者证书的原生生物审批可行性
 
+> 非权威研究记录。已发布行为以 `SECURITY.md` 与
+> `docs/internals/architecture.md` 为准。
+
 ## 结论
 
 无付费开发者证书不妨碍调用本机生物认证 API；它影响的是“软件发布时的信任链”，不是 Touch ID/Windows Hello 能否弹出。LocalAuthentication 与 UserConsentVerifier 返回本机策略成功/失败（布尔或枚举），不能单独作为 daemon 可验证的授权凭据。当前 macOS 实现由固定 bundle 内 helper 校验父进程，只向该 Sloosh 进程提供 login Keychain 中的 vault 密码用于展开精确范围；用户先确认范围，再执行 Touch ID 并比对 `evaluatedPolicyDomainState`，daemon 最后激活。未来若审批跨进程、设备或网络边界，应升级为受用户在场保护的私钥签名挑战，再由 daemon 验签。

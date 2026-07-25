@@ -10,7 +10,9 @@ Before opening an issue:
 2. Search existing issues.
 3. Retry with the latest supported release when practical.
 
-For a normal bug, use the bug report form and include:
+For a normal bug, use the
+[bug report form](https://github.com/ReiSuzunami/sloosh/issues/new?template=bug_report.yml)
+and include:
 
 - `sloosh --version` or the exact commit;
 - OS, architecture, and installation channel;
