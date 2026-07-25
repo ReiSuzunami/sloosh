@@ -22,7 +22,7 @@ export type AppSnapshot = {
   };
   vaultUnlock: VaultUnlockSnapshot;
   vaultTimeoutMinutes: 1 | 5 | 15 | 30;
-  cliPath: string;
+  daemonPath: string;
 };
 
 export type VaultUnlockSnapshot = {

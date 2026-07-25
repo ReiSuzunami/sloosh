@@ -451,7 +451,7 @@
           <div><dt>Wire protocol</dt><dd>{snapshot?.daemon.wireProtocol ?? 'Unavailable'}</dd></div>
           <div><dt>Credential vault</dt><dd class:positive={snapshot?.vaultExists}>{snapshot?.vaultExists ? 'Initialized' : 'Not initialized'}</dd></div>
           <div><dt>Native approval</dt><dd class:positive={snapshot?.nativeApprovalAvailable}>{snapshot?.nativeApprovalAvailable ? 'Available' : 'Unavailable'}</dd></div>
-          <div class="path-row"><dt>CLI</dt><dd title={snapshot?.cliPath}>{snapshot?.cliPath ?? 'Unavailable'}</dd></div>
+          <div class="path-row"><dt>Daemon</dt><dd title={snapshot?.daemonPath}>{snapshot?.daemonPath ?? 'Unavailable'}</dd></div>
         </dl>
         {#if snapshot?.daemon.error}
           <p class="inline-error">{snapshot.daemon.error}</p>

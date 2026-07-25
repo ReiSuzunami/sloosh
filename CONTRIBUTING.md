@@ -10,11 +10,12 @@ Requires current stable Rust plus MSRV 1.85. The
 
 ```sh
 rustup toolchain install stable 1.85.0
-cargo build
+cargo build --bins
 ```
 
-CLI and daemon share `target/debug/sloosh`. Normal tests use temporary state and
-need neither network access nor real `~/.sloosh` data.
+The CLI and daemon are `target/debug/sloosh` and `target/debug/slooshd`.
+Normal tests use temporary state and need neither network access nor real
+`~/.sloosh` data.
 
 ## Required gate
 

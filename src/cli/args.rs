@@ -495,8 +495,6 @@ pub enum DaemonAction {
     Start,
     /// Ask a running daemon to shut down.
     Stop,
-    /// Run the daemon accept loop in the foreground (this is what `start`/auto-spawn exec).
-    Run,
     /// Report whether the daemon is running, without auto-starting it.
     Status,
 }
@@ -645,5 +643,13 @@ mod tests {
     fn vault_timeout_accepts_show_and_set_forms() {
         assert!(Cli::try_parse_from(["sloosh", "vault", "timeout"]).is_ok());
         assert!(Cli::try_parse_from(["sloosh", "vault", "timeout", "5"]).is_ok());
+    }
+
+    #[test]
+    fn daemon_run_is_not_a_public_cli_command() {
+        assert!(Cli::try_parse_from(["sloosh", "daemon", "run"]).is_err());
+        assert!(Cli::try_parse_from(["sloosh", "daemon", "start"]).is_ok());
+        assert!(Cli::try_parse_from(["sloosh", "daemon", "stop"]).is_ok());
+        assert!(Cli::try_parse_from(["sloosh", "daemon", "status"]).is_ok());
     }
 }

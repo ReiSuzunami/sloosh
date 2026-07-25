@@ -4,9 +4,9 @@ Sloosh has three independent distribution channels:
 
 | Channel | Audience | Artifact |
 |---|---|---|
-| GitHub Releases | ordinary users | prebuilt CLI archives and macOS desktop DMG |
-| Homebrew tap | macOS and Linux users | prebuilt CLI only |
-| crates.io | Rust users | CLI source package compiled by `cargo install` |
+| GitHub Releases | ordinary users | prebuilt command-line archives and macOS desktop DMG |
+| Homebrew tap | macOS and Linux users | prebuilt `sloosh` + `slooshd` |
+| crates.io | Rust users | command-line source package compiled by `cargo install` |
 
 GitHub Releases are the primary channel. A crates.io publish does not provide a
 prebuilt binary and is not required for GitHub release creation. Homebrew and
@@ -45,12 +45,13 @@ git push origin "v$version"
 - `x86_64-apple-darwin` on an Intel runner;
 - `x86_64-unknown-linux-musl` on an x86_64 Linux runner.
 
-It combines CLI and Tauri desktop slices into two universal binaries, ad-hoc
-signs both binaries, the payload app, and native installer, and publishes both a CLI tarball
-and a one-click installer DMG. It packages Linux, generates `SHA256SUMS`,
-records GitHub build provenance attestations for a public repository, and
-creates the GitHub Release. No publishing secret is required; GitHub's scoped
-workflow token creates the release.
+It combines `sloosh`, `slooshd`, and Tauri desktop slices into three universal
+binaries. The command-line archive contains the first two. The DMG contains
+only the desktop and private `slooshd`, then ad-hoc signs both, the payload app,
+and native installer. It packages Linux, generates `SHA256SUMS`, records GitHub
+build provenance attestations for a public repository, and creates the GitHub
+Release. No publishing secret is required; GitHub's scoped workflow token
+creates the release.
 
 After the workflow succeeds:
 
@@ -65,8 +66,8 @@ For a public repository, also verify every archive and the DMG with
 attestation availability depends on the GitHub plan, so the workflow does not
 make private releases depend on it.
 
-Extract both archives and run `sloosh --version`. On macOS, also verify the DMG
-and its app bundle:
+Extract both archives and run `sloosh --version` and `slooshd --version`. On
+macOS, also verify the DMG and its app bundle:
 
 ```sh
 dmg="Sloosh-$version-macos-universal.dmg"
@@ -81,8 +82,9 @@ test -s "$mount_dir/.DS_Store"
 test -s "$mount_dir/.background/background.png"
 lipo -archs "$installer/Contents/MacOS/install-sloosh"
 lipo -archs "$payload/Contents/MacOS/Sloosh"
-lipo -archs "$payload/Contents/Helpers/sloosh"
-"$payload/Contents/Helpers/sloosh" --version
+lipo -archs "$payload/Contents/Helpers/slooshd"
+"$payload/Contents/Helpers/slooshd" --version
+test ! -e "$payload/Contents/Helpers/sloosh"
 hdiutil detach "$mount_dir"
 rmdir "$mount_dir"
 ```
@@ -90,16 +92,37 @@ rmdir "$mount_dir"
 Both architecture checks must report `x86_64 arm64` in either order. Opening
 the DMG must show one large, centered `Install Sloosh` app. The package script
 also installs the payload twice in a temporary sandbox, verifies the CLI link
-and conflict-preservation behavior, and exercises the cleanup helper's volume
-ejection handoff. The payload must contain an independent GUI executable and
-CLI/daemon helper; the installed CLI link points to the latter. Do not describe the macOS artifact as notarized
-until Developer ID signing and Apple notarization are configured.
+removal and conflict-preservation behavior, and exercises the cleanup helper's
+volume ejection handoff. The payload must contain an independent GUI executable
+and private daemon, no public CLI, and no newly created CLI link. Do not
+describe the macOS artifact as notarized until Developer ID signing and Apple
+notarization are configured.
+
+## Homebrew tap
+
+After the GitHub assets are final, update the tap formula URLs and SHA-256
+values for both platform archives. The formula must install both binaries:
+
+```ruby
+def install
+  bin.install "sloosh", "slooshd"
+end
+
+test do
+  assert_equal "sloosh #{version}", shell_output("#{bin}/sloosh --version").strip
+  assert_equal "slooshd #{version}", shell_output("#{bin}/slooshd --version").strip
+end
+```
+
+Run `brew style`, `brew audit --strict`, and `brew test` against the updated
+formula on every supported platform before pushing the tap change. Do not point
+the formula at the DMG: Homebrew provides the command-line package, not the
+desktop app.
 
 ## crates.io
 
-The `sloosh` crate name was unallocated when this procedure was written, but
-names are first-come, first-served. The first publish requires a crates.io
-account and API token:
+Publishing requires a crates.io account and an authenticated or trusted
+publishing identity:
 
 ```sh
 cargo login
@@ -116,6 +139,7 @@ Verify the source-install channel in a clean directory:
 ```sh
 cargo install sloosh --version "$version" --locked
 sloosh --version
+slooshd --version
 ```
 
 If only the GitHub Release exists, ordinary users still have the supported

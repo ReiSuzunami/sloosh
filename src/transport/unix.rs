@@ -112,16 +112,19 @@ impl UnixChannel {
         }
     }
 
-    /// Connect to the daemon's socket and verify that the server is this
-    /// user's current sloosh executable.
+    /// Connect and verify against this process's own executable.
+    ///
+    /// Production clients select `slooshd` explicitly with
+    /// [`Self::connect_verified`]; this convenience path primarily supports
+    /// in-process tests whose daemon runs in the test executable.
     pub async fn connect(path: &Path) -> io::Result<Self> {
         let expected_exe = std::env::current_exe()?;
         Self::connect_verified(path, &expected_exe).await
     }
 
     /// Connect to a daemon running from an explicitly selected executable.
-    /// GUI bundles use this to authenticate the CLI sidecar instead of the
-    /// Tauri executable that initiated the connection.
+    /// CLI and GUI clients use this to authenticate the selected `slooshd`
+    /// instead of their own executable.
     pub async fn connect_verified(path: &Path, expected_exe: &Path) -> io::Result<Self> {
         let channel = Self::connect_unverified(path).await?;
         let expected_exe = std::fs::canonicalize(expected_exe)?;
@@ -141,8 +144,9 @@ impl UnixChannel {
 
     /// Connect without authenticating the server process.
     ///
-    /// This is only appropriate for in-process tests and liveness probes that
-    /// never send credentials or privileged requests.
+    /// This is only appropriate for in-process tests, liveness probes, or
+    /// authority-reducing recovery requests such as `Shutdown`. Never use it
+    /// for credentials or requests that grant or exercise authority.
     pub async fn connect_unverified(path: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(path).await?;
         Ok(Self::from_stream(stream))

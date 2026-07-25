@@ -2,7 +2,7 @@
 //!
 //! Rust owns policy and lease activation. Bundled macOS helper owns
 //! Keychain/Touch ID UI and returns a short-lived vault password only over
-//! anonymous pipes inherited from daemon.
+//! anonymous pipes inherited from the trusted daemon or desktop process.
 
 use crate::daemon::{lease, ssh, vault};
 use crate::local_approval::{PinError, PinStatus, PinStore, PinVerify};

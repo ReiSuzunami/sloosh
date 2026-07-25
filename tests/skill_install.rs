@@ -109,11 +109,12 @@ fn init_refuses_non_tty_before_installing_the_skill() {
 }
 
 #[test]
-fn embedded_skill_explains_platform_specific_init_approval() {
-    assert!(EMBEDDED_SKILL.contains("DMG-installed macOS"));
-    assert!(EMBEDDED_SKILL.contains("Sloosh Approval"));
+fn embedded_skill_explains_split_cli_and_desktop_approval() {
+    assert!(EMBEDDED_SKILL.contains("optional desktop"));
+    assert!(EMBEDDED_SKILL.contains("control plane and does not install the CLI"));
+    assert!(EMBEDDED_SKILL.contains("Setup and Security"));
     assert!(EMBEDDED_SKILL.contains("Always Allow"));
-    assert!(EMBEDDED_SKILL.contains("On Linux and standalone/source builds"));
+    assert!(EMBEDDED_SKILL.contains("command-line-only installs"));
     assert!(EMBEDDED_SKILL.contains("sloosh approve <ID>"));
 }
 

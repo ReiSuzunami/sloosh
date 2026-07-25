@@ -14,8 +14,8 @@
 sloosh init
 ```
 
-它会安装内嵌 Agent Skill 并初始化凭据 vault。macOS DMG 流程还可能配置 Keychain、
-Touch ID 与可选审批 PIN；Linux 和 standalone build 由人类在另一终端批准。
+它会安装内嵌 Agent Skill 并初始化凭据 vault。仅命令行安装由人类在另一终端批准；
+macOS 桌面 App 通过自身的 Setup 与 Security 配置 Keychain、Touch ID 与可选审批 PIN。
 
 验证结果：
 
@@ -54,9 +54,13 @@ alias 是稳定身份，不能改名。所有选项见 `sloosh host add --help` 
 
 ## 桌面 App
 
-macOS DMG 包含 Sloosh 桌面 App。Setup 安装内嵌 Agent Skill 并初始化 vault；
-Security 配置 Touch ID、可选的 6 位 Sloosh PIN 与共用 vault 空闲期。这些操作不会
-导入 SSH 私钥，也不会批准主机。
+macOS DMG 包含 Sloosh 桌面控制面与私有 `slooshd`，不会安装公共 CLI。需要终端或
+Agent 访问时，请另用 Homebrew、Cargo 或命令行压缩包安装 `sloosh`。App 位于
+“应用程序”时，两个客户端会共用 App daemon 与状态；桌面端直接连接 daemon，不会
+通过 shell 调用 CLI。
+
+Setup 安装内嵌 Agent Skill 并初始化 vault；Security 配置 Touch ID、可选的 6 位
+Sloosh PIN 与共用 vault 空闲期。这些操作不会导入 SSH 私钥，也不会批准主机。
 
 Hosts 管理与 CLI 相同的 vault 主机配置，可使用 Touch ID、Sloosh PIN 或 Master
 Password 解锁。Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
@@ -157,7 +161,8 @@ sloosh log -n 50
 sloosh daemon status
 ```
 
-daemon 通常按需自动启动。直接控制命令见 `sloosh daemon --help`，只在排障时使用。
+专用 `slooshd` 通常按需自动启动，不应直接运行。生命周期控制命令见
+`sloosh daemon --help`，只在排障时使用。
 
 ## 命令参考
 

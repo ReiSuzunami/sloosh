@@ -65,19 +65,30 @@ same UID. See Section 8.
 
 ### 4.1 Daemon identity from the CLI
 
-Every verified `UnixChannel::connect` checks both:
+Every verified client connection checks both:
 
-- socket peer eUID equals the CLI effective UID; and
-- socket peer executable canonical path equals the current `sloosh`
-  executable canonical path.
+- socket peer eUID equals the client effective UID; and
+- socket peer executable canonical path equals the explicitly selected
+  `slooshd` executable canonical path.
 
-CLI refuses either mismatch. It then negotiates exact protocol version; daemon
-keeps a per-connection gate and rejects ordinary requests before side effects
-until negotiation succeeds. [`protocol.md`](docs/internals/protocol.md#1-version-rule)
-owns exact sequencing and pre-negotiation messages.
+CLI and desktop refuse either mismatch. The command-line package selects its
+sibling `slooshd`, except that macOS prefers the private helper in the standard
+Applications install when present; the desktop selects only its own bundled
+helper. Selection never searches `PATH`. The client then negotiates exact
+protocol version; daemon keeps a per-connection gate and rejects ordinary
+requests before side effects until negotiation succeeds.
+[`protocol.md`](docs/internals/protocol.md#1-version-rule) owns exact sequencing
+and pre-negotiation messages.
 
 This prevents simple socket squatting by a different executable. It is a path
 and process check, not code signing or inode pinning.
+
+`sloosh daemon stop` is the deliberate exception: it may connect without
+executable authentication and send only the pre-negotiation `Shutdown`
+request, so a daemon can still be stopped after its on-disk helper was removed
+or replaced. That message carries no credential, cannot open the ordinary
+protocol gate, and only reduces authority. The macOS installer uses the same
+narrow shutdown path during replacement.
 
 ### 4.2 Client identity and host authorization in the daemon
 
@@ -271,16 +282,18 @@ These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.
 
 The macOS DMG contains an ad-hoc-signed native installer and a signed
-`Sloosh.app` payload. The installer writes only
-`/Applications/Sloosh.app` and, when available, the
-`~/.local/bin/sloosh` symlink. It rejects a symbolic-link, non-application, or
-unrecognized directory at the app target, validates the payload's ad-hoc code
-signature, stages it on the Applications filesystem, and keeps a
-same-directory backup until replacement succeeds. Before replacing a valid
-existing Sloosh bundle, it sends the fixed pre-handshake `Shutdown` request to
-the private daemon socket without executing the old bundle; the confirmation
-warns that active sessions and forwards end. An unrelated file or link at the
-CLI path is preserved rather than overwritten.
+`Sloosh.app` payload. The payload contains the GUI and private
+`Contents/Helpers/slooshd`, but no public `sloosh` executable. The installer
+installs only `/Applications/Sloosh.app` and creates no CLI link. It rejects a
+symbolic-link, non-application, or unrecognized directory at the app target,
+validates the new payload's ad-hoc code signature, stages it on the Applications
+filesystem, and keeps a same-directory backup until replacement succeeds.
+Before replacing a valid current or legacy Sloosh bundle, it sends the fixed
+pre-handshake `Shutdown` request to the private daemon socket without executing
+the old bundle; the confirmation warns that active sessions and forwards end.
+After replacement it removes only a `~/.local/bin/sloosh` symbolic link whose
+stored destination exactly matches the legacy helper path inside that target
+app. An unrelated file, directory, or link is preserved.
 
 After a successful install, a copied cleanup executable runs outside the disk
 image, ejects only the volume that contained the installer, and moves only the
@@ -433,9 +446,9 @@ Sloosh does not guarantee protection from hostile same-UID code. Such code may:
 - read process memory or environment if OS permissions/debug policy already
   permit it.
 
-CLI daemon verification compares eUID and canonical path. It does not verify a
-code signature, binary hash, inode identity, launch service identity, or absence
-of runtime injection.
+Client daemon verification compares eUID and the selected `slooshd` canonical
+path. It does not verify a code signature, binary hash, inode identity, launch
+service identity, or absence of runtime injection.
 
 Human approval grants host capability, not command intent. Once authorized, an
 agent can run arbitrary remote commands, transfer files, and create allowed

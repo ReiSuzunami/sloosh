@@ -1,6 +1,7 @@
 # Local Wire Protocol
 
-This document specifies the current CLI-to-daemon wire contract. The exact
+This document specifies the current local client-to-daemon wire contract used
+by both `sloosh` and the desktop app. The exact
 version constant is `WIRE_PROTOCOL_VERSION = 3` in `src/proto.rs`.
 
 Protocol 3 is local IPC over a Unix domain socket. It combines NDJSON control
@@ -13,17 +14,18 @@ Wire compatibility is exact, independent of package version. Any incompatible
 message shape, tag, default, or sequencing change must bump the wire protocol
 version.
 
-For ordinary new CLI connections:
+For ordinary new client connections:
 
-1. CLI authenticates the daemon peer by eUID and canonical executable path.
-2. CLI sends `{"type":"Status"}\n` as the first request.
+1. Client authenticates the daemon peer by eUID and the selected canonical
+   `slooshd` executable path.
+2. Client sends `{"type":"Status"}\n` as the first request.
 3. Daemon returns a `Status` response containing `wire_protocol`.
-4. CLI requires an exact value of `3`.
-5. CLI sends `{"type":"Hello","wire_protocol":3}\n`.
+4. Client requires an exact value of `3`.
+5. Client sends `{"type":"Hello","wire_protocol":3}\n`.
 6. Daemon replies
    `{"type":"ProtocolReady","wire_protocol":3}\n` and marks that connection
    negotiated.
-7. Only then may the CLI send an ordinary request on that connection.
+7. Only then may the client send an ordinary request on that connection.
 
 This is a bidirectional protocol gate:
 
@@ -40,16 +42,19 @@ This is a bidirectional protocol gate:
 - a raw same-UID client cannot skip the server gate for ordinary requests and
   remains subject to later capability checks and strict framing.
 
-`sloosh daemon stop` intentionally connects without `Hello` and sends the
-pre-negotiation `Shutdown` request. During a DMG upgrade, the native macOS
-installer sends that same fixed request directly to the private default socket
-before replacing the app; it never executes the old bundle. These paths keep
-an incompatible running daemon operable during upgrade.
+`sloosh daemon stop` intentionally connects without executable authentication
+or `Hello` and sends only the pre-negotiation `Shutdown` request. This recovery
+path remains usable when the local `slooshd` file was replaced or removed;
+`Shutdown` carries no credential and only reduces authority. During a DMG
+upgrade, the native macOS installer sends that same fixed request directly to
+the private default socket before replacing the app; it never executes the old
+bundle. Neither path can send an ordinary request on that connection. These
+paths keep an incompatible running daemon operable during upgrade.
 
 ### Upgrade procedure
 
-An installed binary does not replace a running daemon. On mismatch, stop the
-old daemon, then retry so CLI starts a matching one. Stopping loses sessions,
+An installed package does not replace a running daemon. On mismatch, stop the
+old daemon, then retry so the client starts a matching one. Stopping loses sessions,
 forwards, requests, leases, and other in-memory state. If Linux executable-path
 verification rejects an in-place-replaced daemon, confirm and terminate that
 same-user daemon process manually. Operational steps belong to the

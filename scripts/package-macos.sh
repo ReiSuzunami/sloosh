@@ -3,14 +3,14 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <version> <universal-sloosh-cli> <universal-sloosh-gui> <output-directory>" >&2
+  echo "usage: $0 <version> <universal-slooshd> <universal-sloosh-gui> <output-directory>" >&2
   exit 2
 }
 
 [[ $# -eq 4 ]] || usage
 
 version="$1"
-binary="$2"
+daemon_binary="$2"
 gui_binary="$3"
 output_dir="$4"
 
@@ -18,8 +18,8 @@ output_dir="$4"
   echo "invalid version: $version" >&2
   exit 2
 }
-[[ -f "$binary" && -x "$binary" ]] || {
-  echo "universal binary is missing or not executable: $binary" >&2
+[[ -f "$daemon_binary" && -x "$daemon_binary" ]] || {
+  echo "universal daemon is missing or not executable: $daemon_binary" >&2
   exit 2
 }
 [[ -f "$gui_binary" && -x "$gui_binary" ]] || {
@@ -40,7 +40,7 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "$script_dir/.." && pwd -P)"
-binary="$(cd -- "$(dirname -- "$binary")" && pwd -P)/$(basename -- "$binary")"
+daemon_binary="$(cd -- "$(dirname -- "$daemon_binary")" && pwd -P)/$(basename -- "$daemon_binary")"
 gui_binary="$(cd -- "$(dirname -- "$gui_binary")" && pwd -P)/$(basename -- "$gui_binary")"
 mkdir -p "$output_dir"
 output_dir="$(cd -- "$output_dir" && pwd -P)"
@@ -53,8 +53,13 @@ mounted_installer=""
 test_gui_started=0
 running_gui_home=""
 simulated_install=""
+test_daemon_pid=""
 
 cleanup() {
+  if [[ -n "$test_daemon_pid" ]]; then
+    kill "$test_daemon_pid" >/dev/null 2>&1 || true
+    wait "$test_daemon_pid" >/dev/null 2>&1 || true
+  fi
   if [[ "$test_gui_started" -eq 1 && -x "$mounted_installer/Contents/MacOS/install-sloosh" ]]; then
     env SLOOSH_INSTALLER_TEST_MODE=1 \
       "$mounted_installer/Contents/MacOS/install-sloosh" \
@@ -99,7 +104,7 @@ marketing_version="${version%%[-+]*}"
 
 mkdir -p "$contents/MacOS" "$contents/Helpers" "$contents/Resources" "$stage"
 install -m 0755 "$gui_binary" "$contents/MacOS/Sloosh"
-install -m 0755 "$binary" "$contents/Helpers/sloosh"
+install -m 0755 "$daemon_binary" "$contents/Helpers/slooshd"
 install -m 0644 "$repo_root/packaging/macos/Info.plist" "$contents/Info.plist"
 install -m 0644 "$repo_root/LICENSE-APACHE" "$repo_root/LICENSE-MIT" \
   "$contents/Resources/"
@@ -162,7 +167,7 @@ fi
   "Set :SlooshVersion $version" "$contents/Info.plist"
 plutil -lint "$contents/Info.plist" >/dev/null
 
-for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/sloosh"; do
+for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/slooshd"; do
   archs="$(
   lipo -archs "$bundled_binary" |
     tr ' ' '\n' |
@@ -175,7 +180,7 @@ for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/sloosh"; do
   }
 done
 
-for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/sloosh"; do
+for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/slooshd"; do
   minos_values="$(
   xcrun vtool -show-build "$bundled_binary" |
     awk '$1 == "minos" { print $2 }'
@@ -191,7 +196,7 @@ for bundled_binary in "$contents/MacOS/Sloosh" "$contents/Helpers/sloosh"; do
   fi
 done
 
-test "$("$contents/Helpers/sloosh" --version)" = "sloosh $version"
+test "$("$contents/Helpers/slooshd" --version)" = "slooshd $version"
 sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
 for arch in arm64 x86_64; do
   xcrun swiftc \
@@ -229,7 +234,7 @@ approval_archs="$(
 codesign --force --sign - --timestamp=none \
   "$approval_contents/MacOS/sloosh-approval"
 codesign --force --sign - --timestamp=none "$approval_app"
-codesign --force --sign - --timestamp=none "$contents/Helpers/sloosh"
+codesign --force --sign - --timestamp=none "$contents/Helpers/slooshd"
 codesign --force --sign - --timestamp=none "$contents/MacOS/Sloosh"
 codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
@@ -379,7 +384,8 @@ fi
 test "$(plutil -extract CFBundleIdentifier raw \
   "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/Info.plist")" = \
   "io.github.reisuzunami.sloosh.approval"
-test "$("$mounted_app/Contents/Helpers/sloosh" --version)" = "sloosh $version"
+test "$("$mounted_app/Contents/Helpers/slooshd" --version)" = "slooshd $version"
+[[ ! -e "$mounted_app/Contents/Helpers/sloosh" ]]
 test "$(plutil -extract CFBundleExecutable raw \
   "$mounted_app/Contents/Info.plist")" = "Sloosh"
 test "$(
@@ -399,11 +405,16 @@ test "$(
 codesign --verify --deep --strict --verbose=2 "$mounted_app"
 codesign --verify --deep --strict --verbose=2 "$mounted_installer"
 
-test "$(
+reported_dmg="$(
   env SLOOSH_INSTALLER_TEST_MODE=1 \
     "$mounted_installer/Contents/MacOS/install-sloosh" \
     --test-image-path "$mount_dir"
-)" = "$dmg"
+)"
+reported_dmg="$(
+  cd -- "$(dirname -- "$reported_dmg")"
+  printf '%s/%s\n' "$(pwd -P)" "$(basename -- "$reported_dmg")"
+)"
+test "$reported_dmg" = "$dmg"
 
 simulated_install="$tmp_dir/Applications/Sloosh.app"
 simulated_home="$tmp_dir/home"
@@ -412,15 +423,44 @@ env SLOOSH_INSTALLER_TEST_MODE=1 \
   "$mounted_installer/Contents/MacOS/install-sloosh" \
   --test-install "$(dirname "$simulated_install")" "$simulated_home"
 codesign --verify --deep --strict --verbose=2 "$simulated_install"
-test "$("$simulated_install/Contents/Helpers/sloosh" --version)" = "sloosh $version"
-test "$(readlink "$simulated_home/.local/bin/sloosh")" = \
-  "$simulated_install/Contents/Helpers/sloosh"
+test "$("$simulated_install/Contents/Helpers/slooshd" --version)" = "slooshd $version"
+[[ ! -e "$simulated_install/Contents/Helpers/sloosh" ]]
+[[ ! -e "$simulated_home/.local/bin/sloosh" ]]
+[[ ! -L "$simulated_home/.local/bin/sloosh" ]]
 
-# A second run exercises the staged upgrade path.
+# A second run exercises the staged upgrade path and removes only the exact
+# CLI link created by the legacy DMG.
+mkdir -p "$simulated_home/.local/bin"
+ln -s "$simulated_install/Contents/Helpers/sloosh" \
+  "$simulated_home/.local/bin/sloosh"
+upgrade_output="$(
+  env SLOOSH_INSTALLER_TEST_MODE=1 \
+    "$mounted_installer/Contents/MacOS/install-sloosh" \
+    --test-install "$(dirname "$simulated_install")" "$simulated_home"
+)"
+grep -F "Removed the legacy DMG CLI link at ~/.local/bin/sloosh." \
+  <<<"$upgrade_output" >/dev/null
+[[ ! -e "$simulated_home/.local/bin/sloosh" ]]
+[[ ! -L "$simulated_home/.local/bin/sloosh" ]]
+codesign --verify --deep --strict --verbose=2 "$simulated_install"
+
+# A v0.1.0 GUI + full-CLI helper remains a recognized upgrade target.
+legacy_home="$tmp_dir/legacy-home"
+legacy_applications="$tmp_dir/legacy-Applications"
+legacy_install="$legacy_applications/Sloosh.app"
+mkdir -p "$legacy_home/.local/bin" "$legacy_applications"
+ditto "$simulated_install" "$legacy_install"
+mv "$legacy_install/Contents/Helpers/slooshd" \
+  "$legacy_install/Contents/Helpers/sloosh"
+ln -s "$legacy_install/Contents/Helpers/sloosh" \
+  "$legacy_home/.local/bin/sloosh"
 env SLOOSH_INSTALLER_TEST_MODE=1 \
   "$mounted_installer/Contents/MacOS/install-sloosh" \
-  --test-install "$(dirname "$simulated_install")" "$simulated_home"
-codesign --verify --deep --strict --verbose=2 "$simulated_install"
+  --test-install "$legacy_applications" "$legacy_home"
+codesign --verify --deep --strict --verbose=2 "$legacy_install"
+[[ -x "$legacy_install/Contents/Helpers/slooshd" ]]
+[[ ! -e "$legacy_install/Contents/Helpers/sloosh" ]]
+[[ ! -L "$legacy_home/.local/bin/sloosh" ]]
 
 # Updating a running GUI first asks it to terminate, escalates to force-quit
 # after a bounded wait, and never targets another bundle path with the same ID.
@@ -495,6 +535,20 @@ grep -F "Existing item at ~/.local/bin/sloosh was left unchanged." \
   <<<"$conflict_output" >/dev/null
 test "$(cat "$conflict_home/.local/bin/sloosh")" = "keep-existing-cli"
 
+# An unrelated CLI symlink is also preserved exactly.
+link_home="$tmp_dir/link-home"
+link_applications="$tmp_dir/link-Applications"
+mkdir -p "$link_home/.local/bin"
+ln -s "/opt/homebrew/bin/sloosh" "$link_home/.local/bin/sloosh"
+link_output="$(
+  env SLOOSH_INSTALLER_TEST_MODE=1 \
+    "$mounted_installer/Contents/MacOS/install-sloosh" \
+    --test-install "$link_applications" "$link_home"
+)"
+grep -F "Existing CLI link at ~/.local/bin/sloosh was left unchanged." \
+  <<<"$link_output" >/dev/null
+test "$(readlink "$link_home/.local/bin/sloosh")" = "/opt/homebrew/bin/sloosh"
+
 # A same-named ordinary directory is user data, not an app to replace.
 unrecognized_home="$tmp_dir/unrecognized-home"
 unrecognized_applications="$tmp_dir/unrecognized-Applications"
@@ -515,7 +569,13 @@ test "$(cat "$unrecognized_applications/Sloosh.app/marker")" = \
 shutdown_home="$tmp_dir/shutdown-home"
 mkdir -p "$shutdown_home"
 SLOOSH_HOME="$shutdown_home/.sloosh" \
-  "$mounted_app/Contents/Helpers/sloosh" daemon start
+  "$mounted_app/Contents/Helpers/slooshd" \
+  >"$tmp_dir/shutdown-daemon.log" 2>&1 &
+test_daemon_pid=$!
+for _ in {1..100}; do
+  [[ -S "$shutdown_home/.sloosh/sloosh.sock" ]] && break
+  sleep 0.05
+done
 test -S "$shutdown_home/.sloosh/sloosh.sock"
 env SLOOSH_INSTALLER_TEST_MODE=1 \
   "$mounted_installer/Contents/MacOS/install-sloosh" \
@@ -528,6 +588,8 @@ done
   echo "installer did not stop the sandbox daemon" >&2
   exit 1
 }
+wait "$test_daemon_pid"
+test_daemon_pid=""
 
 # Exercise the real copied-helper handoff. The helper waits for the installer
 # process to exit, then ejects the volume from outside it.

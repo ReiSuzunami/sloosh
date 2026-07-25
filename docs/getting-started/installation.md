@@ -6,9 +6,9 @@ GitHub Releases are the primary installation channel once a release is
 available. They provide prebuilt binaries, so users do not need Rust or a C
 compiler. If the latest-release page has no version yet, use the source-build
 steps below. crates.io is a planned secondary source-install channel for Rust
-users and always compiles locally. The Homebrew tap and crates.io both install
-the CLI only; the desktop app and DMG are distributed only through GitHub
-Releases.
+users and always compiles locally. The Homebrew tap and crates.io install the
+command-line package (`sloosh` plus its companion `slooshd`); the desktop app
+and DMG are distributed only through GitHub Releases.
 
 ## Prebuilt binaries
 
@@ -32,16 +32,17 @@ open "$dmg"
 ```
 
 Double-click `Install Sloosh`, review the confirmation, and choose Install. The
-installer copies `Sloosh.app` to Applications and creates
-`~/.local/bin/sloosh` when that path is available. It then ejects the disk
-image and asks whether to move the downloaded DMG to Trash. If the CLI path
-already contains an unrelated file or link, the installer preserves it and
-reports that the link was not changed.
+installer copies `Sloosh.app` to Applications. It does not install a public
+CLI or create anything in `PATH`. During an upgrade from the original combined
+bundle, it removes only a `~/.local/bin/sloosh` symlink whose stored destination
+is exactly the old helper inside that same app; every unrelated file or link is
+preserved. It then ejects the disk image and asks whether to move the downloaded
+DMG to Trash.
 
 The app bundle contains a Tauri desktop executable at `Contents/MacOS/Sloosh`
-and the complete CLI/daemon at `Contents/Helpers/sloosh`. Keep the CLI link
-pointed at that helper instead of copying it out; desktop and CLI clients both
-verify that the daemon is the bundled helper executable.
+and a private daemon at `Contents/Helpers/slooshd`. It deliberately contains no
+public `sloosh` executable. The desktop connects directly to this daemon over
+the local protocol rather than shelling out to a CLI.
 
 macOS archive alternative:
 
@@ -50,6 +51,7 @@ grep '  sloosh-macos-universal.tar.gz$' SHA256SUMS | shasum -a 256 -c -
 tar -xzf sloosh-macos-universal.tar.gz
 install -d "$HOME/.local/bin"
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
+install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
 ```
 
 Linux:
@@ -59,13 +61,18 @@ grep '  sloosh-linux-x86_64-musl.tar.gz$' SHA256SUMS | sha256sum -c -
 tar -xzf sloosh-linux-x86_64-musl.tar.gz
 install -d "$HOME/.local/bin"
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
+install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
 ```
 
 Add `$HOME/.local/bin` to `PATH` if needed, then verify the installation:
 
 ```sh
 sloosh --version
+slooshd --version
 ```
+
+`slooshd` is managed by the client and desktop app; do not start it directly
+during ordinary use.
 
 The macOS installer, app, and binaries are ad-hoc signed but are not currently
 Developer ID signed or notarized. On first use, macOS may block the installer.
@@ -86,24 +93,26 @@ Run the combined setup from your own terminal:
 sloosh init
 ```
 
-This human-only command first installs the Agent Skill embedded in the current
-binary, then creates the credential vault. A DMG installation also enrolls the
-vault password in local login Keychain, gated by Touch ID and biometric
-enrollment-state comparison. Before the system prompts appear, the CLI explains
-the Keychain item, the `Sloosh Approval` access prompt, and one-time `Allow`
-versus `Always Allow`. If the vault
-already exists, rerunning `sloosh init` asks for its password once and enables
-Touch ID. Source builds and the standalone CLI archive have no native helper
-and keep terminal approval behavior. Linux requires no Keychain or biometric
-permission; initialization prints the separate-terminal `sloosh approve <ID>`
-fallback that will be used for pending leases.
+This human-only command first installs the Agent Skill embedded in the client,
+then creates the credential vault. Command-line-only installations use terminal
+approval; Linux requires no Keychain or biometric permission and initialization
+prints the separate-terminal `sloosh approve <ID>` fallback.
+
+The desktop app owns native setup. Open its Setup and Security screens to
+initialize or unlock the same vault and enroll the vault password in the login
+Keychain behind Touch ID or the optional local PIN. The separately distributed
+CLI never executes the native helper directly. When the app is installed in
+Applications, both clients use its private daemon, so CLI lease requests can
+still complete through native approval after the human has enrolled it in the
+app. `Always Allow` avoids repeated Keychain prompts; `Allow` grants one-time
+access.
 
 Setup is safe to rerun: an existing vault is left alone. The steps are not a
 transaction, so a Skill installed before a vault, daemon, or Touch ID error
 remains installed and the command can be retried. Changing enrolled fingerprints
 invalidates the Keychain item; rerun `sloosh init` to enroll again.
 
-The DMG app exposes the same setup as focused native actions: Setup installs the
+The DMG app exposes setup as focused native actions: Setup installs the
 embedded Skill and initializes the vault; Security configures native unlock and
 the shared timeout; Hosts manages connection profiles. Setup neither imports
 SSH private keys nor approves a host. Continue with the
@@ -142,6 +151,7 @@ forwards, pending requests, and leases are in-memory and will be lost.
 
 ```sh
 sloosh daemon stop
+install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
 sloosh --version
 sloosh skill install
@@ -149,11 +159,12 @@ sloosh skill install
 
 For a DMG installation, open the new DMG and run `Install Sloosh`. When
 replacing an existing valid installation, it stops the old daemon before the
-staged replacement and leaves a matching CLI link in place. The confirmation
+staged replacement. It removes the exact legacy DMG-created CLI symlink but
+does not touch a Homebrew, Cargo, archive, or user-managed CLI. The confirmation
 warns that stopping the daemon ends active sessions and forwards. If the GUI is
 running, the same confirmation says it must quit; the installer requests normal
-termination, waits 5 seconds, then force quits only under that explicit consent.
-Replacement never starts while the old GUI is still running.
+termination, waits 5 seconds, then force quits only under that explicit
+consent. Replacement never starts while the old GUI is still running.
 
 This order also avoids the old daemon continuing from a replaced executable on
 Linux, where the new CLI correctly refuses an unverifiable `/proc/<pid>/exe`
@@ -161,34 +172,32 @@ peer.
 
 If an in-place replacement already left the old Linux daemon shown as
 `(deleted)` and CLI refuses its socket, locate it with
-`pgrep -u "$(id -u)" -af 'sloosh daemon run'`. Confirm the process, run
+`pgrep -u "$(id -u)" -af 'slooshd'`. Confirm the executable path, run
 `kill <pid>`, then retry; CLI will remove the stale socket and start the new
-binary.
+daemon.
 
 ## CLI package managers
 
-Once the first formula is published, Homebrew installs the prebuilt CLI from
-the project tap:
+Homebrew installs the prebuilt command-line package from the project tap:
 
 ```sh
 brew install ReiSuzunami/tap/sloosh
 ```
 
-The Homebrew formula does not install the desktop app or generate a DMG.
+The formula installs both `sloosh` and its managed `slooshd`; it does not
+install the desktop app or generate a DMG.
 
-After the first crate publish, crates.io can instead download the source and
-compile the CLI locally. This requires Rust 1.85 or newer and a working C/C++
-toolchain:
+crates.io can instead download the source and compile the command-line package
+locally. This requires Rust 1.85 or newer and a working C/C++ toolchain:
 
 ```sh
 cargo install sloosh --locked
 ```
 
-The installed binary normally lands in `$HOME/.cargo/bin`. The crate does not
+Both binaries normally land in `$HOME/.cargo/bin`. The crate does not
 contain the Tauri desktop source, macOS installer, or DMG packaging resources,
-and `cargo install` installs only Cargo binary targets. It therefore cannot
-build the Sloosh DMG. crates.io is useful for Rust developers, but it is not
-the no-build installation path.
+so it cannot build the Sloosh DMG. crates.io is useful for Rust developers, but
+it is not the no-build installation path.
 
 For a repository checkout, follow the concise
 [source-build steps in the README](../../README.en.md#build-from-source).

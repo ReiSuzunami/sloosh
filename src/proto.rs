@@ -23,7 +23,7 @@ use zeroize::Zeroize;
 /// allocation.
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
 
-/// Exact CLI/daemon wire contract version. Bump this for any incompatible
+/// Exact local client/daemon wire contract version. Bump this for any incompatible
 /// message shape or sequencing change; package versions may differ while this
 /// remains equal.
 pub const WIRE_PROTOCOL_VERSION: u32 = 3;

@@ -23,7 +23,7 @@ const MAX_DELAY: Duration = Duration::from_millis(1000);
 /// Typed local-daemon client shared by CLI and desktop adapters.
 ///
 /// The daemon executable is explicit because a bundled GUI authenticates and
-/// starts `Contents/Helpers/sloosh`, not its own Tauri executable.
+/// starts `Contents/Helpers/slooshd`, not its own Tauri executable.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
@@ -60,9 +60,7 @@ impl DaemonClient {
 /// Connect to the daemon, auto-spawning it (detached, logging to
 /// `~/.sloosh/daemon.log`) if it isn't reachable yet.
 pub async fn connect_or_spawn(socket_path: &Path) -> anyhow::Result<UnixChannel> {
-    let executable = std::env::current_exe().context(
-        "failed to resolve sloosh's own executable path (needed to authenticate the daemon)",
-    )?;
+    let executable = daemon_executable()?;
     connect_or_spawn_with_executable(socket_path, &executable).await
 }
 
@@ -83,9 +81,7 @@ async fn connect_or_spawn_with_executable(
 
 /// Poll `connect` with exponential backoff until it succeeds or we give up.
 pub async fn wait_for_daemon(socket_path: &Path) -> anyhow::Result<UnixChannel> {
-    let executable = std::env::current_exe().context(
-        "failed to resolve sloosh's own executable path (needed to authenticate the daemon)",
-    )?;
+    let executable = daemon_executable()?;
     wait_for_daemon_with_executable(socket_path, &executable).await
 }
 
@@ -128,7 +124,7 @@ pub(super) fn untrusted_daemon_error(socket_path: &Path, source: std::io::Error)
 /// Verify the daemon before this channel carries an ordinary request. Exact
 /// matching is required because SFTP transfers switch from NDJSON control
 /// messages to raw frames mid-connection.
-async fn verify_wire_protocol(
+pub(super) async fn verify_wire_protocol(
     mut chan: UnixChannel,
     socket_path: &Path,
 ) -> anyhow::Result<UnixChannel> {
@@ -206,12 +202,10 @@ async fn verify_wire_protocol(
     Ok(chan)
 }
 
-/// Fork/exec `sloosh daemon run`, detached from this process's session, with
+/// Fork/exec `slooshd`, detached from this process's session, with
 /// stdio wired to `~/.sloosh/daemon.log`.
 pub fn spawn_daemon_detached(socket_path: &Path) -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context(
-        "failed to resolve sloosh's own executable path (needed to auto-start the daemon)",
-    )?;
+    let exe = daemon_executable()?;
     spawn_daemon_detached_with_executable(socket_path, &exe)
 }
 
@@ -226,7 +220,6 @@ fn spawn_daemon_detached_with_executable(
         .context("failed to duplicate daemon log file handle")?;
 
     let mut cmd = std::process::Command::new(executable);
-    cmd.arg("daemon").arg("run");
     // SLOOSH_SOCKET is inherited automatically, but set it explicitly too so
     // the spawned daemon binds the exact same path even if it was passed in
     // some other way (e.g. resolved default differs across working dirs).
@@ -247,8 +240,70 @@ fn spawn_daemon_detached_with_executable(
     }
 
     cmd.spawn()
-        .with_context(|| format!("failed to spawn `{} daemon run`", executable.display()))?;
+        .with_context(|| format!("failed to spawn `{}`", executable.display()))?;
     Ok(())
+}
+
+/// Resolve the daemon executable used for both spawning and peer-identity
+/// verification.
+///
+/// On macOS, an installed desktop app owns the canonical daemon whenever its
+/// private helper is present. This lets Homebrew/Cargo CLIs and the GUI share
+/// one daemon. Other installations use the `slooshd` shipped beside `sloosh`.
+pub fn daemon_executable() -> anyhow::Result<PathBuf> {
+    let current =
+        std::env::current_exe().context("failed to resolve the current sloosh executable path")?;
+    #[cfg(target_os = "macos")]
+    let app_helper = Some(Path::new(
+        "/Applications/Sloosh.app/Contents/Helpers/slooshd",
+    ));
+    #[cfg(not(target_os = "macos"))]
+    let app_helper = None;
+
+    select_daemon_executable(&current, app_helper)
+}
+
+fn select_daemon_executable(
+    current_executable: &Path,
+    app_helper: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = app_helper {
+        if is_regular_executable_file(path) {
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    let sibling = current_executable
+        .parent()
+        .map(|parent| parent.join("slooshd"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not locate slooshd beside {}",
+                current_executable.display()
+            )
+        })?;
+    if is_executable_file(&sibling) {
+        return Ok(sibling);
+    }
+
+    anyhow::bail!(
+        "could not locate an executable slooshd (expected {}). Install the complete sloosh \
+         package, or run `cargo build --bins` for a source checkout",
+        sibling.display()
+    )
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn is_regular_executable_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink()
+            && metadata.is_file()
+            && metadata.permissions().mode() & 0o111 != 0
+    })
 }
 
 fn open_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
@@ -463,8 +518,9 @@ mod tests {
     async fn connect_or_spawn_rejects_legacy_wire_protocol() {
         let socket_path = temp_socket_path("legacy");
         let server = spawn_status_server(&socket_path, 0);
+        let daemon_executable = std::env::current_exe().expect("current executable");
 
-        let error = match connect_or_spawn(&socket_path).await {
+        let error = match connect_or_spawn_with_executable(&socket_path, &daemon_executable).await {
             Ok(_) => panic!("legacy daemon must be rejected"),
             Err(error) => error,
         };
@@ -486,12 +542,74 @@ mod tests {
         let socket_path = temp_socket_path("matching");
         let server = spawn_status_server(&socket_path, WIRE_PROTOCOL_VERSION);
 
-        let chan = wait_for_daemon(&socket_path)
+        let daemon_executable = std::env::current_exe().expect("current executable");
+        let chan = wait_for_daemon_with_executable(&socket_path, &daemon_executable)
             .await
             .expect("matching daemon should be accepted");
         drop(chan);
 
         server.await.expect("status server should exit cleanly");
         let _ = std::fs::remove_dir_all(socket_path.parent().expect("socket parent"));
+    }
+
+    #[test]
+    fn daemon_locator_prefers_installed_app_helper_then_sibling() {
+        let root = std::env::temp_dir().join(format!(
+            "sloosh-daemon-locator-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cli = root.join("bin/sloosh");
+        let sibling = root.join("bin/slooshd");
+        let app_helper = root.join("Sloosh.app/Contents/Helpers/slooshd");
+        for path in [&cli, &sibling, &app_helper] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+            std::fs::write(path, b"test").expect("write executable");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+        }
+
+        assert_eq!(
+            select_daemon_executable(&cli, Some(&app_helper)).expect("app helper"),
+            app_helper
+        );
+        std::fs::remove_file(&app_helper).expect("remove app helper");
+        assert_eq!(
+            select_daemon_executable(&cli, Some(&app_helper)).expect("sibling helper"),
+            sibling
+        );
+        std::os::unix::fs::symlink(&sibling, &app_helper).expect("symlink app helper");
+        assert_eq!(
+            select_daemon_executable(&cli, Some(&app_helper))
+                .expect("symlinked app helper must be ignored"),
+            sibling
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_locator_rejects_missing_or_non_executable_helper() {
+        let root = std::env::temp_dir().join(format!(
+            "sloosh-daemon-locator-invalid-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cli = root.join("bin/sloosh");
+        let sibling = root.join("bin/slooshd");
+        std::fs::create_dir_all(sibling.parent().expect("parent")).expect("create parent");
+        std::fs::write(&sibling, b"test").expect("write helper");
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o644))
+            .expect("make helper non-executable");
+
+        let error =
+            select_daemon_executable(&cli, None).expect_err("non-executable helper must fail");
+        assert!(error.to_string().contains("slooshd"), "{error:#}");
+        assert!(
+            error.to_string().contains("cargo build --bins"),
+            "{error:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

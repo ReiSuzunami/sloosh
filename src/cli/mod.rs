@@ -20,7 +20,7 @@ use args::{
 
 #[cfg(test)]
 use crate::proto::{self, HostRoute, HostSummary};
-use crate::proto::{Request, Response, SecretString};
+use crate::proto::{Request, Response};
 use crate::transport::Channel;
 use crate::transport::unix;
 use std::path::Path;
@@ -133,9 +133,9 @@ fn bail_on_error_or_unexpected(resp: Response) -> anyhow::Result<Response> {
 
 async fn cmd_vault_init() -> anyhow::Result<()> {
     require_tty("vault init")?;
-    let native_approval_available = explain_native_approval_setup();
-    let password = cmd_vault_init_inner().await?;
-    enroll_native_approval(password, native_approval_available).await
+    explain_cli_approval_setup();
+    let _ = cmd_vault_init_inner().await?;
+    Ok(())
 }
 
 async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
@@ -144,49 +144,19 @@ async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
         agent: args.agent,
         force: args.force_skill,
     })?;
-    let native_approval_available = explain_native_approval_setup();
-    let password = cmd_vault_init_inner().await?;
-    enroll_native_approval(password, native_approval_available).await
-}
-
-const MACOS_NATIVE_APPROVAL_SETUP: &str = "Native approval setup (macOS):\n  Sloosh will store a protected copy of the vault Master Password in your login Keychain.\n  macOS may ask whether \"Sloosh Approval\" may access it. Choose \"Always Allow\" to avoid repeated prompts, or \"Allow\" for one-time access.\n  Follow any CLI Master Password prompt, then complete Touch ID.\n  Setup imports no SSH private keys and grants no host access. Each lease shows its exact host scope before biometric or PIN verification.";
-
-const TERMINAL_APPROVAL_SETUP: &str = "Native approval is unavailable in this installation.\n  No Keychain or biometric setup is required. This is the normal flow on Linux and standalone/source builds.\n  Approve each pending lease in another terminal with the printed `sloosh approve <ID>` command.";
-
-fn native_approval_setup_message(available: bool) -> &'static str {
-    if available {
-        MACOS_NATIVE_APPROVAL_SETUP
-    } else {
-        TERMINAL_APPROVAL_SETUP
-    }
-}
-
-fn explain_native_approval_setup() -> bool {
-    let available = crate::native_approval::is_available();
-    let message = native_approval_setup_message(available);
-    println!("{message}");
-    available
-}
-
-async fn enroll_native_approval(
-    password: Option<SecretString>,
-    available: bool,
-) -> anyhow::Result<()> {
-    if !available {
-        return Ok(());
-    }
-    let password = match password {
-        Some(password) => password,
-        None => {
-            println!("Enter the vault Master Password once to continue.");
-            prompt_master_password(true)?
-        }
-    };
-    crate::native_approval::enroll(&password)
-        .await
-        .map_err(|error| anyhow::anyhow!("could not enable Touch ID approval: {error}"))?;
-    println!("Touch ID approval enabled. Future requests show the exact host scope first.");
+    explain_cli_approval_setup();
+    let _ = cmd_vault_init_inner().await?;
     Ok(())
+}
+
+const CLI_APPROVAL_SETUP: &str = "Approval setup:\n  The CLI uses out-of-band approval from another human terminal. Approve each pending lease with the printed `sloosh approve <ID>` command.\n  On macOS, the optional Sloosh desktop app owns login Keychain, Touch ID, and PIN enrollment in its Setup and Security screens. The CLI does not launch the native helper.";
+
+fn cli_approval_setup_message() -> &'static str {
+    CLI_APPROVAL_SETUP
+}
+
+fn explain_cli_approval_setup() {
+    println!("{}", cli_approval_setup_message());
 }
 
 fn cmd_skill(action: SkillAction) -> anyhow::Result<()> {
@@ -373,19 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn native_approval_setup_explains_macos_keychain_before_biometrics() {
-        let message = native_approval_setup_message(true);
+    fn cli_setup_routes_native_approval_to_the_desktop_app() {
+        let message = cli_approval_setup_message();
         assert!(message.contains("login Keychain"));
-        assert!(message.contains("Sloosh Approval"));
-        assert!(message.contains("Always Allow"));
-        assert!(message.contains("exact host scope before biometric or PIN verification"));
-    }
-
-    #[test]
-    fn terminal_approval_setup_explains_linux_without_keychain_work() {
-        let message = native_approval_setup_message(false);
-        assert!(message.contains("normal flow on Linux and standalone/source builds"));
-        assert!(message.contains("No Keychain or biometric setup is required"));
+        assert!(message.contains("desktop app"));
+        assert!(message.contains("Setup and Security"));
+        assert!(message.contains("does not launch the native helper"));
         assert!(message.contains("sloosh approve <ID>"));
         assert!(!message.contains("Touch ID approval enabled"));
     }

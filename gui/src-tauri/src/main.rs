@@ -49,7 +49,7 @@ struct AppSnapshot {
     pin: PinSnapshot,
     vault_unlock: VaultUnlockSnapshot,
     vault_timeout_minutes: u16,
-    cli_path: String,
+    daemon_path: String,
 }
 
 #[derive(Serialize)]
@@ -157,7 +157,7 @@ impl Controller {
             pin: PinStore::current_user().status().into(),
             vault_unlock: self.unlock_snapshot(),
             vault_timeout_minutes: configured_vault_timeout().minutes(),
-            cli_path: self.daemon_executable.display().to_string(),
+            daemon_path: self.daemon_executable.display().to_string(),
         }
     }
 
@@ -431,10 +431,10 @@ async fn get_app_snapshot(controller: tauri::State<'_, Controller>) -> Result<Ap
 }
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
-fn bundled_cli_path(current_executable: &Path) -> Option<PathBuf> {
+fn bundled_daemon_path(current_executable: &Path) -> Option<PathBuf> {
     let macos = current_executable.parent()?;
     let contents = macos.parent()?;
-    Some(contents.join("Helpers").join("sloosh"))
+    Some(contents.join("Helpers").join("slooshd"))
 }
 
 fn daemon_executable() -> Result<PathBuf, String> {
@@ -447,13 +447,14 @@ fn daemon_executable() -> Result<PathBuf, String> {
     {
         Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("target/debug/sloosh"))
+            .join("target/debug/slooshd"))
     }
 
     #[cfg(not(debug_assertions))]
     {
         let current = std::env::current_exe().map_err(|error| error.to_string())?;
-        bundled_cli_path(&current).ok_or_else(|| "could not locate bundled sloosh CLI".to_string())
+        bundled_daemon_path(&current)
+            .ok_or_else(|| "could not locate bundled sloosh daemon".to_string())
     }
 }
 
@@ -466,7 +467,7 @@ fn configured_vault_timeout() -> VaultTimeout {
 fn main() {
     let vault_timeout = configured_vault_timeout();
     let controller = Controller {
-        daemon_executable: daemon_executable().expect("resolve bundled sloosh CLI"),
+        daemon_executable: daemon_executable().expect("resolve bundled sloosh daemon"),
         desktop_unlock: Arc::new(Mutex::new(DesktopUnlockSession::new(
             vault_timeout.duration(),
             DEFAULT_ABSOLUTE_TIMEOUT,
@@ -505,12 +506,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_cli_is_a_stable_helper_path() {
+    fn bundled_daemon_is_a_stable_helper_path() {
         let app = Path::new("/Applications/Sloosh.app/Contents/MacOS/Sloosh");
         assert_eq!(
-            bundled_cli_path(app),
+            bundled_daemon_path(app),
             Some(PathBuf::from(
-                "/Applications/Sloosh.app/Contents/Helpers/sloosh"
+                "/Applications/Sloosh.app/Contents/Helpers/slooshd"
             ))
         );
     }
