@@ -6,7 +6,9 @@ GitHub Releases are the primary installation channel once a release is
 available. They provide prebuilt binaries, so users do not need Rust or a C
 compiler. If the latest-release page has no version yet, use the source-build
 steps below. crates.io is a planned secondary source-install channel for Rust
-users and always compiles locally.
+users and always compiles locally. The Homebrew tap and crates.io both install
+the CLI only; the desktop app and DMG are distributed only through GitHub
+Releases.
 
 ## Prebuilt binaries
 
@@ -163,17 +165,30 @@ If an in-place replacement already left the old Linux daemon shown as
 `kill <pid>`, then retry; CLI will remove the stale socket and start the new
 binary.
 
-## Install from crates.io
+## CLI package managers
 
-After the first crate publish, this path downloads source and compiles it. It
-requires Rust 1.85 or newer and a working C/C++ build toolchain:
+Once the first formula is published, Homebrew installs the prebuilt CLI from
+the project tap:
+
+```sh
+brew install ReiSuzunami/tap/sloosh
+```
+
+The Homebrew formula does not install the desktop app or generate a DMG.
+
+After the first crate publish, crates.io can instead download the source and
+compile the CLI locally. This requires Rust 1.85 or newer and a working C/C++
+toolchain:
 
 ```sh
 cargo install sloosh --locked
 ```
 
-The installed binary normally lands in `$HOME/.cargo/bin`. crates.io is useful
-for Rust developers, but it is not the no-build installation path.
+The installed binary normally lands in `$HOME/.cargo/bin`. The crate does not
+contain the Tauri desktop source, macOS installer, or DMG packaging resources,
+and `cargo install` installs only Cargo binary targets. It therefore cannot
+build the Sloosh DMG. crates.io is useful for Rust developers, but it is not
+the no-build installation path.
 
 For a repository checkout, follow the concise
 [source-build steps in the README](../../README.en.md#build-from-source).

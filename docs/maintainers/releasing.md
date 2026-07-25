@@ -1,14 +1,17 @@
 # Releasing
 
-Sloosh has two independent distribution channels:
+Sloosh has three independent distribution channels:
 
 | Channel | Audience | Artifact |
 |---|---|---|
-| GitHub Releases | ordinary users | prebuilt macOS and Linux binaries |
-| crates.io | Rust users | source package compiled by `cargo install` |
+| GitHub Releases | ordinary users | prebuilt CLI archives and macOS desktop DMG |
+| Homebrew tap | macOS and Linux users | prebuilt CLI only |
+| crates.io | Rust users | CLI source package compiled by `cargo install` |
 
 GitHub Releases are the primary channel. A crates.io publish does not provide a
-prebuilt binary and is not required for GitHub release creation.
+prebuilt binary and is not required for GitHub release creation. Homebrew and
+crates.io do not distribute or build the desktop app or DMG; those remain
+GitHub Release artifacts.
 
 ## Before tagging
 

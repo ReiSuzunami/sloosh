@@ -17,6 +17,10 @@ Once prebuilt versions are available, download one from the
 - macOS standalone CLI: `sloosh-macos-universal.tar.gz`
 - Linux x86_64: `sloosh-linux-x86_64-musl.tar.gz`
 
+The Homebrew tap and crates.io provide the CLI only; neither includes or builds
+the desktop app. The macOS desktop app and DMG are distributed only through
+GitHub Releases.
+
 See the [installation guide](./docs/getting-started/installation.md) for
 checksums, platform requirements, and upgrades.
 
