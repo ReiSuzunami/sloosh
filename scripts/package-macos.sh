@@ -140,7 +140,9 @@ if xcrun actool \
   --app-icon Sloosh \
   --standalone-icon-behavior all \
   --output-partial-info-plist "$adaptive_icon_plist" \
-  "$adaptive_icon_source" >"$tmp_dir/actool.log" 2>&1; then
+  "$adaptive_icon_source" >"$tmp_dir/actool.log" 2>&1 &&
+  [[ -s "$adaptive_icon_output/Assets.car" ]] &&
+  [[ -s "$adaptive_icon_output/Sloosh.icns" ]]; then
   install -m 0644 "$adaptive_icon_output/Assets.car" \
     "$contents/Resources/Assets.car"
   install -m 0644 "$adaptive_icon_output/Sloosh.icns" \
@@ -148,7 +150,7 @@ if xcrun actool \
   /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Sloosh" \
     "$contents/Info.plist"
 else
-  echo "adaptive app icons are unavailable; using static ICNS fallback" >&2
+  echo "adaptive app icon output is unavailable or incomplete; using static ICNS fallback" >&2
   sed 's/^/actool: /' "$tmp_dir/actool.log" >&2
 fi
 
@@ -323,7 +325,18 @@ layout_mount_dir="/Volumes/$volume_name"
 hdiutil attach -nobrowse -readwrite "$rw_dmg" >/dev/null
 mounted_path="$layout_mount_dir"
 mounted=1
-osascript "$layout_script" "$volume_name"
+layout_ready=0
+for _ in {1..10}; do
+  if osascript "$layout_script" "$volume_name"; then
+    layout_ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "$layout_ready" -eq 1 ]] || {
+  echo "Finder did not expose the mounted volume for layout: $volume_name" >&2
+  exit 1
+}
 [[ -s "$layout_mount_dir/.DS_Store" ]]
 [[ -s "$layout_mount_dir/.background/background.png" ]]
 hdiutil detach "$layout_mount_dir" >/dev/null
