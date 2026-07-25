@@ -29,6 +29,7 @@ pnpm --dir gui install --frozen-lockfile
 pnpm --dir gui check
 pnpm --dir gui test:unit
 scripts/check-versions.sh
+scripts/check-lockfile-sync.sh
 cargo check --manifest-path gui/src-tauri/Cargo.toml --locked
 # Release binaries must embed the frontend rather than use devUrl:
 cargo build --manifest-path gui/src-tauri/Cargo.toml --locked --release \
