@@ -4,7 +4,8 @@
 
 GitHub Releases 是有版本发布后的主要安装渠道，提供预编译二进制，用户无需 Rust 或 C
 编译器。如果 latest-release 页面尚无版本，请使用下文的源码构建步骤。crates.io 是为
-Rust 用户准备的次要源码安装渠道，始终会在本机编译。
+Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebrew tap 与 crates.io 均只
+安装 CLI；桌面 App 和 DMG 仅通过 GitHub Releases 发布。
 
 ## 预编译二进制
 
@@ -141,16 +142,26 @@ sloosh skill install
 `pgrep -u "$(id -u)" -af 'sloosh daemon run'` 定位并确认进程，再执行 `kill <pid>` 后
 重试；CLI 会清理 stale socket 并启动新二进制。
 
-## 从 crates.io 安装
+## CLI 包管理器
 
-首次发布 crate 后，可通过此渠道下载源码并编译。需要 Rust 1.85 或更新版本，以及可用的
-C/C++ 工具链：
+首个 Formula 发布后，Homebrew 从项目 tap 安装预编译 CLI：
+
+```sh
+brew install ReiSuzunami/tap/sloosh
+```
+
+Homebrew Formula 不安装桌面 App，也不生成 DMG。
+
+首次发布 crate 后，也可从 crates.io 下载源码并在本机编译 CLI。需要 Rust 1.85 或
+更新版本，以及可用的 C/C++ 工具链：
 
 ```sh
 cargo install sloosh --locked
 ```
 
-二进制通常安装到 `$HOME/.cargo/bin`。此渠道适合 Rust 用户，不是免构建安装方式。
+二进制通常安装到 `$HOME/.cargo/bin`。crates.io 不包含 Tauri 桌面源码、macOS
+安装器或 DMG 打包资源，`cargo install` 也只安装 Cargo binary target，因此不能从
+crate 构建 Sloosh DMG。此渠道适合 Rust 用户，不是免构建安装方式。
 
 从仓库 checkout 构建时，见 README 中的
 [源码构建步骤](../../README.md#从源码构建)。

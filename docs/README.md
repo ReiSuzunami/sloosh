@@ -19,7 +19,7 @@ are English and `.zh-CN.md` files are their simplified Chinese translations.
 | Contributing and tests | — | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Development and verification workflow |
 | Support | — | [`SUPPORT.md`](../SUPPORT.md) | User support scope and safe diagnostics |
 | Community conduct | — | [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) | Participation and enforcement expectations |
-| Releasing | — | [`releasing.md`](maintainers/releasing.md) | Versioning, crates.io, and GitHub Releases |
+| Releasing | — | [`releasing.md`](maintainers/releasing.md) | Versioning, Homebrew, crates.io, and GitHub Releases |
 
 Repository-only, non-canonical research notes:
 

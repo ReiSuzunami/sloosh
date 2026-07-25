@@ -17,6 +17,9 @@
 - macOS 独立 CLI：`sloosh-macos-universal.tar.gz`
 - Linux x86_64：`sloosh-linux-x86_64-musl.tar.gz`
 
+Homebrew tap 与 crates.io 只提供 CLI，不包含或构建桌面 App。macOS 桌面 App
+与 DMG 仅通过 GitHub Releases 发布。
+
 校验和、平台要求与升级步骤见[安装指南](./docs/getting-started/installation.zh-CN.md)。
 
 ## 交给 Agent 安装
