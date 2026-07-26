@@ -83,11 +83,14 @@ Ownership is deliberate:
 
 The command-line distribution always keeps `sloosh` and `slooshd` in the same
 directory. On Linux and CLI-only macOS installations, the client selects that
-sibling daemon. On macOS, if the standard Applications install contains
-`/Applications/Sloosh.app/Contents/Helpers/slooshd`, the CLI selects that
-private daemon instead. The GUI always selects the helper inside its own bundle.
-This deterministic rule lets Homebrew/Cargo/archive clients and the installed
-desktop share one daemon without trusting `PATH` lookup.
+sibling daemon. A macOS release CLI instead selects
+`/Applications/Sloosh.app/Contents/Helpers/slooshd` when present; source/debug
+builds keep using their build-tree sibling. The GUI always selects the helper
+inside its own bundle. Before selecting an app helper, both clients validate
+the bundle-to-helper path components, ownership, write permissions, file type,
+and executable mode. This deterministic rule lets Homebrew/Cargo/archive
+clients and the installed desktop share one daemon without trusting `PATH`
+lookup.
 
 ## 2. Local transport boundary
 

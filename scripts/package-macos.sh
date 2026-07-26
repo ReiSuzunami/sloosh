@@ -418,10 +418,31 @@ test "$reported_dmg" = "$dmg"
 
 simulated_install="$tmp_dir/Applications/Sloosh.app"
 simulated_home="$tmp_dir/home"
-mkdir -p "$simulated_home"
+fresh_sibling="$tmp_dir/fresh-sibling/slooshd"
+mkdir -p "$simulated_home" "$(dirname "$fresh_sibling")"
+cp "$mounted_app/Contents/Helpers/slooshd" "$fresh_sibling"
+chmod 0755 "$fresh_sibling"
+SLOOSH_HOME="$simulated_home/.sloosh" \
+  "$fresh_sibling" >"$tmp_dir/fresh-sibling-daemon.log" 2>&1 &
+test_daemon_pid=$!
+for _ in {1..100}; do
+  [[ -S "$simulated_home/.sloosh/sloosh.sock" ]] && break
+  sleep 0.05
+done
+test -S "$simulated_home/.sloosh/sloosh.sock"
 env SLOOSH_INSTALLER_TEST_MODE=1 \
   "$mounted_installer/Contents/MacOS/install-sloosh" \
   --test-install "$(dirname "$simulated_install")" "$simulated_home"
+for _ in {1..100}; do
+  [[ -e "$simulated_home/.sloosh/sloosh.sock" ]] || break
+  sleep 0.05
+done
+[[ ! -e "$simulated_home/.sloosh/sloosh.sock" ]] || {
+  echo "fresh install did not stop the existing sibling daemon" >&2
+  exit 1
+}
+wait "$test_daemon_pid"
+test_daemon_pid=""
 codesign --verify --deep --strict --verbose=2 "$simulated_install"
 test "$("$simulated_install/Contents/Helpers/slooshd" --version)" = "slooshd $version"
 [[ ! -e "$simulated_install/Contents/Helpers/sloosh" ]]
@@ -443,6 +464,21 @@ grep -F "Removed the legacy DMG CLI link at ~/.local/bin/sloosh." \
 [[ ! -e "$simulated_home/.local/bin/sloosh" ]]
 [[ ! -L "$simulated_home/.local/bin/sloosh" ]]
 codesign --verify --deep --strict --verbose=2 "$simulated_install"
+
+# A staged replacement failure restores the exact previous application and
+# removes both transient siblings.
+rollback_inode="$(stat -f '%i' "$simulated_install")"
+env SLOOSH_INSTALLER_TEST_MODE=1 \
+  "$mounted_installer/Contents/MacOS/install-sloosh" \
+  --test-install-rollback "$(dirname "$simulated_install")" "$simulated_home"
+test "$(stat -f '%i' "$simulated_install")" = "$rollback_inode"
+codesign --verify --deep --strict --verbose=2 "$simulated_install"
+if find "$(dirname "$simulated_install")" -maxdepth 1 \
+  \( -name '.Sloosh.installing-*.app' -o -name '.Sloosh.backup-*.app' \) \
+  -print -quit | grep -q .; then
+  echo "installer rollback left a staged or backup application behind" >&2
+  exit 1
+fi
 
 # A v0.1.0 GUI + full-CLI helper remains a recognized upgrade target.
 legacy_home="$tmp_dir/legacy-home"

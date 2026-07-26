@@ -296,6 +296,7 @@ mod tests {
         let message = daemon_connect_error(Path::new("/tmp/sloosh.sock"), denied).to_string();
         assert!(message.contains("refusing to use the daemon socket"));
         assert!(message.contains("server identity could not be verified"));
+        assert!(message.contains("sloosh daemon stop"));
 
         for kind in [
             std::io::ErrorKind::NotFound,

@@ -42,14 +42,15 @@ This is a bidirectional protocol gate:
 - a raw same-UID client cannot skip the server gate for ordinary requests and
   remains subject to later capability checks and strict framing.
 
-`sloosh daemon stop` intentionally connects without executable authentication
-or `Hello` and sends only the pre-negotiation `Shutdown` request. This recovery
-path remains usable when the local `slooshd` file was replaced or removed;
-`Shutdown` carries no credential and only reduces authority. During a DMG
-upgrade, the native macOS installer sends that same fixed request directly to
-the private default socket before replacing the app; it never executes the old
-bundle. Neither path can send an ordinary request on that connection. These
-paths keep an incompatible running daemon operable during upgrade.
+`sloosh daemon stop` intentionally connects without client-side socket-peer
+eUID or executable-path authentication or `Hello`, and sends only the
+pre-negotiation `Shutdown` request. This recovery path remains usable when the
+local `slooshd` file was replaced or removed; `Shutdown` carries no credential
+and only reduces authority. During a DMG install, the native macOS installer
+sends that same fixed request directly to the private default socket before
+installing the app; it never executes the installed bundle. Neither path can
+send an ordinary request on that connection. These paths keep an incompatible
+running daemon operable during installation or upgrade.
 
 ### Upgrade procedure
 

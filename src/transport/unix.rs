@@ -127,9 +127,8 @@ impl UnixChannel {
     /// instead of their own executable.
     pub async fn connect_verified(path: &Path, expected_exe: &Path) -> io::Result<Self> {
         let channel = Self::connect_unverified(path).await?;
-        let expected_exe = std::fs::canonicalize(expected_exe)?;
         channel
-            .verify_peer_identity_against(effective_uid(), &expected_exe)
+            .verify_peer_identity(expected_exe)
             .map_err(|source| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -140,6 +139,14 @@ impl UnixChannel {
                 )
             })?;
         Ok(channel)
+    }
+
+    /// Authenticate an already-connected local server before sending an
+    /// ordinary request. This lets status probe socket liveness before it
+    /// resolves the expected helper, without trusting any server response.
+    pub(crate) fn verify_peer_identity(&self, expected_exe: &Path) -> io::Result<()> {
+        let expected_exe = std::fs::canonicalize(expected_exe)?;
+        self.verify_peer_identity_against(effective_uid(), &expected_exe)
     }
 
     /// Connect without authenticating the server process.

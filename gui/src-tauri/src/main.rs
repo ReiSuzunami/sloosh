@@ -453,8 +453,10 @@ fn daemon_executable() -> Result<PathBuf, String> {
     #[cfg(not(debug_assertions))]
     {
         let current = std::env::current_exe().map_err(|error| error.to_string())?;
-        bundled_daemon_path(&current)
-            .ok_or_else(|| "could not locate bundled sloosh daemon".to_string())
+        let daemon = bundled_daemon_path(&current)
+            .ok_or_else(|| "could not locate bundled sloosh daemon".to_string())?;
+        sloosh::client::validate_bundled_daemon_executable(&daemon)
+            .map_err(|error| error.to_string())
     }
 }
 

@@ -22,17 +22,18 @@ Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebr
 macOS DMG：
 
 ```sh
-version=0.1.0
+version=0.2.0
 dmg="Sloosh-$version-macos-universal.dmg"
 grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
 open "$dmg"
 ```
 
-双击 `Install Sloosh`，检查确认信息后选择“Install”。安装器会把 `Sloosh.app` 复制到
-“应用程序”，不会安装公共 CLI，也不会向 `PATH` 写入任何内容。由早期合并式 bundle
-升级时，它只删除目标字符串精确指向同一 App 旧 helper 的 `~/.local/bin/sloosh`
-符号链接；其它文件或链接一律保留。随后它会推出磁盘映像，并询问是否把下载的 DMG
-移到废纸篓。
+双击 `Install Sloosh`，检查确认信息后选择“Install”。安装器会先停止任何正在运行的
+sloosh daemon，再把 `Sloosh.app` 复制到“应用程序”；这也包括此前由 Homebrew、Cargo、
+压缩包或源码构建启动的 daemon。停止 daemon 会结束活跃 session 与 forward。安装器
+不会安装公共 CLI，也不会向 `PATH` 写入任何内容。由早期合并式 bundle 升级时，它只
+删除目标字符串精确指向同一 App 旧 helper 的 `~/.local/bin/sloosh` 符号链接；其它文件
+或链接一律保留。随后它会推出磁盘映像，并询问是否把下载的 DMG 移到废纸篓。
 
 App bundle 中的 Tauri 桌面程序位于 `Contents/MacOS/Sloosh`，私有 daemon 位于
 `Contents/Helpers/slooshd`，并且刻意不包含公共 `sloosh` executable。桌面端通过
@@ -138,11 +139,12 @@ sloosh --version
 sloosh skill install
 ```
 
-如果使用 DMG 安装，打开新版 DMG 并运行 `Install Sloosh`。替换已有的有效安装时，安装器
-会先停止旧 daemon，再进行 staged replacement；精确匹配旧 DMG helper 的 CLI 链接会被
-删除，Homebrew、Cargo、压缩包或用户自管的 CLI 不会改变。确认框会提示：停止 daemon 会
-结束活跃 session 和 forward。若 GUI 正在运行，同一确认框会说明必须退出；安装器先请求
-正常退出，等待 5 秒后才在用户已确认的前提下强制退出。旧 GUI 仍在运行时不会开始替换。
+如果使用 DMG 安装，打开新版 DMG 并运行 `Install Sloosh`。无论首次安装还是升级，安装器
+都会先停止占用共用 socket 的 daemon，再安装 App helper；精确匹配旧 DMG helper 的 CLI
+链接会被删除，Homebrew、Cargo、压缩包或用户自管的 CLI 不会改变。确认框会提示：停止
+daemon 会结束活跃 session 和 forward。若 GUI 正在运行，同一确认框会说明必须退出；
+安装器先请求正常退出，等待 5 秒后才在用户已确认的前提下强制退出。旧 GUI 仍在运行时
+不会开始替换。
 
 这个顺序也避免 Linux 上旧 daemon 继续从已替换的 executable 运行；新 CLI 会拒绝无法通过
 `/proc/<pid>/exe` 验证的 peer。

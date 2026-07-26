@@ -34,7 +34,7 @@ requires the tag version to equal `Cargo.toml` and the tagged commit to be in
 Create and push an annotated `v<version>` tag:
 
 ```sh
-version=0.1.0
+version=0.2.0
 git tag -a "v$version" -m "sloosh v$version"
 git push origin "v$version"
 ```
@@ -91,12 +91,13 @@ rmdir "$mount_dir"
 
 Both architecture checks must report `x86_64 arm64` in either order. Opening
 the DMG must show one large, centered `Install Sloosh` app. The package script
-also installs the payload twice in a temporary sandbox, verifies the CLI link
-removal and conflict-preservation behavior, and exercises the cleanup helper's
-volume ejection handoff. The payload must contain an independent GUI executable
-and private daemon, no public CLI, and no newly created CLI link. Do not
-describe the macOS artifact as notarized until Developer ID signing and Apple
-notarization are configured.
+also installs the payload twice in a temporary sandbox, verifies that a fresh
+install stops an existing sibling daemon, forces a staged replacement failure
+to verify rollback, verifies the CLI link removal and conflict-preservation
+behavior, and exercises the cleanup helper's volume ejection handoff. The
+payload must contain an independent GUI executable and private daemon, no
+public CLI, and no newly created CLI link. Do not describe the macOS artifact
+as notarized until Developer ID signing and Apple notarization are configured.
 
 ## Homebrew tap
 

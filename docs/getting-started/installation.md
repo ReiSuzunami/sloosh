@@ -5,7 +5,7 @@ English | [简体中文](installation.zh-CN.md)
 GitHub Releases are the primary installation channel once a release is
 available. They provide prebuilt binaries, so users do not need Rust or a C
 compiler. If the latest-release page has no version yet, use the source-build
-steps below. crates.io is a planned secondary source-install channel for Rust
+steps below. crates.io is a secondary source-install channel for Rust
 users and always compiles locally. The Homebrew tap and crates.io install the
 command-line package (`sloosh` plus its companion `slooshd`); the desktop app
 and DMG are distributed only through GitHub Releases.
@@ -25,19 +25,21 @@ Download `SHA256SUMS` from the same release and verify the selected file.
 macOS DMG:
 
 ```sh
-version=0.1.0
+version=0.2.0
 dmg="Sloosh-$version-macos-universal.dmg"
 grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
 open "$dmg"
 ```
 
 Double-click `Install Sloosh`, review the confirmation, and choose Install. The
-installer copies `Sloosh.app` to Applications. It does not install a public
-CLI or create anything in `PATH`. During an upgrade from the original combined
-bundle, it removes only a `~/.local/bin/sloosh` symlink whose stored destination
-is exactly the old helper inside that same app; every unrelated file or link is
-preserved. It then ejects the disk image and asks whether to move the downloaded
-DMG to Trash.
+installer stops any running sloosh daemon before copying `Sloosh.app` to
+Applications, including one started earlier by Homebrew, Cargo, an archive, or
+a source build. Stopping ends active sessions and forwards. The installer does
+not install a public CLI or create anything in `PATH`. During an upgrade from
+the original combined bundle, it removes only a `~/.local/bin/sloosh` symlink
+whose stored destination is exactly the old helper inside that same app; every
+unrelated file or link is preserved. It then ejects the disk image and asks
+whether to move the downloaded DMG to Trash.
 
 The app bundle contains a Tauri desktop executable at `Contents/MacOS/Sloosh`
 and a private daemon at `Contents/Helpers/slooshd`. It deliberately contains no
@@ -157,14 +159,15 @@ sloosh --version
 sloosh skill install
 ```
 
-For a DMG installation, open the new DMG and run `Install Sloosh`. When
-replacing an existing valid installation, it stops the old daemon before the
-staged replacement. It removes the exact legacy DMG-created CLI symlink but
-does not touch a Homebrew, Cargo, archive, or user-managed CLI. The confirmation
-warns that stopping the daemon ends active sessions and forwards. If the GUI is
-running, the same confirmation says it must quit; the installer requests normal
-termination, waits 5 seconds, then force quits only under that explicit
-consent. Replacement never starts while the old GUI is still running.
+For a DMG installation, open the new DMG and run `Install Sloosh`. On both a
+fresh install and an upgrade, it stops any daemon already using the shared
+socket before installing the app helper. It removes the exact legacy
+DMG-created CLI symlink but does not touch a Homebrew, Cargo, archive, or
+user-managed CLI. The confirmation warns that stopping the daemon ends active
+sessions and forwards. If the GUI is running, the same confirmation says it
+must quit; the installer requests normal termination, waits 5 seconds, then
+force quits only under that explicit consent. Replacement never starts while
+the old GUI is still running.
 
 This order also avoids the old daemon continuing from a replaced executable on
 Linux, where the new CLI correctly refuses an unverifiable `/proc/<pid>/exe`

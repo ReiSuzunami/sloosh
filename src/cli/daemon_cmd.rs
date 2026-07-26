@@ -7,6 +7,7 @@ use super::{client, display_host_list};
 use crate::proto::{self, Request, Response, StatusReply};
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
+use anyhow::Context;
 
 pub(super) async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
     let socket_path = unix::resolve_socket_path();
@@ -78,8 +79,7 @@ async fn cmd_daemon_stop(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 async fn cmd_daemon_status(socket_path: &Path) -> anyhow::Result<()> {
-    let daemon_executable = client::daemon_executable()?;
-    let channel = match UnixChannel::connect_verified(socket_path, &daemon_executable).await {
+    let channel = match UnixChannel::connect_unverified(socket_path).await {
         Ok(channel) => channel,
         Err(error) if daemon_is_not_running_error(&error) => {
             println!(
@@ -90,6 +90,16 @@ async fn cmd_daemon_status(socket_path: &Path) -> anyhow::Result<()> {
         }
         Err(error) => return Err(daemon_connect_error(socket_path, error)),
     };
+    let daemon_executable = client::daemon_executable().with_context(|| {
+        format!(
+            "a daemon is listening at {}, but sloosh cannot locate a trusted daemon executable \
+             to verify it. Stop the listener when ready with `sloosh daemon stop`, then retry",
+            socket_path.display()
+        )
+    })?;
+    channel
+        .verify_peer_identity(&daemon_executable)
+        .map_err(|error| daemon_connect_error(socket_path, error))?;
     let mut channel = channel;
     let reply = request_status(&mut channel).await?;
     print_status_human(&reply, socket_path);

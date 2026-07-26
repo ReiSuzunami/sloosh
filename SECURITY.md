@@ -71,24 +71,29 @@ Every verified client connection checks both:
 - socket peer executable canonical path equals the explicitly selected
   `slooshd` executable canonical path.
 
-CLI and desktop refuse either mismatch. The command-line package selects its
-sibling `slooshd`, except that macOS prefers the private helper in the standard
-Applications install when present; the desktop selects only its own bundled
-helper. Selection never searches `PATH`. The client then negotiates exact
-protocol version; daemon keeps a per-connection gate and rejects ordinary
-requests before side effects until negotiation succeeds.
+CLI and desktop refuse either mismatch. Release command-line builds select
+their sibling `slooshd`, except that macOS prefers the private helper in the
+standard Applications install when present; source/debug builds keep selecting
+their build-tree sibling. The desktop selects only its own bundled helper.
+Selection never searches `PATH`. Before using an app helper, clients reject a
+symlink at any component from the app bundle through `slooshd`, an unexpected
+owner other than root or the effective UID, and group- or other-writable
+components. The client then negotiates exact protocol version; daemon keeps a
+per-connection gate and rejects ordinary requests before side effects until
+negotiation succeeds.
 [`protocol.md`](docs/internals/protocol.md#1-version-rule) owns exact sequencing
 and pre-negotiation messages.
 
 This prevents simple socket squatting by a different executable. It is a path
 and process check, not code signing or inode pinning.
 
-`sloosh daemon stop` is the deliberate exception: it may connect without
-executable authentication and send only the pre-negotiation `Shutdown`
-request, so a daemon can still be stopped after its on-disk helper was removed
-or replaced. That message carries no credential, cannot open the ordinary
-protocol gate, and only reduces authority. The macOS installer uses the same
-narrow shutdown path during replacement.
+`sloosh daemon stop` is the deliberate exception: it skips both client-side
+socket-peer eUID and executable-path authentication and sends only the
+pre-negotiation `Shutdown` request, so a daemon can still be stopped after its
+on-disk helper was removed or replaced. That message carries no credential,
+cannot open the ordinary protocol gate, and only reduces authority. The macOS
+installer uses the same narrow shutdown path before both fresh installations
+and replacements.
 
 ### 4.2 Client identity and host authorization in the daemon
 
@@ -288,9 +293,10 @@ installs only `/Applications/Sloosh.app` and creates no CLI link. It rejects a
 symbolic-link, non-application, or unrecognized directory at the app target,
 validates the new payload's ad-hoc code signature, stages it on the Applications
 filesystem, and keeps a same-directory backup until replacement succeeds.
-Before replacing a valid current or legacy Sloosh bundle, it sends the fixed
-pre-handshake `Shutdown` request to the private daemon socket without executing
-the old bundle; the confirmation warns that active sessions and forwards end.
+Before every install, it sends the fixed pre-handshake `Shutdown` request to an
+existing private daemon socket without executing any installed bundle. This
+also stops a daemon started by a Homebrew, Cargo, archive, or source CLI before
+the app existed; the confirmation warns that active sessions and forwards end.
 After replacement it removes only a `~/.local/bin/sloosh` symbolic link whose
 stored destination exactly matches the legacy helper path inside that target
 app. An unrelated file, directory, or link is preserved.

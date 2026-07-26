@@ -268,7 +268,8 @@ private func replaceApplication(
     target: URL,
     home: URL,
     stopApplication: Bool,
-    stopDaemon: Bool
+    stopDaemon: Bool,
+    simulateInstallFailureAfterBackup: Bool
 ) throws {
     try validatedSlooshBundle(at: source)
     let targetKind = try nodeKind(at: target)
@@ -286,7 +287,10 @@ private func replaceApplication(
     if stopApplication && targetKind == .directory {
         try stopRunningApplication(at: target)
     }
-    if stopDaemon && targetKind == .directory {
+    // A Homebrew, Cargo, archive, or source CLI may already have started the
+    // shared daemon before this app exists. Stop it on both fresh installs and
+    // upgrades so the next client can select the newly installed app helper.
+    if stopDaemon {
         try stopExistingDaemon(home: home)
     }
 
@@ -323,6 +327,9 @@ private func replaceApplication(
     do {
         try fileManager.moveItem(at: target, to: backup)
         do {
+            if simulateInstallFailureAfterBackup {
+                throw InstallerFailure.message("simulated staged replacement failure")
+            }
             try fileManager.moveItem(at: staged, to: target)
         } catch let installError {
             do {
@@ -370,7 +377,8 @@ private func install(
     applicationsDirectory: URL,
     home: URL,
     stopApplication: Bool,
-    stopDaemon: Bool
+    stopDaemon: Bool,
+    simulateInstallFailureAfterBackup: Bool = false
 ) throws -> InstallResult {
     try requireDirectory(applicationsDirectory, create: true)
     let target = applicationsDirectory.appendingPathComponent("Sloosh.app", isDirectory: true)
@@ -379,7 +387,8 @@ private func install(
         target: target,
         home: home,
         stopApplication: stopApplication,
-        stopDaemon: stopDaemon
+        stopDaemon: stopDaemon,
+        simulateInstallFailureAfterBackup: simulateInstallFailureAfterBackup
     )
     return InstallResult(
         targetApp: target,
@@ -562,7 +571,7 @@ private func runInstallerUI() -> Int32 {
         ? "Sloosh is running. Continuing will ask it to quit; if it does not close within 5 seconds, the installer will force quit it. Its daemon will also stop, ending active sessions and forwards."
         : existing
         ? "This replaces the installed app. If Sloosh starts before replacement, the installer will quit it and force quit after 5 seconds if needed. Its daemon will also stop, ending active sessions and forwards."
-        : "Sloosh will be copied to Applications. The DMG contains the desktop control plane and its private daemon; install the CLI separately with Homebrew or Cargo."
+        : "Sloosh will be copied to Applications. Any running Sloosh daemon will stop, ending active sessions and forwards. The DMG contains the desktop control plane and its private daemon; install the CLI separately with Homebrew or Cargo."
 
     guard showAlert(
         title: running ? "Quit Sloosh and Update?" : existing ? "Replace Sloosh?" : "Install Sloosh?",
@@ -642,7 +651,7 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
                 applicationsDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
                 home: URL(fileURLWithPath: arguments[3], isDirectory: true),
                 stopApplication: false,
-                stopDaemon: false
+                stopDaemon: true
             )
             print("installed \(result.targetApp.path)")
             print(result.message)
@@ -658,6 +667,30 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
         }
         print(image.path)
         return 0
+    case "--test-install-rollback":
+        guard arguments.count == 4 else {
+            fputs("usage: install-sloosh --test-install-rollback <applications-dir> <home>\n", stderr)
+            return 2
+        }
+        do {
+            _ = try install(
+                sourceApp: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/Sloosh.app"),
+                applicationsDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
+                home: URL(fileURLWithPath: arguments[3], isDirectory: true),
+                stopApplication: false,
+                stopDaemon: true,
+                simulateInstallFailureAfterBackup: true
+            )
+            fputs("error: simulated replacement unexpectedly succeeded\n", stderr)
+            return 1
+        } catch {
+            guard error.localizedDescription.contains("simulated staged replacement failure") else {
+                fputs("error: unexpected rollback failure: \(error.localizedDescription)\n", stderr)
+                return 1
+            }
+            print("rollback restored the previous application")
+            return 0
+        }
     case "--test-shutdown":
         guard arguments.count == 3 else { return 2 }
         do {

@@ -107,6 +107,24 @@ async fn daemon_stop_recovers_when_the_local_slooshd_file_is_missing() {
     std::fs::set_permissions(&copied_cli, std::fs::Permissions::from_mode(0o755))
         .expect("make copied CLI executable");
 
+    let absent = tokio::process::Command::new(&copied_cli)
+        .args(["daemon", "status"])
+        .env("SLOOSH_HOME", &root)
+        .env("SLOOSH_SOCKET", &socket)
+        .output()
+        .await
+        .expect("query absent daemon");
+    assert!(
+        absent.status.success(),
+        "absent daemon status failed: {}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&absent.stdout).contains("is not running"),
+        "unexpected absent status: {}",
+        String::from_utf8_lossy(&absent.stdout)
+    );
+
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_slooshd"))
         .env("SLOOSH_HOME", &root)
         .env("SLOOSH_SOCKET", &socket)
@@ -122,6 +140,27 @@ async fn daemon_stop_recovers_when_the_local_slooshd_file_is_missing() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(socket.exists(), "slooshd did not bind its socket");
+
+    let status = tokio::process::Command::new(&copied_cli)
+        .args(["daemon", "status"])
+        .env("SLOOSH_HOME", &root)
+        .env("SLOOSH_SOCKET", &socket)
+        .output()
+        .await
+        .expect("query daemon without local helper");
+    assert!(
+        !status.status.success(),
+        "unverifiable daemon status must fail closed"
+    );
+    let status_error = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        status_error.contains("daemon is listening"),
+        "{status_error}"
+    );
+    assert!(
+        status_error.contains("sloosh daemon stop"),
+        "{status_error}"
+    );
 
     let output = tokio::process::Command::new(&copied_cli)
         .args(["daemon", "stop"])
