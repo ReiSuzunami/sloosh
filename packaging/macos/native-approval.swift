@@ -114,8 +114,7 @@ private func isTrustedParent() -> Bool {
         .path
     let trustedPaths = [
         contents.appendingPathComponent("MacOS/Sloosh"),
-        contents.appendingPathComponent("MacOS/sloosh"),
-        contents.appendingPathComponent("Helpers/sloosh"),
+        contents.appendingPathComponent("Helpers/slooshd"),
     ].map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
     return trustedPaths.contains(actualPath)
 }

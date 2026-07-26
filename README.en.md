@@ -13,13 +13,15 @@ agents never need passwords or private keys.
 Once prebuilt versions are available, download one from the
 [latest GitHub Release](https://github.com/ReiSuzunami/sloosh/releases/latest):
 
-- macOS desktop app and CLI: `Sloosh-<version>-macos-universal.dmg`
-- macOS standalone CLI: `sloosh-macos-universal.tar.gz`
+- macOS desktop control plane: `Sloosh-<version>-macos-universal.dmg`
+- macOS command-line package: `sloosh-macos-universal.tar.gz`
 - Linux x86_64: `sloosh-linux-x86_64-musl.tar.gz`
 
-The Homebrew tap and crates.io provide the CLI only; neither includes or builds
-the desktop app. The macOS desktop app and DMG are distributed only through
-GitHub Releases.
+The DMG installs only the desktop control plane and its private daemon; it does
+not put the `sloosh` CLI in `PATH`. Homebrew, crates.io, and the command-line
+archives provide `sloosh` with its companion `slooshd`, but do not include or
+build the desktop app. The app and DMG are distributed only through GitHub
+Releases.
 
 See the [installation guide](./docs/getting-started/installation.md) for
 checksums, platform requirements, and upgrades.
@@ -33,13 +35,16 @@ You are my sloosh installation guide.
 
 1. Detect the OS and architecture, then run `command -v sloosh && sloosh --version`.
    Use only `https://github.com/ReiSuzunami/sloosh`. If sloosh is missing or old,
-   check the latest Release: choose the matching DMG/archive and verify
+   choose Homebrew or the matching command-line archive and verify
    `SHA256SUMS`, or explain the Rust 1.85+ source build when no release exists.
-   Ask before installing anything. Never use `curl | sh`, silently invoke a
-   package manager, bypass platform protections, or request/display passwords,
-   SSH keys, vault secrets, or lease tokens.
-2. Once the binary works, explain `sloosh init` and ask me to run it in my own
+   The macOS DMG is an optional desktop control plane and does not provide the
+   CLI. Ask before installing anything. Never use `curl | sh`, silently invoke
+   a package manager, bypass platform protections, request/display passwords,
+   SSH keys, vault secrets, or lease tokens, or run `slooshd` directly.
+2. Once the CLI works, explain `sloosh init` and ask me to run it in my own
    interactive terminal. Do not run it, fake a TTY, or enter/read any secret.
+   If I also install the desktop app, guide me to complete native unlock setup
+   myself in its Setup/Security screens.
 3. After I confirm completion, run only `sloosh skill status --agent auto` and
    `sloosh status`, then report the results. Host access still requires
    out-of-band human approval.
@@ -55,10 +60,11 @@ Requires Rust 1.85+ and a C/C++ build toolchain:
 ```sh
 git clone https://github.com/ReiSuzunami/sloosh.git
 cd sloosh
-cargo build --release --locked
+cargo build --release --bins --locked
 ```
 
-The binary is written to `target/release/sloosh`.
+The client and daemon are written to `target/release/sloosh` and
+`target/release/slooshd`.
 
 ## Documentation
 

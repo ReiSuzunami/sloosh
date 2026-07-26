@@ -28,7 +28,7 @@ private enum NodeKind {
 
 private struct InstallResult {
     let targetApp: URL
-    let cliMessage: String
+    let message: String
 }
 
 private func nodeKind(at url: URL) throws -> NodeKind {
@@ -66,29 +66,51 @@ private func requireDirectory(_ url: URL, create: Bool) throws {
     }
 }
 
-private func isRecognizedSlooshBundle(at url: URL) throws -> Bool {
+private func bundleExecutableName(at url: URL) throws -> String? {
     guard try nodeKind(at: url) == .directory,
           let bundle = Bundle(url: url),
           bundle.bundleIdentifier == bundleIdentifier,
           let executableName = bundle.object(forInfoDictionaryKey: "CFBundleExecutable") as? String
     else {
-        return false
+        return nil
     }
     let executable = url.appendingPathComponent("Contents/MacOS/\(executableName)")
-    let helper = url.appendingPathComponent("Contents/Helpers/sloosh")
     guard fileManager.isExecutableFile(atPath: executable.path) else {
+        return nil
+    }
+    return executableName
+}
+
+private func isCurrentSlooshBundle(at url: URL) throws -> Bool {
+    guard try bundleExecutableName(at: url) == "Sloosh" else {
         return false
     }
+    let daemon = url.appendingPathComponent("Contents/Helpers/slooshd")
+    let publicCLI = url.appendingPathComponent("Contents/Helpers/sloosh")
+    return try nodeKind(at: daemon) == .other
+        && fileManager.isExecutableFile(atPath: daemon.path)
+        && nodeKind(at: publicCLI) == .missing
+}
+
+private func isRecognizedSlooshBundle(at url: URL) throws -> Bool {
+    if try isCurrentSlooshBundle(at: url) {
+        return true
+    }
+
+    guard let executableName = try bundleExecutableName(at: url) else {
+        return false
+    }
+    let legacyHelper = url.appendingPathComponent("Contents/Helpers/sloosh")
     if executableName == "Sloosh" {
-        return try nodeKind(at: helper) == .other
-            && fileManager.isExecutableFile(atPath: helper.path)
+        return try nodeKind(at: legacyHelper) == .other
+            && fileManager.isExecutableFile(atPath: legacyHelper.path)
     }
     guard executableName == "sloosh",
-          try nodeKind(at: helper) == .symbolicLink
+          try nodeKind(at: legacyHelper) == .symbolicLink
     else {
         return false
     }
-    return try fileManager.destinationOfSymbolicLink(atPath: helper.path) == "../MacOS/sloosh"
+    return try fileManager.destinationOfSymbolicLink(atPath: legacyHelper.path) == "../MacOS/sloosh"
 }
 
 private func validateCodeSignature(at url: URL) throws {
@@ -105,7 +127,7 @@ private func validateCodeSignature(at url: URL) throws {
 }
 
 private func validatedSlooshBundle(at url: URL) throws {
-    guard try isRecognizedSlooshBundle(at: url) else {
+    guard try isCurrentSlooshBundle(at: url) else {
         throw InstallerFailure.message("Sloosh application payload is missing or malformed.")
     }
     try validateCodeSignature(at: url)
@@ -246,7 +268,8 @@ private func replaceApplication(
     target: URL,
     home: URL,
     stopApplication: Bool,
-    stopDaemon: Bool
+    stopDaemon: Bool,
+    simulateInstallFailureAfterBackup: Bool
 ) throws {
     try validatedSlooshBundle(at: source)
     let targetKind = try nodeKind(at: target)
@@ -264,7 +287,10 @@ private func replaceApplication(
     if stopApplication && targetKind == .directory {
         try stopRunningApplication(at: target)
     }
-    if stopDaemon && targetKind == .directory {
+    // A Homebrew, Cargo, archive, or source CLI may already have started the
+    // shared daemon before this app exists. Stop it on both fresh installs and
+    // upgrades so the next client can select the newly installed app helper.
+    if stopDaemon {
         try stopExistingDaemon(home: home)
     }
 
@@ -301,6 +327,9 @@ private func replaceApplication(
     do {
         try fileManager.moveItem(at: target, to: backup)
         do {
+            if simulateInstallFailureAfterBackup {
+                throw InstallerFailure.message("simulated staged replacement failure")
+            }
             try fileManager.moveItem(at: staged, to: target)
         } catch let installError {
             do {
@@ -319,32 +348,27 @@ private func replaceApplication(
     }
 }
 
-private func installCLILink(targetApp: URL, home: URL) -> String {
-    let local = home.appendingPathComponent(".local", isDirectory: true)
-    let bin = local.appendingPathComponent("bin", isDirectory: true)
-    let link = bin.appendingPathComponent("sloosh")
-    let helper = targetApp.appendingPathComponent("Contents/Helpers/sloosh")
+private func removeLegacyCLILink(targetApp: URL, home: URL) -> String {
+    let link = home.appendingPathComponent(".local/bin/sloosh")
+    let legacyHelper = targetApp.appendingPathComponent("Contents/Helpers/sloosh")
+    let separateInstall = "The DMG installs the desktop control plane only; install the CLI separately with Homebrew or Cargo."
 
     do {
-        try requireDirectory(home, create: false)
-        try requireDirectory(local, create: true)
-        try requireDirectory(bin, create: true)
-
         switch try nodeKind(at: link) {
         case .missing:
-            try fileManager.createSymbolicLink(at: link, withDestinationURL: helper)
-            return "CLI installed at ~/.local/bin/sloosh."
+            return separateInstall
         case .symbolicLink:
             let destination = try fileManager.destinationOfSymbolicLink(atPath: link.path)
-            if destination == helper.path {
-                return "CLI link at ~/.local/bin/sloosh is current."
+            if destination == legacyHelper.path {
+                try fileManager.removeItem(at: link)
+                return "Removed the legacy DMG CLI link at ~/.local/bin/sloosh. \(separateInstall)"
             }
-            return "Existing CLI link at ~/.local/bin/sloosh was left unchanged."
+            return "Existing CLI link at ~/.local/bin/sloosh was left unchanged. \(separateInstall)"
         case .directory, .socket, .other:
-            return "Existing item at ~/.local/bin/sloosh was left unchanged."
+            return "Existing item at ~/.local/bin/sloosh was left unchanged. \(separateInstall)"
         }
     } catch {
-        return "Sloosh was installed, but its CLI link was not changed: \(error.localizedDescription)"
+        return "Sloosh was installed, but its legacy CLI link could not be inspected: \(error.localizedDescription). \(separateInstall)"
     }
 }
 
@@ -353,7 +377,8 @@ private func install(
     applicationsDirectory: URL,
     home: URL,
     stopApplication: Bool,
-    stopDaemon: Bool
+    stopDaemon: Bool,
+    simulateInstallFailureAfterBackup: Bool = false
 ) throws -> InstallResult {
     try requireDirectory(applicationsDirectory, create: true)
     let target = applicationsDirectory.appendingPathComponent("Sloosh.app", isDirectory: true)
@@ -362,9 +387,13 @@ private func install(
         target: target,
         home: home,
         stopApplication: stopApplication,
-        stopDaemon: stopDaemon
+        stopDaemon: stopDaemon,
+        simulateInstallFailureAfterBackup: simulateInstallFailureAfterBackup
     )
-    return InstallResult(targetApp: target, cliMessage: installCLILink(targetApp: target, home: home))
+    return InstallResult(
+        targetApp: target,
+        message: removeLegacyCLILink(targetApp: target, home: home)
+    )
 }
 
 private func volumeRoot(containing url: URL) -> URL? {
@@ -542,7 +571,7 @@ private func runInstallerUI() -> Int32 {
         ? "Sloosh is running. Continuing will ask it to quit; if it does not close within 5 seconds, the installer will force quit it. Its daemon will also stop, ending active sessions and forwards."
         : existing
         ? "This replaces the installed app. If Sloosh starts before replacement, the installer will quit it and force quit after 5 seconds if needed. Its daemon will also stop, ending active sessions and forwards."
-        : "Sloosh will be copied to Applications. Its CLI will be linked at ~/.local/bin/sloosh when that path is available."
+        : "Sloosh will be copied to Applications. Any running Sloosh daemon will stop, ending active sessions and forwards. The DMG contains the desktop control plane and its private daemon; install the CLI separately with Homebrew or Cargo."
 
     guard showAlert(
         title: running ? "Quit Sloosh and Update?" : existing ? "Replace Sloosh?" : "Install Sloosh?",
@@ -575,7 +604,7 @@ private func runInstallerUI() -> Int32 {
     guard let mount = volumeRoot(containing: installerBundle) else {
         _ = showAlert(
             title: "Sloosh Installed",
-            message: result.cliMessage,
+            message: result.message,
             buttons: ["Done"]
         )
         return 0
@@ -584,7 +613,7 @@ private func runInstallerUI() -> Int32 {
     let image = diskImageURL(for: mount)
     let response = showAlert(
         title: "Sloosh Installed",
-        message: result.cliMessage + " The installer disk image will now be ejected.",
+        message: result.message + " The installer disk image will now be ejected.",
         buttons: image == nil ? ["Eject"] : ["Move DMG to Trash", "Keep DMG"]
     )
     let moveToTrash = image != nil && response == .alertFirstButtonReturn
@@ -622,10 +651,10 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
                 applicationsDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
                 home: URL(fileURLWithPath: arguments[3], isDirectory: true),
                 stopApplication: false,
-                stopDaemon: false
+                stopDaemon: true
             )
             print("installed \(result.targetApp.path)")
-            print(result.cliMessage)
+            print(result.message)
             return 0
         } catch {
             fputs("error: \(error.localizedDescription)\n", stderr)
@@ -638,6 +667,30 @@ private func runTestingCommand(arguments: [String]) -> Int32? {
         }
         print(image.path)
         return 0
+    case "--test-install-rollback":
+        guard arguments.count == 4 else {
+            fputs("usage: install-sloosh --test-install-rollback <applications-dir> <home>\n", stderr)
+            return 2
+        }
+        do {
+            _ = try install(
+                sourceApp: Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/Sloosh.app"),
+                applicationsDirectory: URL(fileURLWithPath: arguments[2], isDirectory: true),
+                home: URL(fileURLWithPath: arguments[3], isDirectory: true),
+                stopApplication: false,
+                stopDaemon: true,
+                simulateInstallFailureAfterBackup: true
+            )
+            fputs("error: simulated replacement unexpectedly succeeded\n", stderr)
+            return 1
+        } catch {
+            guard error.localizedDescription.contains("simulated staged replacement failure") else {
+                fputs("error: unexpected rollback failure: \(error.localizedDescription)\n", stderr)
+                return 1
+            }
+            print("rollback restored the previous application")
+            return 0
+        }
     case "--test-shutdown":
         guard arguments.count == 3 else { return 2 }
         do {

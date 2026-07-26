@@ -19,26 +19,31 @@ command -v sloosh && sloosh --version
 ```
 
 If it is missing or too old to provide `sloosh init` and `sloosh skill`, explain
-the official release option for the user's OS and ask before installing
-anything. Prefer the verified GitHub Release described in the repository's
-installation guide. Do not use `curl | sh`, request credentials, bypass
-Gatekeeper/SmartScreen, or silently invoke a package manager.
+the official command-line package for the user's OS and ask before installing
+anything. Prefer the verified GitHub Release archive or Homebrew path described
+in the repository's installation guide. That package includes the managed
+`slooshd`; never start it directly. The macOS DMG is an optional desktop
+control plane and does not install the CLI. Do not use `curl | sh`, request
+credentials, bypass Gatekeeper/SmartScreen, or silently invoke a package
+manager.
 
-Once the binary is available, explain that `sloosh init` detects the installed
-delivery and prints the matching human-approval setup:
+Once the CLI is available, explain the matching human-approval setup:
 
-- On DMG-installed macOS, it explains the login Keychain item, the possible
-  `Sloosh Approval` system prompt, and Touch ID enrollment. The user handles
-  every native prompt; `Always Allow` avoids repeated Keychain prompts, while
-  `Allow` grants one-time access.
-- On Linux and standalone/source builds, there is no native helper or Keychain
-  permission step. Later pending requests print a `sloosh approve <ID>` command
-  for the human to run in another terminal.
+- `sloosh init` is a human-only terminal flow and command-line-only installs
+  use the separate-terminal approval fallback: the human runs the printed
+  `sloosh approve <ID>` command in another terminal.
+- On macOS with the desktop app, the human uses its Setup and Security screens
+  for login Keychain, the possible `Sloosh Approval` prompt, Touch ID, and PIN.
+  The CLI and app then share the app's private daemon. The user handles every
+  native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
+  grants one-time access.
 
 Then ask the user to run `sloosh init` themselves in their own terminal, stop,
 and wait. Never run it for them, fake a TTY, or enter a vault password. After
 they confirm completion, you may run `sloosh skill status` and `sloosh status`
-to verify Skill and daemon state.
+to verify Skill and daemon state. If they want native approval, ask them to
+open the desktop app and complete its setup themselves; do not automate its
+secure prompts.
 
 ## Mental model
 

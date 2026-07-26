@@ -107,7 +107,7 @@ jobs:
 
       - name: Build release slice
         run: |
-          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --bins --locked --target aarch64-apple-darwin
           corepack enable
           corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
@@ -122,8 +122,11 @@ jobs:
         run: |
           test "$(target/aarch64-apple-darwin/release/sloosh --version)" = \
             "sloosh ${{ needs.preflight.outputs.version }}"
+          test "$(target/aarch64-apple-darwin/release/slooshd --version)" = \
+            "slooshd ${{ needs.preflight.outputs.version }}"
           mkdir -p artifacts
           cp target/aarch64-apple-darwin/release/sloosh artifacts/sloosh-cli
+          cp target/aarch64-apple-darwin/release/slooshd artifacts/slooshd
           cp gui/src-tauri/target/aarch64-apple-darwin/release/Sloosh \
             artifacts/sloosh-gui
 
@@ -155,7 +158,7 @@ jobs:
 
       - name: Build release slice
         run: |
-          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --bins --locked --target x86_64-apple-darwin
           corepack enable
           corepack prepare "$(node -p "require('./gui/package.json').packageManager")" --activate
           pnpm --dir gui install --frozen-lockfile
@@ -170,8 +173,11 @@ jobs:
         run: |
           test "$(target/x86_64-apple-darwin/release/sloosh --version)" = \
             "sloosh ${{ needs.preflight.outputs.version }}"
+          test "$(target/x86_64-apple-darwin/release/slooshd --version)" = \
+            "slooshd ${{ needs.preflight.outputs.version }}"
           mkdir -p artifacts
           cp target/x86_64-apple-darwin/release/sloosh artifacts/sloosh-cli
+          cp target/x86_64-apple-darwin/release/slooshd artifacts/slooshd
           cp gui/src-tauri/target/x86_64-apple-darwin/release/Sloosh \
             artifacts/sloosh-gui
 
@@ -204,20 +210,22 @@ jobs:
       - name: Test musl target
         run: cargo test --all-targets --all-features --locked --target x86_64-unknown-linux-musl
 
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Build release binaries
+        run: cargo build --release --bins --locked --target x86_64-unknown-linux-musl
 
-      - name: Verify static binary
+      - name: Verify static binaries
         shell: bash
         run: |
           set -euo pipefail
-          binary=target/x86_64-unknown-linux-musl/release/sloosh
-          test "$("$binary" --version)" = "sloosh ${{ needs.preflight.outputs.version }}"
-          file "$binary" | grep -Eq 'static|statically linked'
-          if readelf -l "$binary" | grep -q 'INTERP'; then
-            echo "release binary unexpectedly has an ELF interpreter" >&2
-            exit 1
-          fi
+          for name in sloosh slooshd; do
+            binary="target/x86_64-unknown-linux-musl/release/$name"
+            test "$("$binary" --version)" = "$name ${{ needs.preflight.outputs.version }}"
+            file "$binary" | grep -Eq 'static|statically linked'
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "$name unexpectedly has an ELF interpreter" >&2
+              exit 1
+            fi
+          done
 
       - name: Package archive
         shell: bash
@@ -229,6 +237,8 @@ jobs:
           mkdir -p "dist/root/$package"
           install -m 0755 target/x86_64-unknown-linux-musl/release/sloosh \
             "dist/root/$package/sloosh"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/slooshd \
+            "dist/root/$package/slooshd"
           install -m 0644 README.md README.en.md SECURITY.md SUPPORT.md \
             CONTRIBUTING.md LICENSE-APACHE LICENSE-MIT "dist/root/$package/"
           install -d "dist/root/$package/docs/getting-started" \
@@ -282,16 +292,23 @@ jobs:
           mkdir -p "dist/root/$package"
           lipo -create slices/arm64/sloosh-cli slices/x86_64/sloosh-cli \
             -output "dist/root/$package/sloosh"
+          lipo -create slices/arm64/slooshd slices/x86_64/slooshd \
+            -output "dist/root/$package/slooshd"
           lipo -create slices/arm64/sloosh-gui slices/x86_64/sloosh-gui \
             -output dist/sloosh-gui
           chmod 0755 "dist/root/$package/sloosh"
+          chmod 0755 "dist/root/$package/slooshd"
           chmod 0755 dist/sloosh-gui
           codesign --force --sign - --timestamp=none "dist/root/$package/sloosh"
+          codesign --force --sign - --timestamp=none "dist/root/$package/slooshd"
           codesign --verify --strict "dist/root/$package/sloosh"
-          archs="$(lipo -archs "dist/root/$package/sloosh")"
-          [[ " $archs " == *" arm64 "* ]]
-          [[ " $archs " == *" x86_64 "* ]]
-          test "$("dist/root/$package/sloosh" --version)" = "sloosh $version"
+          codesign --verify --strict "dist/root/$package/slooshd"
+          for name in sloosh slooshd; do
+            archs="$(lipo -archs "dist/root/$package/$name")"
+            [[ " $archs " == *" arm64 "* ]]
+            [[ " $archs " == *" x86_64 "* ]]
+            test "$("dist/root/$package/$name" --version)" = "$name $version"
+          done
           install -m 0644 README.md README.en.md SECURITY.md SUPPORT.md \
             CONTRIBUTING.md LICENSE-APACHE LICENSE-MIT "dist/root/$package/"
           install -d "dist/root/$package/docs/getting-started" \
@@ -314,7 +331,7 @@ jobs:
             gzip -n > dist/sloosh-macos-universal.tar.gz
           scripts/package-macos.sh \
             "$version" \
-            "dist/root/$package/sloosh" \
+            "dist/root/$package/slooshd" \
             dist/sloosh-gui \
             dist
 

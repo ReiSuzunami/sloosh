@@ -8,44 +8,41 @@ and sequencing.
 ## 1. Component and data ownership
 
 ```text
-Agent process                         Human terminal
-     |                                     |
-     +---------------+---------------------+
-                     v
-          +------------------------+
-          | sloosh CLI             |
-          |                        |
-          | - argument/TTY policy  |
-          | - protocol handshake   |
-          | - local file access    |
-          | - Agent Skill setup    |
-          | - approval preview     |
-          | - routed key probes    |
-          +-----------+------------+
-                      |
-                      | Unix domain socket
-                      v
-          +------------------------+
-          | sloosh daemon          |
-          |                        |
-          | - peer PID + leases    |
-          | - vault writer/cache   |
-          | - SSH connections      |
-          | - PTY sessions/spool   |
-          | - remote SFTP handles  |
-          | - forwards + audit     |
-          +-----------+------------+
-                      |
-                      | SSH / SFTP
-                      v
-               Remote hosts
+Agent process + human terminal              Human desktop
+              |                                  |
+              v                                  v
+    +------------------------+        +------------------------+
+    | sloosh CLI             |        | Sloosh Tauri app       |
+    | - argument/TTY policy  |        | - native control plane |
+    | - local SFTP files     |        | - setup/security/hosts |
+    | - Agent Skill setup    |        | - no public CLI        |
+    +------------+-----------+        +-----------+------------+
+                 |                                |
+                 +---------------+----------------+
+                                 |
+                                 | verified Unix domain socket
+                                 v
+                     +------------------------+
+                     | slooshd                |
+                     | - peer PID + leases    |
+                     | - vault writer/cache   |
+                     | - SSH connections      |
+                     | - PTY sessions/spool   |
+                     | - remote SFTP handles  |
+                     | - forwards + audit     |
+                     +-----------+------------+
+                                 |
+                                 | SSH / SFTP
+                                 v
+                          Remote hosts
 ```
 
-CLI and daemon are subcommands of one binary. Ordinary CLI commands start the
-daemon when needed. The daemon is persistent because SSH connections, PTY
-shells, forwards, pending approvals, and active leases must outlive one CLI
-invocation. Restarting it loses this in-memory state and terminates sessions and
-forwards.
+`sloosh` and the desktop app are separate clients of the dedicated `slooshd`
+binary. Neither client routes control operations through the other. Ordinary
+CLI or desktop commands start the selected daemon when needed. The daemon is
+persistent because SSH connections, PTY shells, forwards, pending approvals,
+and active leases must outlive one client invocation. Restarting it loses this
+in-memory state and terminates sessions and forwards.
 
 Ownership is deliberate:
 
@@ -69,9 +66,10 @@ Ownership is deliberate:
   steps are deliberately restartable rather than transactional.
 - `gui/` is a Svelte 5 frontend inside a Tauri 2 desktop process. It owns
   presentation, fixed setup commands, and host-management forms. Host inventory
-  and mutations still cross the verified daemon seam. Master Password, Touch ID,
-  and PIN unlock create a time-bounded desktop session containing one zeroizing
-  `SecretString` in Rust memory; only status and countdowns enter the WebView.
+  and mutations cross the same verified daemon seam as the CLI; the app never
+  shells out to `sloosh`. Master Password, Touch ID, and PIN unlock create a
+  time-bounded desktop session containing one zeroizing `SecretString` in Rust
+  memory; only status and countdowns enter the WebView.
   Its idle timeout comes from the same owner-only `vault-settings.json` used by
   daemon leases, while each Agent request still needs its own exact-scope human
   approval. SSH Password is transient WebView state, crosses the local Tauri
@@ -80,7 +78,19 @@ Ownership is deliberate:
   profile or explicitly changing its authentication; ordinary edits send
   neither. On macOS, the desktop process maps Tauri's system-theme events to
   explicit light/dark AppKit Dock icons while the bundle icon remains the
-  launch-time fallback. The bundle keeps the CLI/daemon as `Helpers/sloosh`.
+  launch-time fallback. The bundle keeps only its private daemon at
+  `Helpers/slooshd`; it contains no public `sloosh` CLI and creates no CLI link.
+
+The command-line distribution always keeps `sloosh` and `slooshd` in the same
+directory. On Linux and CLI-only macOS installations, the client selects that
+sibling daemon. A macOS release CLI instead selects
+`/Applications/Sloosh.app/Contents/Helpers/slooshd` when present; source/debug
+builds keep using their build-tree sibling. The GUI always selects the helper
+inside its own bundle. Before selecting an app helper, both clients validate
+the bundle-to-helper path components, ownership, write permissions, file type,
+and executable mode. This deterministic rule lets Homebrew/Cargo/archive
+clients and the installed desktop share one daemon without trusting `PATH`
+lookup.
 
 ## 2. Local transport boundary
 
@@ -95,22 +105,22 @@ Default socket locations:
 - macOS: `$SLOOSH_HOME/sloosh.sock`, normally `~/.sloosh/sloosh.sock`.
 - `$SLOOSH_SOCKET` overrides either default.
 
-Before sending requests, CLI verifies that daemon peer eUID matches its own and
-that peer executable resolves to the current `sloosh` executable. Daemon gets
-client PID from kernel peer credentials (`SO_PEERCRED` on Linux,
-`LOCAL_PEERPID` on macOS) and uses it for authorization and self-approval
-checks.
+Before sending ordinary requests, each client verifies that daemon peer eUID
+matches its own and that the peer executable resolves to its explicitly
+selected `slooshd` canonical path. Daemon gets client PID from kernel peer
+credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS) and uses it for
+authorization and self-approval checks.
 
 These checks authenticate daemon to CLI and identify client process to daemon.
 They do not isolate hostile code already running as the same UID. A same-UID
 process can open the socket, but ordinary requests still require protocol
 negotiation and daemon-side capability checks.
 
-The macOS DMG installer is a narrow additional local client during upgrades.
-It sends only the pre-negotiation `Shutdown` request to the default private
-socket before replacing an existing recognized app. It never negotiates,
-accesses credentials, or sends an ordinary request, and it never executes the
-old installed bundle.
+`sloosh daemon stop` and the macOS DMG installer are narrow recovery clients.
+They send only the pre-negotiation `Shutdown` request to the private socket,
+even if the selected daemon executable is missing or incompatible. They never
+negotiate, access credentials, or send an ordinary request; the installer also
+never executes the old installed bundle.
 
 Protocol 3 uses bounded NDJSON control messages and bounded raw frames for SFTP
 payloads. CLI performs `Status -> Hello -> ProtocolReady`; daemon rejects

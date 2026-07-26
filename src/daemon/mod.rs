@@ -1,8 +1,7 @@
 //! Daemon: accept loop and request routing (docs/internals/architecture.md).
 //!
-//! The daemon is a plain subcommand of the same binary (`sloosh daemon
-//! run`), not a separate crate — see docs/internals/architecture.md "single binary". It owns
-//! the Unix domain socket and answers the phase-1/phase-2 command surface:
+//! The daemon runs from the dedicated `slooshd` binary in this package. It
+//! owns the Unix domain socket and answers the phase-1/phase-2 command surface:
 //! `Status`/`Shutdown`, SSH session management (`Run`/`Peek`/`Send`/
 //! `Interrupt`/`Open`/`Ls`/`Kill`), port forwarding (`Forward`/`ForwardLs`/
 //! `ForwardStop`), and the vault/lease authorization flow
@@ -198,7 +197,7 @@ async fn handle_connection(
                     chan.send(&Response::Error {
                         message: format!(
                             "incompatible wire protocol {wire_protocol}; this daemon requires {}. \
-                             Run `sloosh daemon stop`, then retry with a matching CLI/daemon binary",
+                             Run `sloosh daemon stop`, then retry with a matching client/daemon package",
                             proto::WIRE_PROTOCOL_VERSION
                         ),
                     })

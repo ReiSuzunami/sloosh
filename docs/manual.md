@@ -15,9 +15,9 @@ sloosh init
 ```
 
 It installs the embedded Agent Skill and initializes the credential vault.
-The macOS DMG flow may also configure Keychain access, Touch ID, and an
-optional approval PIN. Linux and standalone builds use approval from another
-human terminal.
+Command-line-only installations use approval from another human terminal. The
+macOS desktop app configures Keychain access, Touch ID, and an optional
+approval PIN through its own Setup and Security screens.
 
 Verify the result:
 
@@ -59,10 +59,16 @@ Aliases are stable identities and cannot be renamed. Run
 
 ## Desktop app
 
-The macOS DMG includes the Sloosh desktop app. Setup installs the embedded
-Agent Skill and initializes the vault; Security configures Touch ID, an
-optional 6-digit Sloosh PIN, and the shared vault timeout. These actions do not
-import SSH private keys or approve a host.
+The macOS DMG includes the Sloosh desktop control plane and its private
+`slooshd`; it does not install a public CLI. Install `sloosh` separately with
+Homebrew, Cargo, or the command-line archive when terminal or Agent access is
+needed. Both clients share the app daemon and state when the app is installed
+in Applications; the desktop talks to that daemon directly and never shells
+out to the CLI.
+
+Setup installs the embedded Agent Skill and initializes the vault; Security
+configures Touch ID, an optional 6-digit Sloosh PIN, and the shared vault
+timeout. These actions do not import SSH private keys or approve a host.
 
 Hosts manages the same vault-backed profiles as the CLI. Unlock it with Touch
 ID, the Sloosh PIN, or the Master Password. Master Password and PIN entry stay
@@ -173,8 +179,9 @@ sloosh log -n 50
 sloosh daemon status
 ```
 
-The daemon normally starts on demand. Direct controls are available under
-`sloosh daemon --help`; use them only when troubleshooting.
+The dedicated `slooshd` normally starts on demand and should not be invoked
+directly. Lifecycle controls are available under `sloosh daemon --help`; use
+them only when troubleshooting.
 
 ## Command reference
 
