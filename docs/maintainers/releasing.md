@@ -34,7 +34,7 @@ requires the tag version to equal `Cargo.toml` and the tagged commit to be in
 Create and push an annotated `v<version>` tag:
 
 ```sh
-version=0.2.0
+version=0.2.1
 git tag -a "v$version" -m "sloosh v$version"
 git push origin "v$version"
 ```
