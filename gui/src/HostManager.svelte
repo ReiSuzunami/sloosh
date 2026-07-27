@@ -30,6 +30,7 @@
     type HostMode,
   } from './hostForm';
   import type { AppSnapshot, HostSummary, VaultUnlockSnapshot } from './types';
+  import { canStartVaultUnlockStatusSync } from './vaultUnlock';
 
   let {
     snapshot,
@@ -159,7 +160,7 @@
   }
 
   async function syncUnlockStatus() {
-    if (statusInFlight) return;
+    if (!canStartVaultUnlockStatusSync(statusInFlight, activeAction)) return;
     const generation = ++unlockGeneration;
     statusInFlight = true;
     try {
@@ -218,6 +219,7 @@
     activeAction = command;
     const generation = ++unlockGeneration;
     const operation = ++hostOperationGeneration;
+    let refreshAfterFailure = false;
     error = null;
     success = null;
     try {
@@ -231,10 +233,11 @@
       }
     } catch (cause) {
       error = errorMessage(cause);
-      await syncUnlockStatus();
+      refreshAfterFailure = true;
     } finally {
       activeAction = null;
     }
+    if (refreshAfterFailure) await syncUnlockStatus();
   }
 
   async function lockHosts() {

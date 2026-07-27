@@ -25,7 +25,7 @@ Download `SHA256SUMS` from the same release and verify the selected file.
 macOS DMG:
 
 ```sh
-version=0.2.0
+version=0.2.1
 dmg="Sloosh-$version-macos-universal.dmg"
 grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
 open "$dmg"
