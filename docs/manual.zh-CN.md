@@ -94,8 +94,9 @@ sloosh request myhost
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-配置完成的 macOS DMG 安装可直接通过 Touch ID 或审批 PIN 完成请求。未知 host key
-仍需人类核对指纹；ProxyJump 路由会在批准前完成校验。
+配置完成的 macOS DMG 安装会先在原生审批弹窗中选择 Touch ID、审批 PIN 或 vault
+Master Password，再通过第二步安全认证完成请求。未知 host key 仍需人类核对指纹；
+ProxyJump 路由会在批准前完成校验。
 
 ## 持久会话
 

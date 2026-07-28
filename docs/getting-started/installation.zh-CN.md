@@ -68,10 +68,13 @@ slooshd --version
 
 日常使用时由客户端或桌面 App 管理 `slooshd`，不要直接启动它。
 
-macOS 安装器、App 与二进制使用 ad-hoc 签名，目前没有 Developer ID 签名或
-notarization。首次运行可能被 macOS 阻止。验证校验和后双击 `Install Sloosh`，再到
+GitHub Release 的 macOS 安装器、App 与二进制使用固定的项目自签证书，使代码身份在
+升级时保持稳定。它们仍没有 Developer ID 签名或 notarization，也不会把该证书加入
+系统信任。首次运行可能被 macOS 阻止。验证校验和后双击 `Install Sloosh`，再到
 “系统设置 > 隐私与安全性”为 Install Sloosh 选择“仍要打开”，然后重试。这是未公证
-社区构建的预期安装流程。
+社区构建的预期安装流程。从旧 ad-hoc 构建首次升级时需要重新登记一次本机审批凭据；
+后续使用同一证书签名的版本会保持相同的 Keychain 身份。本地源码构建未配置签名身份
+时仍默认使用 ad-hoc 签名。
 
 Linux 二进制通过 musl 静态链接，以兼容常见 Linux 发行版。但 `sloosh` 仍需要 procfs
 验证 peer executable 和进程 ancestry；静态链接不会消除这项运行时要求。其它 Linux

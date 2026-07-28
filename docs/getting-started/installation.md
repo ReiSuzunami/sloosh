@@ -76,11 +76,16 @@ slooshd --version
 `slooshd` is managed by the client and desktop app; do not start it directly
 during ordinary use.
 
-The macOS installer, app, and binaries are ad-hoc signed but are not currently
-Developer ID signed or notarized. On first use, macOS may block the installer.
-After verifying the checksum, double-click `Install Sloosh`, open System
-Settings > Privacy & Security, choose Open Anyway for Install Sloosh, then
-retry. This manual approval is expected for the unnotarized community build.
+GitHub Release macOS artifacts use a fixed self-signed project certificate so
+their code identity remains stable across updates. They are not Developer ID
+signed or notarized, and the certificate is not added to system trust. On first
+use, macOS may block the installer. After verifying the checksum, double-click
+`Install Sloosh`, open System Settings > Privacy & Security, choose Open Anyway
+for Install Sloosh, then retry. This manual approval is expected for the
+unnotarized community build. The first upgrade from an older ad-hoc build
+requires native approval enrollment once; later releases signed by the same
+certificate keep the same Keychain identity. Local source builds still default
+to ad-hoc signing unless a signing identity is configured.
 
 The Linux binary is statically linked against musl for distribution across
 common Linux distributions. Sloosh still requires procfs at runtime for peer

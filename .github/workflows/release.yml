@@ -268,6 +268,9 @@ jobs:
     name: Assemble macOS universal binary
     needs: [preflight, macos-arm64, macos-x86_64]
     runs-on: macos-15
+    environment: release
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -283,8 +286,56 @@ jobs:
           name: macos-x86_64-slice
           path: slices/x86_64
 
+      - name: Import macOS signing identity
+        shell: bash
+        env:
+          MACOS_SIGNING_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_SIGNING_CERTIFICATE_P12_BASE64 }}
+          MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_SIGNING_KEYCHAIN_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for name in \
+            MACOS_SIGNING_CERTIFICATE_P12_BASE64 \
+            MACOS_SIGNING_CERTIFICATE_PASSWORD \
+            MACOS_SIGNING_KEYCHAIN_PASSWORD \
+            MACOS_SIGNING_IDENTITY
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing release environment value: $name"
+              exit 1
+            fi
+          done
+
+          umask 077
+          certificate_path="$RUNNER_TEMP/sloosh-signing.p12"
+          keychain_path="$RUNNER_TEMP/sloosh-signing.keychain-db"
+          printf '%s' "$MACOS_SIGNING_CERTIFICATE_P12_BASE64" |
+            /usr/bin/base64 --decode >"$certificate_path"
+          security create-keychain \
+            -p "$MACOS_SIGNING_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain \
+            -p "$MACOS_SIGNING_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$MACOS_SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$MACOS_SIGNING_KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security find-certificate \
+            -c "$MACOS_SIGNING_IDENTITY" "$keychain_path" >/dev/null
+          echo "Imported macOS signing identity: $MACOS_SIGNING_IDENTITY"
+
       - name: Assemble, sign, and package
         shell: bash
+        env:
+          SLOOSH_MACOS_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          SLOOSH_MACOS_SIGNING_KEYCHAIN: ${{ runner.temp }}/sloosh-signing.keychain-db
         run: |
           set -euo pipefail
           version="${{ needs.preflight.outputs.version }}"
@@ -299,11 +350,27 @@ jobs:
           chmod 0755 "dist/root/$package/sloosh"
           chmod 0755 "dist/root/$package/slooshd"
           chmod 0755 dist/sloosh-gui
-          codesign --force --sign - --timestamp=none "dist/root/$package/sloosh"
-          codesign --force --sign - --timestamp=none "dist/root/$package/slooshd"
+          codesign --force \
+            --keychain "$SLOOSH_MACOS_SIGNING_KEYCHAIN" \
+            --sign "$SLOOSH_MACOS_SIGNING_IDENTITY" \
+            --timestamp=none \
+            "dist/root/$package/sloosh"
+          codesign --force \
+            --keychain "$SLOOSH_MACOS_SIGNING_KEYCHAIN" \
+            --sign "$SLOOSH_MACOS_SIGNING_IDENTITY" \
+            --timestamp=none \
+            "dist/root/$package/slooshd"
           codesign --verify --strict "dist/root/$package/sloosh"
           codesign --verify --strict "dist/root/$package/slooshd"
           for name in sloosh slooshd; do
+            requirement="$(
+              codesign -d -r- "dist/root/$package/$name" 2>&1 |
+                sed -n '/designated =>/p'
+            )"
+            if grep -Eq 'designated => .*cdhash' <<<"$requirement"; then
+              echo "release signing produced an ad-hoc requirement: $name" >&2
+              exit 1
+            fi
             archs="$(lipo -archs "dist/root/$package/$name")"
             [[ " $archs " == *" arm64 "* ]]
             [[ " $archs " == *" x86_64 "* ]]
@@ -344,11 +411,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Remove macOS signing keychain
+        if: always()
+        shell: bash
+        run: |
+          keychain_path="$RUNNER_TEMP/sloosh-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/sloosh-signing.p12"
+          security delete-keychain "$keychain_path" >/dev/null 2>&1 || true
+          /bin/rm -f "$certificate_path"
+
   publish:
     name: Publish GitHub Release
     needs: [preflight, linux-x86_64-musl, macos-universal]
     runs-on: ubuntu-24.04
-    environment: release
     permissions:
       contents: write
       id-token: write

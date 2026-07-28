@@ -108,9 +108,11 @@ command, a human runs that exact command in another terminal:
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-On a configured macOS DMG installation, Touch ID or the approval PIN may
-complete the request directly. Unknown host keys still require the human to
-verify the fingerprint. ProxyJump routes are validated before approval.
+On a configured macOS DMG installation, choose Touch ID, the approval PIN, or
+the vault Master Password in the native approval prompt. The selected method
+is authenticated in a second secure step. Unknown host keys still require the
+human to verify the fingerprint. ProxyJump routes are validated before
+approval.
 
 ## Persistent sessions
 

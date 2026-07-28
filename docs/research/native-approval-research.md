@@ -5,7 +5,7 @@
 
 ## 结论
 
-无付费开发者证书不妨碍调用本机生物认证 API；它影响的是“软件发布时的信任链”，不是 Touch ID/Windows Hello 能否弹出。LocalAuthentication 与 UserConsentVerifier 返回本机策略成功/失败（布尔或枚举），不能单独作为 daemon 可验证的授权凭据。当前 macOS 实现由固定 bundle 内 helper 校验父进程，只向该 Sloosh 进程提供 login Keychain 中的 vault 密码用于展开精确范围；用户先确认范围，再执行 Touch ID 并比对 `evaluatedPolicyDomainState`，daemon 最后激活。未来若审批跨进程、设备或网络边界，应升级为受用户在场保护的私钥签名挑战，再由 daemon 验签。
+无付费开发者证书不妨碍调用本机生物认证 API；它影响的是“软件发布时的信任链”，不是 Touch ID/Windows Hello 能否弹出。LocalAuthentication 与 UserConsentVerifier 返回本机策略成功/失败（布尔或枚举），不能单独作为 daemon 可验证的授权凭据。当前 macOS 实现由固定 bundle 内 helper 校验父进程，只向该 Sloosh 进程提供 login Keychain 中的 vault 密码用于展开精确范围；用户先确认范围并选择 Touch ID、Sloosh PIN 或 Master Password，再完成对应认证，daemon 独立验证并激活。未来若审批跨进程、设备或网络边界，应升级为受用户在场保护的私钥签名挑战，再由 daemon 验签。
 
 ## 事实边界
 
@@ -35,7 +35,7 @@
 
 ## sloosh 分阶段路线
 
-1. **阶段 A（macOS 已实现）**：保留密码批准；DMG 内置 helper 将 vault 密码存入本机 login Keychain。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围，原生 UI 先确认完整列表，再执行 Touch ID 并比对登记时的 biometric domain state。取消、未知 host key、未登记或 helper 缺失均退回终端审批。
+1. **阶段 A（macOS 已实现）**：保留密码批准；DMG 内置 helper 将 vault 密码存入本机 login Keychain。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围，原生 UI 先确认完整列表并选择 Touch ID、Sloosh PIN 或 Master Password，再执行对应认证。Touch ID 比对登记时的 biometric domain state；PIN 由 daemon 的持久退避状态机验证；Master Password 重新解锁 vault 并触发范围二次比对。取消、未知 host key、未登记或 helper 缺失均退回终端审批。
 2. **阶段 B（本机密码学证明）**：每台客户端生成受 user presence 保护的签名密钥；守护进程发随机 nonce，客户端完成生物审批后签名，守护进程验签并把公钥绑定设备/租约。设计重放防护、密钥轮换、撤销与无生物回退。
 3. **阶段 C（发布与生态）**：需要公共下载时再接入 Apple Developer ID + notarization、Windows Store/MSIX/代码签名，或合规的 OSS 签名服务；证书预算与发布渠道独立于审批协议。
 

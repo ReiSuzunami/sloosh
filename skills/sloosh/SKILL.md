@@ -33,7 +33,9 @@ Once the CLI is available, explain the matching human-approval setup:
   use the separate-terminal approval fallback: the human runs the printed
   `sloosh approve <ID>` command in another terminal.
 - On macOS with the desktop app, the human uses its Setup and Security screens
-  for login Keychain, the possible `Sloosh Approval` prompt, Touch ID, and PIN.
+  for login Keychain and the possible `Sloosh Approval` prompt. Native lease
+  approval lets the human choose Touch ID, PIN, or Master Password before the
+  secure authentication step.
   The CLI and app then share the app's private daemon. The user handles every
   native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
   grants one-time access.
@@ -73,7 +75,8 @@ sloosh status                                # daemon/lease/session overview —
 - After `sloosh request <host>`, continue when it prints `authorized`. On a
   pending fallback, show the printed approval command to your user and **stop
   and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
-  Touch ID or an approval PIN may complete the request without another terminal.
+  Touch ID, an approval PIN, or the Master Password may complete the request
+  without another terminal.
 - If `request` reports an invalid ProxyJump cycle or depth, show that error to
   the user and stop. Never retry with a subset of hosts or bypass the route.
 - Active leases idle out according to the human's shared vault timeout

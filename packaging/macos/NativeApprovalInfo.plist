@@ -12,6 +12,8 @@
 	<string>io.github.reisuzunami.sloosh.approval</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>Sloosh.icns</string>
 	<key>CFBundleName</key>
 	<string>Sloosh Approval</string>
 	<key>CFBundlePackageType</key>

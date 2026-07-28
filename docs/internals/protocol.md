@@ -345,14 +345,16 @@ invalid route is visible before `RequestLease` creates pending state, the
 request itself returns `Error` instead.
 
 On a DMG-installed Mac, daemon may satisfy a newly created pending request via
-its bundled Touch ID or PIN helper before replying. Success returns the already-valid
-`Ok` response for `RequestLease`; failure returns `LeaseRequestPending` exactly
-as before. Helper traffic uses anonymous child-process pipes, is not part of
-this wire protocol, and never exposes the generated bearer lease token to the
-requesting connection. Therefore this optional path does not change protocol 3
-message shape or sequencing. PIN and Master Password entry use anonymous helper
-pipes and never become Tauri command arguments. Raw PIN never becomes a
-protocol field. GUI vault initialization uses the existing `InitVault`
+its bundled native helper. Human first chooses Touch ID, PIN, or Master
+Password after reviewing the exact host scope, then completes that method in a
+second secure step. Success returns the already-valid `Ok` response for
+`RequestLease`; failure returns `LeaseRequestPending` exactly as before. Helper
+traffic uses anonymous child-process pipes, is not part of this wire protocol,
+and never exposes the generated bearer lease token to the requesting
+connection. Therefore this optional path does not change protocol 3 message
+shape or sequencing. PIN and Master Password entry use anonymous helper pipes
+and never become Tauri command arguments. Raw PIN and Master Password never
+become protocol fields. GUI vault initialization uses the existing `InitVault`
 `SecretString` over the verified owner-only Unix socket, preserving the daemon
 as vault authority.
 

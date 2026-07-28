@@ -211,18 +211,20 @@ agent CLI          daemon                    native helper
     |                 |<------ password ----------| login Keychain
     |                 | unlock + expand exact list|
     |                 |---------- list ---------->|
-    |                 |       human confirms      |
-    |                 |<-- Touch ID or PIN --------| native secure input
+    |                 | human confirms + chooses  |
+    |                 |<-- Touch ID/PIN/Master ----| native secure input
     |                 | compare again + activate  |
     |<------ Ok ------|                            |
 ```
 
 PIN verification is a daemon-local state machine with persistent backoff. It
-does not alter the request's Master Password failure budget. Cancellation,
-missing enrollment, helper failure, or any unknown SSH host key
-keeps request pending and returns normal terminal-approval instructions. Native
-success uses existing `RequestLease -> Ok`; bearer lease token never returns to
-requesting process. Password approval remains supported on every platform.
+does not alter the request's Master Password failure budget. A Master Password
+selected in native UI is verified by reopening the vault, then the daemon
+recomputes and compares the exact host scope before activation. Cancellation,
+missing enrollment, helper failure, or any unknown SSH host key keeps request
+pending and returns normal terminal-approval instructions. Native success uses
+existing `RequestLease -> Ok`; bearer lease token never returns to requesting
+process. Password approval remains supported on every platform.
 
 After activation, human CLI confirms missing host keys in dependency order.
 Each jump is trusted before targets reached through it. A target probe follows

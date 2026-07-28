@@ -122,18 +122,24 @@ The DMG-installed macOS path stores a copy of vault master password in local
 login Keychain. Bundled helper verifies its parent is the daemon helper or
 desktop executable,
 releases password only to that trusted parent over anonymous pipe so daemon can
-expand scope, then native UI confirms exact list. Only after confirmation does
-helper require Touch ID and compare LocalAuthentication biometric domain state
-with enrollment, or collect a 6-digit PIN through a native secure field. Raw
-PIN never enters Svelte, the WebView, Tauri command arguments, logs, or the
-daemon wire protocol. Master Password never enters Svelte, the WebView, Tauri
-command arguments, or logs; vault initialization sends the existing redacted
-`SecretString` over the verified owner-only Unix socket to the daemon, which
-remains the vault authority. After Master Password, Touch ID, or PIN unlock,
-the Tauri Rust process may retain one zeroizing `SecretString` for the configured
-desktop vault timeout; the WebView receives only method, lock state, and bounded
-countdowns. The session is dropped on manual lock, idle or 8-hour absolute
-expiry, app exit, macOS sleep, screen sleep, or user-session deactivation. It
+expand scope, then native UI confirms the exact list and asks the human to
+choose Touch ID, PIN, or Master Password. Only after that choice does helper
+run Touch ID and compare LocalAuthentication biometric domain state with
+enrollment, collect a 6-digit PIN, or collect the vault Master Password through
+a native secure field. Raw PIN never enters Svelte, the WebView, Tauri command
+arguments, logs, or the daemon wire protocol. Master Password never enters
+Svelte, the WebView, Tauri command arguments, or logs; Rust verifies a selected
+Master Password by reopening the vault and repeats the exact-scope comparison
+before lease activation. The preceding Keychain-backed scope preview does not
+reset the pending request's Master Password failure budget; only final
+successful authentication does. Vault initialization sends the existing
+redacted `SecretString` over the verified owner-only Unix socket to the daemon,
+which remains the vault authority. After Master Password, Touch ID, or PIN
+unlock, the Tauri Rust process may retain one zeroizing `SecretString` for the
+configured desktop vault timeout; the WebView receives only method, lock state,
+and bounded countdowns. The session is dropped on manual lock, idle or 8-hour
+absolute expiry, app exit, macOS sleep, screen sleep, or user-session
+deactivation. It
 never satisfies or bypasses an Agent lease approval. SSH Password entered in the desktop Hosts form is
 transient WebView state, crosses the local Tauri command boundary and verified
 owner-only Unix socket only as a redacted `SecretString`, and is cleared from
@@ -141,7 +147,7 @@ the form after every submission attempt. It is never logged. Daemon
 independently verifies the PIN before activation. At runtime Sloosh rejects a
 native helper that is a symlink, has an
 unexpected owner, or is group- or other-writable; the installer separately
-validates the ad-hoc bundle signature.
+validates the bundle signature.
 Cancellation or helper failure leaves request pending. Unknown SSH
 host keys force terminal approval so fingerprint trust remains human CLI-owned.
 Native success returns no bearer lease token to requester.
@@ -288,13 +294,15 @@ changing ownership.
 These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.
 
-The macOS DMG contains an ad-hoc-signed native installer and a signed
-`Sloosh.app` payload. The payload contains the GUI and private
-`Contents/Helpers/slooshd`, but no public `sloosh` executable. The installer
-installs only `/Applications/Sloosh.app` and creates no CLI link. It rejects a
-symbolic-link, non-application, or unrecognized directory at the app target,
-validates the new payload's ad-hoc code signature, stages it on the Applications
-filesystem, and keeps a same-directory backup until replacement succeeds.
+GitHub Release macOS artifacts use a fixed self-signed code-signing identity;
+local packaging falls back to ad-hoc signing unless an identity is configured.
+The DMG contains a signed native installer and `Sloosh.app` payload. The payload
+contains the GUI and private `Contents/Helpers/slooshd`, but no public `sloosh`
+executable. The installer installs only `/Applications/Sloosh.app` and creates
+no CLI link. It rejects a symbolic-link, non-application, or unrecognized
+directory at the app target, validates the new payload's code signature, stages
+it on the Applications filesystem, and keeps a same-directory backup until
+replacement succeeds.
 Before every install, it sends the fixed pre-handshake `Shutdown` request to an
 existing private daemon socket without executing any installed bundle. This
 also stops a daemon started by a Homebrew, Cargo, archive, or source CLI before
@@ -381,7 +389,7 @@ additional authority after that gate.
 | `Ls`, `ForwardLs` | negotiated connection, no lease | read-only state disclosure to same UID |
 | `ForwardStop` | no lease | only reduces access |
 | `Shutdown` / `daemon stop` | no handshake or lease | operational control; same-UID DoS surface |
-| `RequestLease` | peer PID, no active lease | creates pending request and anchor; DMG macOS may complete it through Touch ID or PIN and return existing `Ok` |
+| `RequestLease` | peer PID, no active lease | creates pending request and anchor; DMG macOS may complete it through Touch ID, PIN, or Master Password and return existing `Ok` |
 | `DescribeLeaseRequest` | no active lease | exposes pending request details |
 | `ApproveLease` | master password, separate ancestry, exact host list | CLI requires TTY; daemon cannot prove TTY from raw protocol |
 | `VaultExists` | no lease | metadata only |
@@ -396,13 +404,16 @@ A TTY check is CLI policy, not a server-side protocol credential. A raw same-UID
 client can send the underlying vault requests, but still needs the relevant
 password and state preconditions.
 
-Touch ID and PIN are local helper policy, not proof carried on wire. Security property comes from
-trusted helper checking its parent executable, completing LocalAuthentication,
-matching enrolled biometric domain state or returning a daemon-verified PIN,
-and returning final approval only after exact scope confirmation. Helper is daemon-spawned outside requester
-process tree; pre-approval vault material goes only to trusted daemon and is
-cleared on failure. No
-Developer ID certificate or notarization is assumed. Ad-hoc signing and
+Touch ID, PIN, and Master Password are local helper policy, not proof carried
+on wire. Security property comes from trusted helper checking its parent
+executable, completing LocalAuthentication, matching enrolled biometric domain
+state or returning native secure input for daemon-side PIN or vault
+verification, and returning final approval only after exact scope confirmation.
+Helper is daemon-spawned outside requester process tree; pre-approval vault
+material goes only to trusted daemon and is cleared on failure. No
+Developer ID certificate or notarization is assumed. Release CI's fixed
+self-signed identity keeps the Keychain designated requirement stable across
+updates without adding a system trust anchor; local ad-hoc signing and
 Gatekeeper limits are documented in installation guide.
 
 ## 6. Lease and forward timing
@@ -451,8 +462,9 @@ Sloosh does not guarantee protection from hostile same-UID code. Such code may:
 - inherit a lease when injected into or launched under the authorized anchor's
   process tree, or use a stolen `SLOOSH_LEASE` token;
 - replace or inject into a process at the expected canonical executable path;
-- replace bundled native helper or installed app as same UID; ad-hoc signing is
-  integrity structure for packaging, not protection from hostile owner writes;
+- replace bundled native helper or installed app as same UID; self-signed or
+  ad-hoc signing is integrity structure and update identity, not protection
+  from hostile owner writes;
 - delete, replace, or tamper with owner-writable vault, known_hosts, audit,
   spool, socket, or daemon state;
 - exhaust CPU, memory, descriptors, pending requests, sessions, connections,

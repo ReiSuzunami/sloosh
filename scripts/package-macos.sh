@@ -38,6 +38,43 @@ for command in codesign ditto hdiutil iconutil lipo mount osascript plutil sips 
   }
 done
 
+signing_identity="${SLOOSH_MACOS_SIGNING_IDENTITY:--}"
+signing_keychain="${SLOOSH_MACOS_SIGNING_KEYCHAIN:-}"
+if [[ -n "$signing_keychain" && ! -f "$signing_keychain" ]]; then
+  echo "macOS signing keychain does not exist: $signing_keychain" >&2
+  exit 2
+fi
+
+sign_code() {
+  local target="$1"
+  local arguments=(--force --sign "$signing_identity" --timestamp=none)
+  if [[ -n "$signing_keychain" ]]; then
+    arguments+=(--keychain "$signing_keychain")
+  fi
+  codesign "${arguments[@]}" "$target"
+}
+
+verify_stable_signing_requirement() {
+  local target="$1"
+  [[ "$signing_identity" != "-" ]] || return 0
+
+  local requirement
+  requirement="$(codesign -d -r- "$target" 2>&1)" || {
+    echo "could not inspect signing requirement for $target" >&2
+    exit 1
+  }
+  if grep -Eq 'designated => .*cdhash' <<<"$requirement"; then
+    echo "configured signing identity produced an ad-hoc cdhash requirement: $target" >&2
+    exit 1
+  fi
+}
+
+if [[ "$signing_identity" == "-" ]]; then
+  echo "macOS signing mode: ad-hoc"
+else
+  echo "macOS signing identity: $signing_identity"
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "$script_dir/.." && pwd -P)"
 daemon_binary="$(cd -- "$(dirname -- "$daemon_binary")" && pwd -P)/$(basename -- "$daemon_binary")"
@@ -208,13 +245,15 @@ for arch in arm64 x86_64; do
     -o "$tmp_dir/sloosh-approval-$arch"
 done
 
-mkdir -p "$approval_contents/MacOS"
+mkdir -p "$approval_contents/MacOS" "$approval_contents/Resources"
 lipo -create \
   "$tmp_dir/sloosh-approval-arm64" \
   "$tmp_dir/sloosh-approval-x86_64" \
   -output "$approval_contents/MacOS/sloosh-approval"
 chmod 0755 "$approval_contents/MacOS/sloosh-approval"
 install -m 0644 "$approval_info" "$approval_contents/Info.plist"
+install -m 0644 "$contents/Resources/Sloosh.icns" \
+  "$approval_contents/Resources/Sloosh.icns"
 /usr/libexec/PlistBuddy -c \
   "Set :CFBundleShortVersionString $marketing_version" "$approval_contents/Info.plist"
 /usr/libexec/PlistBuddy -c \
@@ -231,13 +270,17 @@ approval_archs="$(
   echo "expected universal native approval helper, got: $approval_archs" >&2
   exit 1
 }
-codesign --force --sign - --timestamp=none \
-  "$approval_contents/MacOS/sloosh-approval"
-codesign --force --sign - --timestamp=none "$approval_app"
-codesign --force --sign - --timestamp=none "$contents/Helpers/slooshd"
-codesign --force --sign - --timestamp=none "$contents/MacOS/Sloosh"
-codesign --force --sign - --timestamp=none "$app"
+sign_code "$approval_contents/MacOS/sloosh-approval"
+sign_code "$approval_app"
+sign_code "$contents/Helpers/slooshd"
+sign_code "$contents/MacOS/Sloosh"
+sign_code "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
+verify_stable_signing_requirement \
+  "$approval_contents/MacOS/sloosh-approval"
+verify_stable_signing_requirement "$contents/Helpers/slooshd"
+verify_stable_signing_requirement "$contents/MacOS/Sloosh"
+verify_stable_signing_requirement "$app"
 
 for arch in arm64 x86_64; do
   xcrun swiftc \
@@ -296,10 +339,12 @@ if echo "$installer_minos_values" | grep -Ev '^11\.0(\.0)?$' >/dev/null; then
   exit 1
 fi
 
-codesign --force --sign - --timestamp=none \
-  "$installer_contents/MacOS/install-sloosh"
-codesign --force --sign - --timestamp=none "$installer"
+sign_code "$installer_contents/MacOS/install-sloosh"
+sign_code "$installer"
 codesign --verify --deep --strict --verbose=2 "$installer"
+verify_stable_signing_requirement \
+  "$installer_contents/MacOS/install-sloosh"
+verify_stable_signing_requirement "$installer"
 
 ditto "$installer" "$stage/Install Sloosh.app"
 mkdir -p "$(dirname "$background")"
@@ -384,6 +429,10 @@ fi
 test "$(plutil -extract CFBundleIdentifier raw \
   "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/Info.plist")" = \
   "io.github.reisuzunami.sloosh.approval"
+test "$(plutil -extract CFBundleIconFile raw \
+  "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/Info.plist")" = \
+  "Sloosh.icns"
+[[ -s "$mounted_app/Contents/Helpers/Sloosh Approval.app/Contents/Resources/Sloosh.icns" ]]
 test "$("$mounted_app/Contents/Helpers/slooshd" --version)" = "slooshd $version"
 [[ ! -e "$mounted_app/Contents/Helpers/sloosh" ]]
 test "$(plutil -extract CFBundleExecutable raw \

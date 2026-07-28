@@ -22,6 +22,23 @@ private enum CredentialResult {
     case failure(Response)
 }
 
+private enum ApprovalMethod: Int {
+    case touchID
+    case pin
+    case masterPassword
+
+    var title: String {
+        switch self {
+        case .touchID:
+            return "Touch ID — fingerprint"
+        case .pin:
+            return "Sloosh PIN — 6-digit local PIN"
+        case .masterPassword:
+            return "Master Password — vault password"
+        }
+    }
+}
+
 private struct Request: Decodable {
     let type: String
     let master_password: String?
@@ -207,6 +224,85 @@ private func activateApplication() {
     NSApplication.shared.activate(ignoringOtherApps: true)
 }
 
+private func applicationIcon() -> NSImage {
+    if let iconURL = Bundle.main.url(forResource: "Sloosh", withExtension: "icns"),
+       let icon = NSImage(contentsOf: iconURL) {
+        return icon
+    }
+    if let icon = NSImage(named: NSImage.applicationIconName) {
+        return icon
+    }
+    return NSWorkspace.shared.icon(forFile: Bundle.main.bundlePath)
+}
+
+private func alertIcon(systemSymbolName: String, accessibilityDescription: String) -> NSImage {
+    NSImage(
+        systemSymbolName: systemSymbolName,
+        accessibilityDescription: accessibilityDescription
+    ) ?? applicationIcon()
+}
+
+private final class ApprovalMethodPickerView: NSView {
+    private var choices: [(method: ApprovalMethod, button: NSButton)] = []
+    private(set) var selectedMethod: ApprovalMethod
+
+    init(touchIDAvailable: Bool, pinAvailable: Bool) {
+        var methods: [ApprovalMethod] = []
+        if touchIDAvailable {
+            methods.append(.touchID)
+        }
+        if pinAvailable {
+            methods.append(.pin)
+        }
+        methods.append(.masterPassword)
+        selectedMethod = methods[0]
+
+        let height = CGFloat(30 + methods.count * 28)
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: height))
+
+        let heading = NSTextField(labelWithString: "Approval method")
+        heading.font = .systemFont(ofSize: 12, weight: .semibold)
+        heading.textColor = .secondaryLabelColor
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.frame = bounds
+        stack.autoresizingMask = [.width, .height]
+        stack.addArrangedSubview(heading)
+        addSubview(stack)
+
+        for method in methods {
+            let button = NSButton(
+                radioButtonWithTitle: method.title,
+                target: self,
+                action: #selector(selectMethod(_:))
+            )
+            button.tag = method.rawValue
+            button.state = method == selectedMethod ? .on : .off
+            button.setAccessibilityLabel(method.title)
+            choices.append((method, button))
+            stack.addArrangedSubview(button)
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func selectMethod(_ sender: NSButton) {
+        guard let method = ApprovalMethod(rawValue: sender.tag) else {
+            return
+        }
+        selectedMethod = method
+        for choice in choices {
+            choice.button.state = choice.method == method ? .on : .off
+        }
+    }
+}
+
 private final class PINCodeInputView: NSView, NSTextFieldDelegate {
     private static let digitCount = 6
     private let fields: [NSSecureTextField]
@@ -379,6 +475,10 @@ private func promptPin(title: String, message: String) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
+    alert.icon = alertIcon(
+        systemSymbolName: "number.circle.fill",
+        accessibilityDescription: "Sloosh PIN"
+    )
     alert.messageText = title
     alert.informativeText = message
 
@@ -425,7 +525,7 @@ private func promptMasterPassword(purpose: String, confirmation: Bool) -> Respon
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
-    alert.icon = NSImage(
+    alert.icon = alertIcon(
         systemSymbolName: "lock.shield.fill",
         accessibilityDescription: "Master Password"
     )
@@ -486,7 +586,7 @@ private func promptSshPassword(hostLabel: String) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
-    alert.icon = NSImage(
+    alert.icon = alertIcon(
         systemSymbolName: "key.fill",
         accessibilityDescription: "SSH Password"
     )
@@ -515,6 +615,10 @@ private func promptNewPin() -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
+    alert.icon = alertIcon(
+        systemSymbolName: "number.circle.fill",
+        accessibilityDescription: "Sloosh PIN"
+    )
     alert.messageText = "Create approval PIN"
     alert.informativeText = "Choose a 6-digit PIN for local SSH approvals."
     let first = PINCodeInputView(label: "New PIN", autofocus: true)
@@ -566,46 +670,49 @@ private func confirm(
 
     let alert = NSAlert()
     alert.alertStyle = .informational
-    alert.messageText = "Approve SSH access?"
+    alert.icon = applicationIcon()
+    alert.messageText = "Approve SSH access"
     let escapedHosts = hosts.map { "- \($0.debugDescription)" }.joined(separator: "\n")
-    alert.informativeText = "Sloosh will grant this request access to:\n\n\(escapedHosts)"
-    if enrolledDomainState != nil {
-        alert.addButton(withTitle: "Use Touch ID")
-    }
-    if allowPin {
-        alert.addButton(withTitle: "Use PIN")
-    }
-    guard enrolledDomainState != nil || allowPin else {
-        return .error("not_enrolled", "No local approval method is configured")
-    }
-    alert.addButton(withTitle: "Cancel")
-    let answer = alert.runModal()
-    let selectedTouchID = enrolledDomainState != nil && answer == .alertFirstButtonReturn
-    let selectedPIN = allowPin && (
-        (enrolledDomainState == nil && answer == .alertFirstButtonReturn)
-            || (enrolledDomainState != nil && answer == .alertSecondButtonReturn)
+    alert.informativeText = "Review the exact host scope, then choose how to approve:\n\n\(escapedHosts)"
+    let picker = ApprovalMethodPickerView(
+        touchIDAvailable: enrolledDomainState != nil,
+        pinAvailable: allowPin
     )
-    guard selectedTouchID || selectedPIN else {
+    alert.accessoryView = picker
+    alert.addButton(withTitle: "Continue")
+    alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else {
         return .error("cancelled", "Native approval was cancelled")
     }
-    if selectedPIN {
+
+    switch picker.selectedMethod {
+    case .pin:
         return promptPin(
             title: "Enter approval PIN",
             message: "Enter your 6-digit Sloosh approval PIN."
         )
-    }
+    case .masterPassword:
+        return promptMasterPassword(
+            purpose: "SSH access to \(hosts.joined(separator: ", "))",
+            confirmation: false
+        )
+    case .touchID:
+        guard let enrolledDomainState else {
+            return .error("not_enrolled", "Touch ID approval is not enrolled")
+        }
 
-    let currentDomainState: Data
-    switch authenticate(reason: "Approve Sloosh access to \(hosts.joined(separator: ", "))") {
-    case .success(let state):
-        currentDomainState = state
-    case .failure(let response):
-        return response
+        let currentDomainState: Data
+        switch authenticate(reason: "Approve Sloosh access to \(hosts.joined(separator: ", "))") {
+        case .success(let state):
+            currentDomainState = state
+        case .failure(let response):
+            return response
+        }
+        guard enrolledDomainState == currentDomainState else {
+            return .error("not_enrolled", "Touch ID enrollment changed; run `sloosh init` again")
+        }
+        return .simple("approved")
     }
-    guard enrolledDomainState == currentDomainState else {
-        return .error("not_enrolled", "Touch ID enrollment changed; run `sloosh init` again")
-    }
-    return .simple("approved")
 }
 
 private func storePinCredential(password: String) -> Response {
@@ -786,7 +893,13 @@ case "begin":
         allowPin: second.allow_pin ?? false
     )
     send(confirmation)
-    exit(confirmation.type == "approved" || confirmation.type == "pin_entered" ? 0 : 1)
+    exit(
+        confirmation.type == "approved"
+            || confirmation.type == "pin_entered"
+            || confirmation.type == "master_password_entered"
+            ? 0
+            : 1
+    )
 
 default:
     send(.error("invalid_request", "Unsupported helper request"))

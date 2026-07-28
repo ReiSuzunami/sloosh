@@ -47,11 +47,44 @@ git push origin "v$version"
 
 It combines `sloosh`, `slooshd`, and Tauri desktop slices into three universal
 binaries. The command-line archive contains the first two. The DMG contains
-only the desktop and private `slooshd`, then ad-hoc signs both, the payload app,
-and native installer. It packages Linux, generates `SHA256SUMS`, records GitHub
-build provenance attestations for a public repository, and creates the GitHub
-Release. No publishing secret is required; GitHub's scoped workflow token
+only the desktop and private `slooshd`. The `macos-universal` job imports the
+fixed self-signed release identity from the protected `release` environment,
+signs the command-line binaries, payload, native approval helper, and installer,
+then deletes its temporary Keychain. It packages Linux, generates
+`SHA256SUMS`, records GitHub build provenance attestations for a public
+repository, and creates the GitHub Release. GitHub's scoped workflow token
 creates the release.
+
+Configure these values in the GitHub `release` environment before tagging:
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `MACOS_SIGNING_CERTIFICATE_P12_BASE64` | Base64-encoded encrypted `.p12` containing the fixed certificate and private key |
+| Secret | `MACOS_SIGNING_CERTIFICATE_PASSWORD` | Password protecting that `.p12` |
+| Secret | `MACOS_SIGNING_KEYCHAIN_PASSWORD` | Random password for the runner's temporary Keychain |
+| Variable | `MACOS_SIGNING_IDENTITY` | Exact certificate common name used by `codesign` |
+
+The environment should require a reviewer and allow only release tags. Never
+commit the `.p12`, private key, or passwords. Reuse the same certificate across
+releases: replacing it changes the code designated requirement and requires
+existing macOS Keychain approval credentials to be enrolled again.
+The approval gates `macos-universal`; `publish` depends on that signed job and
+therefore does not request a second environment approval.
+
+Local packaging defaults to ad-hoc signing. To reproduce release signing, make
+the same identity available in a local Keychain:
+
+```sh
+SLOOSH_MACOS_SIGNING_IDENTITY="Sloosh Release Signing 2026" \
+SLOOSH_MACOS_SIGNING_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
+scripts/package-macos.sh \
+  "$version" path/to/universal/slooshd path/to/universal/Sloosh dist
+```
+
+The fixed certificate creates a stable signing identity but remains
+self-signed. It does not create system trust, Developer ID status, or
+notarization, and release artifacts still require the documented Gatekeeper
+override.
 
 After the workflow succeeds:
 
@@ -78,6 +111,9 @@ installer="$mount_dir/Install Sloosh.app"
 payload="$installer/Contents/Helpers/Sloosh.app"
 codesign --verify --deep --strict "$installer"
 codesign --verify --deep --strict "$payload"
+! codesign -d -r- \
+  "$payload/Contents/Helpers/Sloosh Approval.app/Contents/MacOS/sloosh-approval" \
+  2>&1 | grep -Eq 'designated => .*cdhash'
 test -s "$mount_dir/.DS_Store"
 test -s "$mount_dir/.background/background.png"
 lipo -archs "$installer/Contents/MacOS/install-sloosh"

@@ -525,14 +525,10 @@ pub async fn preview_native_approval(
         return Err(LeaseError::VaultRequired);
     }
     match vault::unlock_for_lease(master_password).await {
-        Ok(()) => {
-            let mut st = state().lock().await;
-            prune_expired(&mut st).await;
-            st.pending
-                .get_mut(id)
-                .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
-                .failed_attempts = 0;
-        }
+        // Native preview uses the Keychain credential before the human chooses
+        // an approval method. It proves only that exact scope can be shown, so
+        // it must not reset failures from later Master Password input.
+        Ok(()) => {}
         Err(VaultError::WrongPassword) => {
             let mut st = state().lock().await;
             prune_expired(&mut st).await;
@@ -1856,6 +1852,57 @@ mod tests {
                 .failed_attempts,
             1
         );
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn native_master_password_failures_survive_keychain_previews() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(970, 110, Some("sloosh")),
+            ancestor(969, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault(b"correct");
+
+        for expected_remaining in [MAX_APPROVE_ATTEMPTS - 1, MAX_APPROVE_ATTEMPTS - 2] {
+            let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+            let err = approve_lease_native(&info.id, b"wrong-master-password", &preview)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    LeaseError::WrongPassword { remaining }
+                        if remaining == expected_remaining
+                ),
+                "{err}"
+            );
+        }
+        assert!(
+            state().lock().await.pending.contains_key(&info.id),
+            "wrong Master Password must leave the request pending"
+        );
+        assert_eq!(
+            state()
+                .lock()
+                .await
+                .pending
+                .get(&info.id)
+                .expect("request remains pending")
+                .failed_attempts,
+            2
+        );
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
 
         reset_state().await;
     }

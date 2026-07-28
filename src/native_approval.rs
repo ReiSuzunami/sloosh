@@ -316,15 +316,16 @@ async fn finish_native_approval(
     }
     let pin_store = PinStore::current_user();
     let allow_pin = matches!(pin_store.status()?, PinStatus::Ready);
-    let entered_pin = match helper
+    let (entered_pin, entered_master_password) = match helper
         .exchange(&HelperRequest::Confirm {
             hosts: &approved_hosts,
             allow_pin,
         })
         .await?
     {
-        HelperResponse::Approved => None,
-        HelperResponse::PinEntered { pin } => Some(pin),
+        HelperResponse::Approved => (None, None),
+        HelperResponse::PinEntered { pin } => (Some(pin), None),
+        HelperResponse::MasterPasswordEntered { master_password } => (None, Some(master_password)),
         HelperResponse::Error { code, message } => return Err(map_helper_error(code, message)),
         _ => {
             return Err(NativeApprovalError::InvalidData(
@@ -336,9 +337,10 @@ async fn finish_native_approval(
     if let Some(pin) = entered_pin {
         verify_pin(&pin_store, &pin)?;
     }
+    let approval_password = entered_master_password.as_ref().unwrap_or(master_password);
     Ok(lease::approve_lease_native(
         &info.id,
-        master_password.expose_secret().as_bytes(),
+        approval_password.expose_secret().as_bytes(),
         &approved_hosts,
     )
     .await?)
@@ -416,6 +418,20 @@ mod tests {
             serde_json::to_value(HelperRequest::CompletePinUnlock { verified: true }).unwrap(),
             serde_json::json!({ "type": "complete_pin_unlock", "verified": true })
         );
+    }
+
+    #[test]
+    fn helper_master_password_response_remains_typed_and_secret() {
+        let response: HelperResponse = serde_json::from_value(serde_json::json!({
+            "type": "master_password_entered",
+            "master_password": "vault-secret"
+        }))
+        .unwrap();
+        let HelperResponse::MasterPasswordEntered { master_password } = response else {
+            panic!("expected Master Password response");
+        };
+        assert_eq!(master_password.expose_secret(), "vault-secret");
+        assert_eq!(format!("{master_password:?}"), "SecretString(<redacted>)");
     }
 
     #[test]
