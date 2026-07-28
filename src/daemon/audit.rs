@@ -24,8 +24,9 @@ use serde_json::{Map, Value};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::transport::unix::{self, sloosh_home};
 
 /// `~/.sloosh/audit.jsonl` (or `$SLOOSH_HOME/audit.jsonl` under test).
@@ -42,12 +43,29 @@ pub fn record(event: &str, fields: Value) {
     let Some(line) = build_line(event, fields) else {
         return;
     };
-    if let Err(e) = append_line(&audit_log_path(), &line) {
-        warn!(
-            error = %e, event,
-            "failed to write audit log entry; continuing without it (availability of sloosh \
-             itself over completeness of the audit trail — docs/internals/architecture.md)"
-        );
+    match append_line(&audit_log_path(), &line) {
+        Ok(()) => {
+            if let Some(suppressed) = warning_recovered("AUDIT_WRITE_FAILED", &()) {
+                info!(
+                    diagnostic_code = "AUDIT_WRITE_RECOVERED",
+                    suppressed, "audit log writes recovered"
+                );
+            }
+        }
+        Err(error) => {
+            if let WarningAction::Emit { suppressed } =
+                warning_occurrence("AUDIT_WRITE_FAILED", &())
+            {
+                warn!(
+                    diagnostic_code = "AUDIT_WRITE_FAILED",
+                    error_kind = ?error.kind(),
+                    suppressed,
+                    "failed to write audit log entry; continuing without it (availability of \
+                     sloosh itself over completeness of the audit trail — \
+                     docs/internals/architecture.md)"
+                );
+            }
+        }
     }
 }
 
@@ -65,20 +83,34 @@ fn build_line(event: &str, fields: Value) -> Option<String> {
         Value::Object(extra) => obj.extend(extra),
         Value::Null => {}
         other => {
+            let field_type = json_value_type(&other);
             warn!(
-                event,
-                ?other,
-                "audit fields must be a JSON object; dropping extra fields"
+                diagnostic_code = "AUDIT_FIELDS_INVALID",
+                event, field_type, "audit fields must be a JSON object; dropping extra fields"
             );
         }
     }
 
     match serde_json::to_string(&Value::Object(obj)) {
         Ok(s) => Some(s),
-        Err(e) => {
-            warn!(error = %e, event, "failed to serialize audit event; dropping it");
+        Err(_) => {
+            warn!(
+                diagnostic_code = "AUDIT_SERIALIZE_FAILED",
+                event, "failed to serialize audit event; dropping it"
+            );
             None
         }
+    }
+}
+
+fn json_value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -160,6 +192,7 @@ pub fn read_events(path: &std::path::Path) -> std::io::Result<Vec<AuditEvent>> {
         Err(e) => return Err(e),
     };
     let mut events = Vec::new();
+    let mut malformed = 0_u64;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -167,18 +200,17 @@ pub fn read_events(path: &std::path::Path) -> std::io::Result<Vec<AuditEvent>> {
         }
         match serde_json::from_str::<AuditEvent>(line) {
             Ok(ev) => events.push(ev),
-            Err(e) => warn!(error = %e, "skipping malformed audit log line"),
+            Err(_) => malformed += 1,
         }
     }
+    warn_malformed_audit_lines(malformed);
     Ok(events)
 }
 
-/// Read the raw NDJSON lines of the audit log verbatim (trimmed, blank
-/// lines dropped, still unparsed) — used by `sloosh log --json`, which
-/// echoes the file's exact on-disk text rather than a value re-serialized
-/// from a parsed struct (serde_json's `Map` is `BTreeMap`-backed without
-/// the `preserve_order` feature, so re-serializing would silently reorder
-/// fields away from what was actually written).
+/// Read the raw NDJSON lines of the audit log verbatim (trimmed, blank lines
+/// dropped, still unparsed). [`read_validated_raw_events`] uses this before
+/// validating each canonical audit envelope while retaining the exact
+/// on-disk text; re-serializing through serde_json could reorder fields.
 pub fn read_raw_lines(path: &std::path::Path) -> std::io::Result<Vec<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -191,6 +223,44 @@ pub fn read_raw_lines(path: &std::path::Path) -> std::io::Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// One validated audit event retaining its exact source line for `--json`.
+pub struct ValidatedRawAuditEvent {
+    pub raw: String,
+    pub value: Value,
+}
+
+/// Read exact audit lines while accepting only the canonical `AuditEvent`
+/// envelope. This prevents valid-but-unrelated JSON from being echoed as if
+/// the daemon had authored it.
+pub fn read_validated_raw_events(
+    path: &std::path::Path,
+) -> std::io::Result<Vec<ValidatedRawAuditEvent>> {
+    let raw_lines = read_raw_lines(path)?;
+    let mut events = Vec::new();
+    let mut malformed = 0_u64;
+    for raw in raw_lines {
+        if serde_json::from_str::<AuditEvent>(&raw).is_err() {
+            malformed += 1;
+            continue;
+        }
+        match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => events.push(ValidatedRawAuditEvent { raw, value }),
+            Err(_) => malformed += 1,
+        }
+    }
+    warn_malformed_audit_lines(malformed);
+    Ok(events)
+}
+
+fn warn_malformed_audit_lines(count: u64) {
+    if count > 0 {
+        warn!(
+            diagnostic_code = "AUDIT_MALFORMED_LINES",
+            count, "skipping malformed audit log lines"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +424,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let lines = read_raw_lines(&path).expect("read");
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_validated_raw_events_filters_non_audit_json_and_preserves_bytes() {
+        let path = temp_log_path("validated-raw");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "42").unwrap();
+            writeln!(f, "{{\"not\":\"an audit envelope\"}}").unwrap();
+            writeln!(f, "torn json").unwrap();
+            writeln!(
+                f,
+                "{{\"ts\":\"2026-07-08T00:00:00Z\",\"event\":\"run\",\"zzz\":1,\"aaa\":2}}"
+            )
+            .unwrap();
+        }
+
+        let events = read_validated_raw_events(&path).expect("read");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].raw,
+            "{\"ts\":\"2026-07-08T00:00:00Z\",\"event\":\"run\",\"zzz\":1,\"aaa\":2}"
+        );
+        assert_eq!(events[0].value["event"], "run");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use tracing::warn;
+use tracing::{info, warn};
 
+use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::transport::unix::{ensure_private_dir as ensure_sloosh_private_dir, sloosh_home};
 
 pub(super) const MAX_SPOOL_DIR_BYTES: u64 = 64 * 1024 * 1024;
@@ -123,7 +124,7 @@ impl SpoolWriter {
         if planned_marker || root_limited {
             self.limited = true;
             warn!(
-                spool_path = %self.path.display(),
+                diagnostic_code = "SPOOL_LIMIT_REACHED",
                 per_run_limit_bytes = self.limit,
                 root_persistence_unavailable = root_limited,
                 "spool persistence limit reached; further output remains in the memory ring only"
@@ -209,14 +210,28 @@ impl SpoolLedger {
         }
 
         let (mut entries, mut total_bytes) = match scan_spool_root(&self.root) {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => {
+                if let Some(suppressed) = warning_recovered("SPOOL_INDEX_FAILED", &self.root) {
+                    info!(
+                        diagnostic_code = "SPOOL_INDEX_RECOVERED",
+                        suppressed, "spool root indexing recovered"
+                    );
+                }
+                snapshot
+            }
             Err(error) => {
                 self.next_scan_attempt = Some(Instant::now() + SPOOL_SCAN_RETRY_INTERVAL);
-                warn!(
-                    spool_root = %self.root.display(),
-                    %error,
-                    "could not completely index spool root; disk persistence is paused until a later retry"
-                );
+                if let WarningAction::Emit { suppressed } =
+                    warning_occurrence("SPOOL_INDEX_FAILED", &self.root)
+                {
+                    warn!(
+                        diagnostic_code = "SPOOL_INDEX_FAILED",
+                        error_kind = ?error.kind(),
+                        suppressed,
+                        "could not completely index spool root; disk persistence is paused until \
+                         a later retry"
+                    );
+                }
                 return;
             }
         };
@@ -345,12 +360,28 @@ impl SpoolLedger {
         for (path, _) in candidates {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
+                    if let Some(suppressed) =
+                        warning_recovered("SPOOL_EVICTION_REMOVE_FAILED", &self.root)
+                    {
+                        info!(
+                            diagnostic_code = "SPOOL_EVICTION_REMOVE_RECOVERED",
+                            suppressed, "spool budget eviction recovered"
+                        );
+                    }
                     if let Some(entry) = self.entries.remove(&path) {
                         self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
                     }
                     return true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(suppressed) =
+                        warning_recovered("SPOOL_EVICTION_REMOVE_FAILED", &self.root)
+                    {
+                        info!(
+                            diagnostic_code = "SPOOL_EVICTION_REMOVE_RECOVERED",
+                            suppressed, "spool budget eviction recovered"
+                        );
+                    }
                     if let Some(entry) = self.entries.remove(&path) {
                         self.total_bytes = self.total_bytes.saturating_sub(entry.bytes);
                     }
@@ -358,7 +389,16 @@ impl SpoolLedger {
                 }
                 Err(error) => {
                     attempted.insert(path.clone());
-                    warn!(spool_path = %path.display(), %error, "could not remove old spool file");
+                    if let WarningAction::Emit { suppressed } =
+                        warning_occurrence("SPOOL_EVICTION_REMOVE_FAILED", &self.root)
+                    {
+                        warn!(
+                            diagnostic_code = "SPOOL_EVICTION_REMOVE_FAILED",
+                            error_kind = ?error.kind(),
+                            suppressed,
+                            "could not remove old spool file during budget enforcement"
+                        );
+                    }
                 }
             }
         }
@@ -540,14 +580,26 @@ fn open_spool_file_under_best_effort(
     seq: u64,
 ) -> (PathBuf, Option<SpoolWriter>) {
     match open_spool_file_under(root, host, name, seq) {
-        Ok((path, writer)) => (path, Some(writer)),
+        Ok((path, writer)) => {
+            if let Some(suppressed) = warning_recovered("SPOOL_OPEN_FAILED", &(host, name)) {
+                info!(
+                    diagnostic_code = "SPOOL_OPEN_RECOVERED",
+                    suppressed, "spool file creation recovered"
+                );
+            }
+            (path, Some(writer))
+        }
         Err(error) => {
-            warn!(
-                %host,
-                session = %name,
-                %error,
-                "spool open failed; command and in-memory output continue"
-            );
+            if let WarningAction::Emit { suppressed } =
+                warning_occurrence("SPOOL_OPEN_FAILED", &(host, name))
+            {
+                warn!(
+                    diagnostic_code = "SPOOL_OPEN_FAILED",
+                    error_kind = ?error.kind(),
+                    suppressed,
+                    "spool open failed; command and in-memory output continue"
+                );
+            }
             (PathBuf::new(), None)
         }
     }
@@ -563,22 +615,39 @@ pub(super) fn open_spool_file_best_effort(
 
 pub(super) fn cleanup_spool_dir_preserving(dir: &Path, preserve: Option<&Path>) {
     let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = match std::fs::read_dir(dir) {
-        Ok(read_dir) => read_dir
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                if !entry.file_type().ok()?.is_file() {
-                    return None;
-                }
-                let metadata = entry.metadata().ok()?;
-                Some((
-                    entry.path(),
-                    metadata.len(),
-                    metadata.modified().unwrap_or(UNIX_EPOCH),
-                ))
-            })
-            .collect(),
+        Ok(read_dir) => {
+            if let Some(suppressed) = warning_recovered("SPOOL_CLEANUP_LIST_FAILED", dir) {
+                info!(
+                    diagnostic_code = "SPOOL_CLEANUP_LIST_RECOVERED",
+                    suppressed, "spool cleanup directory listing recovered"
+                );
+            }
+            read_dir
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    if !entry.file_type().ok()?.is_file() {
+                        return None;
+                    }
+                    let metadata = entry.metadata().ok()?;
+                    Some((
+                        entry.path(),
+                        metadata.len(),
+                        metadata.modified().unwrap_or(UNIX_EPOCH),
+                    ))
+                })
+                .collect()
+        }
         Err(error) => {
-            warn!(dir = %dir.display(), %error, "could not list spool dir for cleanup");
+            if let WarningAction::Emit { suppressed } =
+                warning_occurrence("SPOOL_CLEANUP_LIST_FAILED", dir)
+            {
+                warn!(
+                    diagnostic_code = "SPOOL_CLEANUP_LIST_FAILED",
+                    error_kind = ?error.kind(),
+                    suppressed,
+                    "could not list spool directory for cleanup"
+                );
+            }
             return;
         }
     };
@@ -592,9 +661,26 @@ pub(super) fn cleanup_spool_dir_preserving(dir: &Path, preserve: Option<&Path>) 
             continue;
         }
         match std::fs::remove_file(path) {
-            Ok(()) => total = total.saturating_sub(*len),
+            Ok(()) => {
+                if let Some(suppressed) = warning_recovered("SPOOL_CLEANUP_REMOVE_FAILED", dir) {
+                    info!(
+                        diagnostic_code = "SPOOL_CLEANUP_REMOVE_RECOVERED",
+                        suppressed, "spool cleanup removal recovered"
+                    );
+                }
+                total = total.saturating_sub(*len);
+            }
             Err(error) => {
-                warn!(spool_path = %path.display(), %error, "could not remove old spool file");
+                if let WarningAction::Emit { suppressed } =
+                    warning_occurrence("SPOOL_CLEANUP_REMOVE_FAILED", dir)
+                {
+                    warn!(
+                        diagnostic_code = "SPOOL_CLEANUP_REMOVE_FAILED",
+                        error_kind = ?error.kind(),
+                        suppressed,
+                        "could not remove old spool file"
+                    );
+                }
             }
         }
     }

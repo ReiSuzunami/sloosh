@@ -804,8 +804,7 @@ async fn create_session(
             _ = wake_rx.changed() => {}
             _ = sleep_until(deadline) => {
                 warn!(
-                    host,
-                    session = name,
+                    diagnostic_code = "SESSION_INIT_TIMEOUT",
                     "shell init marker never arrived; proceeding without banner consumption \
                      (login banner may appear in early session output)"
                 );
@@ -889,11 +888,10 @@ fn ingest(state: &mut SessionState, data: &[u8]) {
                     // The ledger avoids repeated tree scans; the actual
                     // append remains synchronous and failures detach only
                     // this spool while command/ring processing continues.
-                    let path = writer.path.clone();
                     if let Err(error) = writer.write_payload(&bytes) {
                         warn!(
-                            spool_path = %path.display(),
-                            %error,
+                            diagnostic_code = "SPOOL_WRITE_FAILED",
+                            error_kind = ?error.kind(),
                             "spool write failed; command and in-memory output continue"
                         );
                         state.spool_file = None;
@@ -949,7 +947,10 @@ fn handle_marker(state: &mut SessionState, sentinel: &str, exit_code: i32) {
 async fn mark_dead(inner: &Arc<SessionInner>, reason: &str) {
     let mut state = inner.state.lock().await;
     if state.dead.is_none() {
-        warn!(host = %inner.host, session = %inner.name, reason, "session died");
+        warn!(
+            diagnostic_code = "SESSION_DIED",
+            "SSH session died; later operations will return the stored reason"
+        );
         state.dead = Some(reason.to_string());
         audit::record(
             "session_dead",

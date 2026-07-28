@@ -5,24 +5,18 @@ use crate::daemon::audit;
 
 pub(super) async fn cmd_log(args: LogArgs) -> anyhow::Result<()> {
     let path = audit::audit_log_path();
-    let raw_lines = audit::read_raw_lines(&path).map_err(|error| {
+    let raw_events = audit::read_validated_raw_events(&path).map_err(|error| {
         anyhow::anyhow!("could not read audit log at {}: {error}", path.display())
     })?;
 
-    let mut parsed: Vec<(String, serde_json::Value)> = Vec::new();
-    for line in raw_lines {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            parsed.push((line, value));
-        }
-    }
-
-    let filtered: Vec<(String, serde_json::Value)> = parsed
+    let filtered: Vec<(String, serde_json::Value)> = raw_events
         .into_iter()
-        .filter(|(_, value)| {
-            args.host
-                .as_deref()
-                .is_none_or(|host| value.get("host").and_then(|field| field.as_str()) == Some(host))
+        .filter(|event| {
+            args.host.as_deref().is_none_or(|host| {
+                event.value.get("host").and_then(|field| field.as_str()) == Some(host)
+            })
         })
+        .map(|event| (event.raw, event.value))
         .collect();
 
     let start = filtered.len().saturating_sub(args.count);

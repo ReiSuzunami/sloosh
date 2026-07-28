@@ -553,7 +553,7 @@ pub async fn preview_native_approval(
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(ssh::expand_lease_hosts(&hosts).await?)
+    Ok(expand_approval_hosts(&hosts).await?)
 }
 
 /// Activate after bundled native UI confirms daemon-resolved host scope.
@@ -640,7 +640,7 @@ async fn approve_lease_for_chain_checked(
     // list the human confirmed in the separate CLI process. Any config or
     // vault change between preview and activation fails closed and leaves
     // the pending request intact.
-    let resolved_hosts = match ssh::expand_lease_hosts(&pending.hosts).await {
+    let resolved_hosts = match expand_approval_hosts(&pending.hosts).await {
         Ok(hosts) => hosts,
         Err(error) => {
             if cleanup_failed_preview && st.active.is_empty() {
@@ -687,6 +687,19 @@ async fn approve_lease_for_chain_checked(
         token,
         unverified_hosts: Vec::new(),
     })
+}
+
+async fn expand_approval_hosts(hosts: &[String]) -> Result<Vec<String>, ssh::SshError> {
+    // Unit tests exercise the lease state machine with synthetic host names
+    // and must not consume the developer's real ~/.ssh/config. Integration
+    // tests compile the library without cfg(test), so live SSH coverage still
+    // uses the production config loader.
+    #[cfg(test)]
+    let config = ssh::SshConfig::default();
+    #[cfg(not(test))]
+    let config = ssh::SshConfig::load_default();
+
+    ssh::expand_lease_hosts_with_config(&config, hosts).await
 }
 
 fn format_host_list(hosts: &[String]) -> String {
@@ -1490,7 +1503,7 @@ mod tests {
         // vault before the daemon sees ApproveLease. Exact comparison must
         // catch this TOCTOU and keep the request pending again.
         vault::unlock_for_lease(b"pw").await.unwrap();
-        let preview = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
+        let preview = expand_approval_hosts(&info.hosts).await.unwrap();
         vault::clear_cache().await;
         assert!(preview.iter().any(|h| h == "sloosh-test-bastion-before"));
         vault::add_entry(
@@ -1524,7 +1537,7 @@ mod tests {
         assert!(!vault::is_cached().await);
 
         vault::unlock_for_lease(b"pw").await.unwrap();
-        let exact_approval = ssh::expand_lease_hosts(&info.hosts).await.unwrap();
+        let exact_approval = expand_approval_hosts(&info.hosts).await.unwrap();
         vault::clear_cache().await;
         assert!(
             exact_approval

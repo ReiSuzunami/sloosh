@@ -6,6 +6,7 @@
 pub mod cli;
 pub use cli::client;
 pub mod daemon;
+pub(crate) mod diagnostics;
 pub mod local_approval;
 pub mod native_approval;
 pub mod procs;

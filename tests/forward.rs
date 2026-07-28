@@ -65,13 +65,22 @@ fn set_test_home(tag: &str) -> std::path::PathBuf {
 
 /// Grant this test process itself a lease for `host` (docs/internals/architecture.md), same
 /// approach as `tests/ssh_session.rs::grant_lease_for_test`.
-async fn grant_lease_for_test(host: &str) {
+async fn grant_lease_for_test(host: &str, use_vault_profile: bool) {
     if !vault::exists() {
-        vault::create(
-            &vault::VaultData::default(),
-            b"sloosh-live-test-master-password",
-        )
-        .expect("create test vault");
+        let mut data = vault::VaultData::default();
+        if use_vault_profile {
+            data.hosts.insert(
+                host.to_string(),
+                vault::HostEntry {
+                    hostname: host.to_string(),
+                    port: Some(22),
+                    user: None,
+                    auth: vault::AuthMethod::Agent,
+                    route: sloosh::proto::HostRoute::Direct,
+                },
+            );
+        }
+        vault::create(&data, b"sloosh-live-test-master-password").expect("create test vault");
     }
     let pid = std::process::id();
     match lease::request_lease(pid, vec![host.to_string()])
@@ -112,9 +121,13 @@ async fn connect_with_retry(path: &std::path::Path) -> UnixChannel {
     panic!("daemon never became connectable at {}", path.display());
 }
 
-async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf) {
+async fn start_daemon(
+    tag: &str,
+    host: &str,
+    use_vault_profile: bool,
+) -> (UnixChannel, std::path::PathBuf) {
     set_test_home(tag);
-    grant_lease_for_test(host).await;
+    grant_lease_for_test(host, use_vault_profile).await;
     let socket_path = temp_socket_path(tag);
     let daemon_socket = socket_path.clone();
     tokio::spawn(async move {
@@ -128,7 +141,7 @@ async fn start_daemon(tag: &str, host: &str) -> (UnixChannel, std::path::PathBuf
 async fn remote_forward_dispatches_to_remote_parser_without_network() {
     let _guard = test_lock().lock().await;
     let host = "remote-forward-parser.invalid";
-    let (mut chan, _socket) = start_daemon("remote-parser", host).await;
+    let (mut chan, _socket) = start_daemon("remote-parser", host, true).await;
 
     chan.send(&Request::Forward {
         host: host.to_string(),
@@ -205,7 +218,7 @@ async fn remote_forward_tunnels_to_local_target_and_stops_cleanly() {
         return;
     };
     let (local_port, echo_task) = start_local_echo().await;
-    let (mut chan, _socket) = start_daemon("remote-forward", &host).await;
+    let (mut chan, _socket) = start_daemon("remote-forward", &host, false).await;
 
     chan.send(&Request::Forward {
         host: host.clone(),
@@ -271,7 +284,7 @@ async fn remote_forward_listener_and_tunnel_close_when_lease_expires() {
         return;
     };
     let (local_port, echo_task) = start_local_echo().await;
-    let (mut chan, _socket) = start_daemon("remote-expiry", &host).await;
+    let (mut chan, _socket) = start_daemon("remote-expiry", &host, false).await;
 
     chan.send(&Request::Forward {
         host: host.clone(),
@@ -334,7 +347,7 @@ async fn local_forward_tunnels_to_remote_sshd_and_stops_cleanly() {
         eprintln!("SLOOSH_TEST_SSH_HOST not set; skipping live SSH test");
         return;
     };
-    let (mut chan, _socket) = start_daemon("local-forward", &host).await;
+    let (mut chan, _socket) = start_daemon("local-forward", &host, false).await;
 
     chan.send(&Request::Forward {
         host: host.clone(),

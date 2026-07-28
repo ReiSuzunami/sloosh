@@ -43,6 +43,7 @@ use crate::daemon::lease;
 #[cfg(test)]
 use crate::daemon::ssh::ForwardRouteState;
 use crate::daemon::ssh::{self, ForwardRoute, ForwardRouteLifecycle, LeaseContext, SshError};
+use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::proto::ForwardSummary;
 
 /// How often [`spawn_reaper`] re-checks every live forward's lease
@@ -591,11 +592,21 @@ async fn run_local_forward(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer_addr)) => {
+                        if let Some(suppressed) =
+                            warning_recovered("FORWARD_ACCEPT_FAILED", &id)
+                        {
+                            info!(
+                                diagnostic_code = "FORWARD_ACCEPT_RECOVERED",
+                                suppressed,
+                                "local forward listener recovered"
+                            );
+                        }
                         if !lease::check_grant(&grant).await {
                             registry().lock().await.remove(&id);
                             break StopReason::LeaseExpired;
                         }
                         tokio::spawn(run_local_tunnel(
+                            id.clone(),
                             conn.clone(),
                             stream,
                             remote_host.clone(),
@@ -604,7 +615,18 @@ async fn run_local_forward(
                             closed_rx.clone(),
                         ));
                     }
-                    Err(e) => warn!(id = %id, error = %e, "local forward: accept failed"),
+                    Err(error) => {
+                        if let WarningAction::Emit { suppressed } =
+                            warning_occurrence("FORWARD_ACCEPT_FAILED", &id)
+                        {
+                            warn!(
+                                diagnostic_code = "FORWARD_ACCEPT_FAILED",
+                                error = %error,
+                                suppressed,
+                                "local forward listener accept failed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -620,6 +642,7 @@ async fn run_local_forward(
 }
 
 async fn run_local_tunnel(
+    warning_scope: String,
     conn: Arc<ssh::Connection>,
     mut local: TcpStream,
     remote_host: String,
@@ -633,6 +656,14 @@ async fn run_local_tunnel(
         .await
     {
         Ok(channel) => {
+            if let Some(suppressed) =
+                warning_recovered("FORWARD_CHANNEL_OPEN_FAILED", &warning_scope)
+            {
+                info!(
+                    diagnostic_code = "FORWARD_CHANNEL_OPEN_RECOVERED",
+                    suppressed, "local forward channel opens recovered"
+                );
+            }
             tunnel_count.fetch_add(1, Ordering::SeqCst);
             let mut remote = channel.into_stream();
             tokio::select! {
@@ -641,11 +672,17 @@ async fn run_local_tunnel(
             }
             tunnel_count.fetch_sub(1, Ordering::SeqCst);
         }
-        Err(e) => {
-            warn!(
-                remote_host, remote_port, error = %e,
-                "local forward: could not open direct-tcpip channel to target"
-            );
+        Err(error) => {
+            if let WarningAction::Emit { suppressed } =
+                warning_occurrence("FORWARD_CHANNEL_OPEN_FAILED", &warning_scope)
+            {
+                warn!(
+                    diagnostic_code = "FORWARD_CHANNEL_OPEN_FAILED",
+                    error = %error,
+                    suppressed,
+                    "local forward could not open direct-tcpip channel to target"
+                );
+            }
         }
     }
 }
@@ -664,19 +701,21 @@ async fn cancel_remote_listener(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(
+        Ok(Err(error)) => info!(
+            diagnostic_code = "REMOTE_FORWARD_CANCEL_REJECTED",
             host,
             bind_addr,
             remote_port,
             error = %error,
-            "remote forward: server rejected listener cancellation; closing SSH connection"
+            "remote forward server rejected listener cancellation; closing SSH connection"
         ),
-        Err(_) => warn!(
+        Err(_) => info!(
+            diagnostic_code = "REMOTE_FORWARD_CANCEL_TIMEOUT",
             host,
             bind_addr,
             remote_port,
             timeout_secs = REMOTE_CANCEL_TIMEOUT.as_secs(),
-            "remote forward: listener cancellation timed out; closing SSH connection"
+            "remote forward listener cancellation timed out; closing SSH connection"
         ),
     }
 }

@@ -8,6 +8,11 @@ use super::{bail_on_error_or_unexpected, send_request};
 use crate::daemon::{ssh, vault};
 use crate::proto::{LeaseActivatedInfo, LeaseRequestSummary, Request, Response, SecretString};
 
+struct ApprovalPlan {
+    approved_hosts: Vec<String>,
+    host_key_targets: Vec<ssh::HostKeyConfirmationTarget>,
+}
+
 /// Refuse to run a human-only command outside a real terminal. Credential
 /// enrollment and lease approval must never be driven by an agent.
 pub(super) fn require_tty(command: &str) -> anyhow::Result<()> {
@@ -99,17 +104,24 @@ pub(super) async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
     // ProxyJump-aware probe can resolve vault-only bastions without another
     // password prompt. Clear it before every return path.
     let approval_result: anyhow::Result<LeaseActivatedInfo> = async {
-        let activated = resolve_confirm_and_submit_approval(
+        let (activated, host_key_targets) = resolve_confirm_and_submit_approval(
             args.request_id,
             master_password,
             info.hosts,
-            |hosts| async move { ssh::expand_lease_hosts(&hosts).await },
+            |hosts| async move {
+                let approved_hosts = ssh::expand_lease_hosts(&hosts).await?;
+                let host_key_targets = ssh::host_key_confirmation_order(&approved_hosts).await?;
+                Ok(ApprovalPlan {
+                    approved_hosts,
+                    host_key_targets,
+                })
+            },
             confirm_approved_hosts,
             |request| async move { send_request(&request).await },
         )
         .await?;
 
-        for target in ssh::host_key_confirmation_order(&activated.hosts).await {
+        for target in host_key_targets {
             if ssh::host_has_known_key(&target.hostname, target.port) {
                 continue;
             }
@@ -131,29 +143,29 @@ async fn resolve_confirm_and_submit_approval<Resolve, ResolveFuture, Confirm, Se
     resolve_scope: Resolve,
     confirm_scope: Confirm,
     send: Send,
-) -> anyhow::Result<LeaseActivatedInfo>
+) -> anyhow::Result<(LeaseActivatedInfo, Vec<ssh::HostKeyConfirmationTarget>)>
 where
     Resolve: FnOnce(Vec<String>) -> ResolveFuture,
-    ResolveFuture: Future<Output = Result<Vec<String>, ssh::SshError>>,
+    ResolveFuture: Future<Output = Result<ApprovalPlan, ssh::SshError>>,
     Confirm: FnOnce(&[String]) -> anyhow::Result<()>,
     Send: FnOnce(Request) -> SendFuture,
     SendFuture: Future<Output = anyhow::Result<Response>>,
 {
-    let approved_hosts = resolve_scope(requested_hosts).await.map_err(|error| {
-        anyhow::anyhow!("could not resolve full ProxyJump approval scope: {error}")
-    })?;
-    confirm_scope(&approved_hosts)?;
+    let plan = resolve_scope(requested_hosts)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not plan complete approval scope: {error}"))?;
+    confirm_scope(&plan.approved_hosts)?;
 
     let approve_req = Request::ApproveLease {
         id: request_id,
         master_password,
-        approved_hosts,
+        approved_hosts: plan.approved_hosts,
     };
     let resp = bail_on_error_or_unexpected(send(approve_req).await?)?;
     let Response::LeaseActivated(activated) = resp else {
         anyhow::bail!("daemon sent an unexpected reply to ApproveLease: {resp:?}");
     };
-    Ok(activated)
+    Ok((activated, plan.host_key_targets))
 }
 
 fn confirm_approved_hosts(hosts: &[String]) -> anyhow::Result<()> {
@@ -318,7 +330,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("could not resolve full ProxyJump approval scope"),
+                .contains("could not plan complete approval scope"),
             "{error}"
         );
         assert_eq!(confirmations.load(Ordering::Relaxed), 0);

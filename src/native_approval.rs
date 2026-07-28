@@ -40,6 +40,8 @@ pub enum NativeApprovalError {
     Lease(#[from] lease::LeaseError),
     #[error(transparent)]
     Pin(#[from] PinError),
+    #[error(transparent)]
+    Ssh(#[from] ssh::SshError),
     #[error("wrong approval PIN ({remaining} attempt(s) remain)")]
     WrongPin { remaining: u32 },
     #[error("approval PIN is locked for {remaining_secs} seconds")]
@@ -307,7 +309,7 @@ async fn finish_native_approval(
         lease::preview_native_approval(&info.id, master_password.expose_secret().as_bytes())
             .await?;
     for host in &approved_hosts {
-        let (hostname, port) = ssh::resolve_endpoint(host).await;
+        let (hostname, port) = ssh::resolve_endpoint(host).await?;
         if !ssh::host_has_known_key(&hostname, port) {
             return Err(NativeApprovalError::HostKeyConfirmationRequired);
         }

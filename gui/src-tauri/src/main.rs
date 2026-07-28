@@ -2,10 +2,12 @@
 
 mod desktop_unlock;
 mod dock_icon;
+mod gui_error;
 mod host_commands;
 mod system_lock;
 
 use desktop_unlock::{DEFAULT_ABSOLUTE_TIMEOUT, DesktopUnlockSession, UnlockMethod, UnlockStatus};
+use gui_error::{daemon_request_failed, pin_status_failed, unexpected_daemon_response};
 use serde::Serialize;
 use sloosh::client::DaemonClient;
 use sloosh::daemon::vault;
@@ -93,10 +95,10 @@ impl From<Result<PinStatus, sloosh::local_approval::PinError>> for PinSnapshot {
                 remaining_secs: None,
                 error: None,
             },
-            Err(error) => Self {
+            Err(_) => Self {
                 state: "error",
                 remaining_secs: None,
-                error: Some(error.to_string()),
+                error: Some(pin_status_failed()),
             },
         }
     }
@@ -129,7 +131,7 @@ impl Controller {
                 leases: status.leases.len(),
                 error: None,
             },
-            Err(error) => DaemonSnapshot {
+            Err(_) => DaemonSnapshot {
                 online: false,
                 pid: None,
                 version: None,
@@ -137,7 +139,7 @@ impl Controller {
                 uptime_secs: None,
                 sessions: 0,
                 leases: 0,
-                error: Some(error.to_string()),
+                error: Some(daemon_request_failed("reading daemon status")),
             },
         };
         let native_approval_available = native_approval::is_available();
@@ -281,16 +283,14 @@ async fn initialize_vault(controller: tauri::State<'_, Controller>) -> Result<Ap
             master_password: password,
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| daemon_request_failed("initializing the vault"))?
     {
         Response::Ok => {
             controller.unlock(session_password, UnlockMethod::MasterPassword)?;
             refreshed(&controller).await
         }
         Response::Error { message } => Err(message),
-        response => Err(format!(
-            "daemon returned an unexpected response: {response:?}"
-        )),
+        _ => Err(unexpected_daemon_response("initializing the vault")),
     }
 }
 

@@ -239,6 +239,8 @@ or explicit daemon/process termination remains the termination path.
 Spool limits cover PTY command output only. They never cap SFTP bytes or
 duration. Other resources still have no global process, connection-count,
 host-count, audit-log, daemon-log, or user-selected SFTP disk quota.
+Operational warning suppression is process-local and bounded to 1,024 hashed
+`(diagnostic_code, scope)` keys; it evicts the oldest window at the cap.
 
 ### 4.5 Filesystem permissions and path handling
 
@@ -331,6 +333,13 @@ lifetime; successful activation transfers cache lifetime to the active lease.
 `SecretString` redacts `Debug` and zeroizes on drop. The daemon logs request
 type, not complete request fields. Audit does not record credentials or command
 output, but it does record command text and transfer paths.
+
+Diagnostics use stable codes and value-free scopes where input may contain
+paths, commands, or credentials. SSH-config diagnostics retain normalized
+directive names and line numbers, never directive values. Repeated operational
+failures may be suppressed for 60 seconds and later reported with a count;
+fail-closed request errors are still returned to every caller. Desktop command
+adapters never render an unexpected wire response through `Debug`.
 
 Sloosh retains RSA public-key interoperability for host keys and ssh-agent
 identities, but refuses RSA private-key files before authentication. RSA

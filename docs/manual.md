@@ -57,6 +57,18 @@ sloosh host edit myhost --direct
 Aliases are stable identities and cannot be renamed. Run
 `sloosh host add --help` or `sloosh host edit --help` for every option.
 
+Hosts not stored in the vault fall back to OpenSSH configuration. Sloosh
+understands `Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`,
+and `IdentityAgent`, including global defaults before the first `Host`.
+Unsupported directives in unrelated `Host` blocks stay silent. A selected
+host gets one concise diagnostic for lower-impact ignored options. Directives
+known to change its endpoint, route, or host-key identity (`Include`,
+`ProxyCommand`, `ProxyUseFdpass`, `HostKeyAlias`, and hostname
+canonicalization) fail instead of falling back to guessed settings. Because
+Sloosh does not evaluate `Match` predicates, any `Match` section is a
+fail-closed barrier for SSH-config-backed hosts. Direct vault profiles do not
+consume unrelated SSH configuration.
+
 ## Desktop app
 
 The macOS DMG includes the Sloosh desktop control plane and its private
@@ -182,6 +194,13 @@ sloosh daemon status
 The dedicated `slooshd` normally starts on demand and should not be invoked
 directly. Lifecycle controls are available under `sloosh daemon --help`; use
 them only when troubleshooting.
+
+Command warnings and errors use stderr; normal command results stay on stdout.
+Detached daemon diagnostics go to `~/.sloosh/daemon.log`. Operational warnings
+carry a stable `diagnostic_code`; repeated background failures are summarized
+with `suppressed=N` instead of printing every occurrence. When a later success
+proves recovery, it is recorded once. `RUST_LOG=debug` enables more detail for
+either binary. Review all logs before sharing them.
 
 ## Command reference
 
