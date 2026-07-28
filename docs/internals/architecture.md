@@ -188,6 +188,19 @@ route is visible before pending state is created, `RequestLease` fails instead
 of presenting a truncated approval scope. Connection-time dialing also checks
 each vault-backed ProxyJump alias independently.
 
+`src/daemon/ssh/config.rs` parses without logging. It attaches normalized,
+value-free diagnostics to global or `Host` scopes, then surfaces only those
+selected after vault precedence and host-pattern matching. Direct vault
+profiles therefore ignore unrelated OpenSSH configuration. Unsupported
+directives known to change a selected stanza's route or host-key identity and
+invalid selected ports return typed errors. `Include` is also fail-closed
+because ignored files could replace endpoint, route, or trust settings.
+`Match` begins an independent conditional section; because Sloosh does not
+evaluate its predicates, any `Match` is a global fail-closed barrier for
+SSH-config-backed hosts. Lower-impact ignored options emit one stable-code
+warning. Human CLI plans the complete host-key confirmation route before
+sending `ApproveLease`, so a planning failure cannot activate a lease.
+
 DMG-installed macOS adds an internal adapter without changing wire protocol:
 
 ```text

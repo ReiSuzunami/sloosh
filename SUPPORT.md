@@ -17,10 +17,14 @@ and include:
 - `sloosh --version` or the exact commit;
 - OS, architecture, and installation channel;
 - minimal reproduction steps, expected behavior, and actual behavior;
-- relevant redacted errors or logs.
+- relevant `diagnostic_code` values and redacted errors or logs. A
+  `suppressed=N` field means equivalent background failures were aggregated
+  during the warning window, not lost from the current command result.
 
 Never publish passwords, private keys, vault data, lease tokens, or sensitive
-audit/spool contents. Report vulnerabilities only through
+audit/spool contents. Review `RUST_LOG=debug` and `daemon.log` output before
+sharing: private paths, host topology, and command metadata may still be
+operationally sensitive. Report vulnerabilities only through
 [SECURITY.md](SECURITY.md). Feature requests are welcome but do not imply a
 commitment or response deadline. This is a maintainer-supported project without
 a guaranteed support SLA.

@@ -52,6 +52,15 @@ sloosh host edit myhost --direct
 alias 是稳定身份，不能改名。所有选项见 `sloosh host add --help` 与
 `sloosh host edit --help`。
 
+未存入 vault 的主机会回退到 OpenSSH 配置。Sloosh 支持 `Host`、`HostName`、
+`Port`、`User`、`IdentityFile`、`ProxyJump` 与 `IdentityAgent`，也支持首个
+`Host` 前的全局默认值。其他 `Host` 块中的不支持指令保持静默；命中目标的低影响
+未实现选项只生成一条精简诊断。已知会改变 endpoint、路由或 host-key 身份的
+`Include`、`ProxyCommand`、`ProxyUseFdpass`、`HostKeyAlias` 与 hostname
+canonicalization 会直接失败，不会猜测默认设置。Sloosh 不解析 `Match` 条件，
+所以任何 `Match` 区段都会让 SSH-config-backed 主机 fail closed。直连 vault
+profile 不读取无关 SSH 配置。
+
 ## 桌面 App
 
 macOS DMG 包含 Sloosh 桌面控制面与私有 `slooshd`，不会安装公共 CLI。需要终端或
@@ -163,6 +172,11 @@ sloosh daemon status
 
 专用 `slooshd` 通常按需自动启动，不应直接运行。生命周期控制命令见
 `sloosh daemon --help`，只在排障时使用。
+
+命令警告与错误写入 stderr，正常结果保留在 stdout。后台 daemon 诊断写入
+`~/.sloosh/daemon.log`。运行期警告包含稳定 `diagnostic_code`；重复后台故障以
+`suppressed=N` 聚合，不会逐条刷屏；后续成功能证明恢复时，只记录一次恢复事件。
+可用 `RUST_LOG=debug` 为任一二进制启用更多细节；分享前必须检查并脱敏日志。
 
 ## 命令参考
 

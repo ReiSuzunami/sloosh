@@ -6,6 +6,7 @@ use sloosh::proto::{
 };
 
 use super::Controller;
+use super::gui_error::{daemon_request_failed, unexpected_daemon_response};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,13 +49,11 @@ async fn host_inventory(
         .client()
         .request(&Request::ListHosts { master_password })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| daemon_request_failed("loading hosts"))?
     {
         Response::Hosts { hosts } => Ok(hosts),
         Response::Error { message } => Err(message),
-        response => Err(format!(
-            "daemon returned an unexpected response: {response:?}"
-        )),
+        _ => Err(unexpected_daemon_response("loading hosts")),
     }
 }
 
@@ -95,13 +94,11 @@ pub(crate) async fn add_host(
             route: host.route,
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| daemon_request_failed("adding a host"))?
     {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(message),
-        response => Err(format!(
-            "daemon returned an unexpected response: {response:?}"
-        )),
+        _ => Err(unexpected_daemon_response("adding a host")),
     }
 }
 
@@ -130,13 +127,11 @@ pub(crate) async fn update_host(
             master_password,
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| daemon_request_failed("updating a host"))?
     {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(message),
-        response => Err(format!(
-            "daemon returned an unexpected response: {response:?}"
-        )),
+        _ => Err(unexpected_daemon_response("updating a host")),
     }
 }
 
@@ -154,13 +149,11 @@ pub(crate) async fn remove_host(
             master_password,
         })
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|_| daemon_request_failed("removing a host"))?
     {
         Response::Ok => Ok(()),
         Response::Error { message } => Err(message),
-        response => Err(format!(
-            "daemon returned an unexpected response: {response:?}"
-        )),
+        _ => Err(unexpected_daemon_response("removing a host")),
     }
 }
 

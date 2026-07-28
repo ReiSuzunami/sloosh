@@ -41,6 +41,7 @@ pub mod session;
 pub mod ssh;
 pub mod vault;
 
+use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::native_approval;
 use crate::proto::{self, Request, Response};
 use crate::transport::unix;
@@ -139,14 +140,56 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok(chan) => {
+                        if let Some(suppressed) =
+                            warning_recovered("DAEMON_ACCEPT_FAILED", &())
+                        {
+                            info!(
+                                diagnostic_code = "DAEMON_ACCEPT_RECOVERED",
+                                suppressed,
+                                "daemon socket accepts recovered"
+                            );
+                        }
                         let tx = shutdown_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(chan, start, pid, tx).await {
-                                warn!(error = %e, "connection handler error");
+                            match handle_connection(chan, start, pid, tx).await {
+                                Ok(()) => {
+                                    if let Some(suppressed) =
+                                        warning_recovered("DAEMON_CONNECTION_FAILED", &())
+                                    {
+                                        info!(
+                                            diagnostic_code = "DAEMON_CONNECTION_RECOVERED",
+                                            suppressed,
+                                            "daemon connection handling recovered"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    if let WarningAction::Emit { suppressed } =
+                                        warning_occurrence("DAEMON_CONNECTION_FAILED", &())
+                                    {
+                                        warn!(
+                                            diagnostic_code = "DAEMON_CONNECTION_FAILED",
+                                            error = %error,
+                                            suppressed,
+                                            "daemon connection handler failed"
+                                        );
+                                    }
+                                }
                             }
                         });
                     }
-                    Err(e) => warn!(error = %e, "accept failed"),
+                    Err(error) => {
+                        if let WarningAction::Emit { suppressed } =
+                            warning_occurrence("DAEMON_ACCEPT_FAILED", &())
+                        {
+                            warn!(
+                                diagnostic_code = "DAEMON_ACCEPT_FAILED",
+                                error = %error,
+                                suppressed,
+                                "daemon socket accept failed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -558,7 +601,7 @@ async fn handle_connection(
                 // docs/internals/architecture.md: expand every requested host's ProxyJump
                 // chain so the human approving this request sees (and
                 // grants) coverage for the whole path, not just the target.
-                let expanded_hosts = match ssh::expand_lease_hosts(&hosts).await {
+                let expanded_hosts = match ssh::expand_lease_hosts_for_request(&hosts).await {
                     Ok(hosts) => hosts,
                     Err(error) => {
                         chan.send(&Response::Error {
@@ -655,7 +698,18 @@ async fn handle_connection(
                         // will (vault entry first) and tell the CLI which
                         // endpoints still need a host-key confirmation.
                         for host in &info.hosts {
-                            let (hostname, port) = ssh::resolve_endpoint(host).await;
+                            let (hostname, port) = match ssh::resolve_endpoint(host).await {
+                                Ok(endpoint) => endpoint,
+                                Err(error) => {
+                                    debug!(
+                                        diagnostic_code = "HOST_KEY_ENDPOINT_RESOLUTION_FAILED",
+                                        %error,
+                                        "approved host endpoint could not be resolved for host-key \
+                                         preview; later connection will return the same error"
+                                    );
+                                    continue;
+                                }
+                            };
                             if !ssh::host_has_known_key(&hostname, port) {
                                 info.unverified_hosts.push(proto::UnverifiedHostKey {
                                     host: host.clone(),

@@ -35,17 +35,18 @@ use russh::Pty;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 use crate::daemon::lease;
 use crate::daemon::vault;
+use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::transport::unix::sloosh_home;
 
 mod config;
 mod route;
 
-pub use config::{HostConfig, IdentityAgentValue, SshConfig};
+pub use config::{HostConfig, IdentityAgentValue, SshConfig, SshConfigError};
 use config::{current_user, expand_tilde, home_dir};
 #[cfg(test)]
 use config::{glob_match, host_patterns_match};
@@ -67,6 +68,9 @@ const FORWARD_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// error should know what to do next without consulting docs.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
+    #[error(transparent)]
+    Config(#[from] SshConfigError),
+
     #[error(
         "could not resolve host '{host}' — check the name for typos, or map the alias to a real \
          address with a `Host {host}` + `HostName` entry in ~/.ssh/config. (dns: {source})"
@@ -351,11 +355,17 @@ impl russh::client::Handler for Handler {
             return Ok(());
         }
         if !lease::check_grant(&route.grant).await || !route.lifecycle.is_active() {
-            warn!(
-                local_host = %route.local_host,
-                local_port = route.local_port,
-                "remote forward: lease no longer covers this host, refusing forwarded connection"
-            );
+            let warning_scope = (route.local_host.as_str(), route.local_port);
+            if let WarningAction::Emit { suppressed } =
+                warning_occurrence("REMOTE_FORWARD_LEASE_EXPIRED", &warning_scope)
+            {
+                warn!(
+                    diagnostic_code = "REMOTE_FORWARD_LEASE_EXPIRED",
+                    suppressed,
+                    "remote forward lease no longer covers this host; refusing forwarded \
+                     connection"
+                );
+            }
             reply
                 .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
                 .await;
@@ -366,6 +376,24 @@ impl russh::client::Handler for Handler {
             .await
         {
             Ok(tcp) => {
+                let warning_scope = (route.local_host.as_str(), route.local_port);
+                for (failed_code, recovered_code) in [
+                    (
+                        "REMOTE_FORWARD_TARGET_TIMEOUT",
+                        "REMOTE_FORWARD_TARGET_TIMEOUT_RECOVERED",
+                    ),
+                    (
+                        "REMOTE_FORWARD_TARGET_CONNECT_FAILED",
+                        "REMOTE_FORWARD_TARGET_CONNECT_RECOVERED",
+                    ),
+                ] {
+                    if let Some(suppressed) = warning_recovered(failed_code, &warning_scope) {
+                        info!(
+                            diagnostic_code = recovered_code,
+                            suppressed, "remote forward local-target connections recovered"
+                        );
+                    }
+                }
                 if !route.lifecycle.is_active()
                     || !lease::check_grant(&route.grant).await
                     || !route.lifecycle.is_active()
@@ -395,18 +423,31 @@ impl russh::client::Handler for Handler {
                     .await;
             }
             Err(ForwardTargetConnectError::TimedOut) => {
-                warn!(
-                    local_host = %route.local_host, local_port = route.local_port,
-                    timeout_secs = FORWARD_TARGET_CONNECT_TIMEOUT.as_secs(),
-                    "remote forward: timed out connecting to local target"
-                );
+                let warning_scope = (route.local_host.as_str(), route.local_port);
+                if let WarningAction::Emit { suppressed } =
+                    warning_occurrence("REMOTE_FORWARD_TARGET_TIMEOUT", &warning_scope)
+                {
+                    warn!(
+                        diagnostic_code = "REMOTE_FORWARD_TARGET_TIMEOUT",
+                        timeout_secs = FORWARD_TARGET_CONNECT_TIMEOUT.as_secs(),
+                        suppressed,
+                        "remote forward timed out connecting to local target"
+                    );
+                }
                 reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
             }
-            Err(ForwardTargetConnectError::Io(e)) => {
-                warn!(
-                    local_host = %route.local_host, local_port = route.local_port, error = %e,
-                    "remote forward: local target refused connection"
-                );
+            Err(ForwardTargetConnectError::Io(error)) => {
+                let warning_scope = (route.local_host.as_str(), route.local_port);
+                if let WarningAction::Emit { suppressed } =
+                    warning_occurrence("REMOTE_FORWARD_TARGET_CONNECT_FAILED", &warning_scope)
+                {
+                    warn!(
+                        diagnostic_code = "REMOTE_FORWARD_TARGET_CONNECT_FAILED",
+                        error_kind = ?error.kind(),
+                        suppressed,
+                        "remote forward could not connect to local target"
+                    );
+                }
                 reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
             }
         }
@@ -563,7 +604,7 @@ async fn resolve_host_key_probe_route(
     config: &SshConfig,
     alias: &str,
 ) -> Result<HostKeyProbeRoute, SshError> {
-    let target = resolve_host_config(config, alias).await;
+    let target = resolve_host_config(config, alias).await?;
     let mut hops = Vec::new();
     if let Some(jump_spec) = target.proxy_jump.as_deref() {
         let mut seen = HashSet::new();
@@ -634,10 +675,10 @@ pub fn record_sloosh_known_host(
 /// hostname). Used daemon-side during `approve` to tell the CLI which
 /// endpoints still need a host-key fingerprint confirmation; the endpoint
 /// itself is not a secret.
-pub async fn resolve_endpoint(alias: &str) -> (String, u16) {
+pub async fn resolve_endpoint(alias: &str) -> Result<(String, u16), SshError> {
     let config = SshConfig::load_default();
-    let host_cfg = resolve_host_config(&config, alias).await;
-    (host_cfg.hostname, host_cfg.port)
+    let host_cfg = resolve_host_config(&config, alias).await?;
+    Ok((host_cfg.hostname, host_cfg.port))
 }
 
 /// Connect to `alias`, resolving it through `~/.ssh/config`, dialing the full
@@ -662,7 +703,7 @@ pub(crate) async fn connect_with_route(
     route: Option<ForwardRoute>,
 ) -> Result<Connection, SshError> {
     let config = SshConfig::load_default();
-    let host_cfg = resolve_host_config(&config, alias).await;
+    let host_cfg = resolve_host_config(&config, alias).await?;
     connect_resolved(&config, host_cfg, lease_ctx, route).await
 }
 
@@ -672,14 +713,14 @@ pub(crate) async fn connect_with_route(
 /// active) — `vault::get_entry` returns `None` otherwise, so this quietly
 /// falls back to the plain config-file resolution, exactly like an alias
 /// that was never in the vault at all.
-async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
+async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<HostConfig, SshError> {
     if let Some(entry) = vault::get_entry(alias).await {
         let proxy_jump = match &entry.route {
             crate::proto::HostRoute::Direct => None,
             crate::proto::HostRoute::ManagedHost { alias } => Some(alias.clone()),
             crate::proto::HostRoute::ProxyJump { spec } => Some(spec.clone()),
         };
-        return HostConfig {
+        return Ok(HostConfig {
             alias: alias.to_string(),
             hostname: entry.hostname,
             port: entry.port.unwrap_or(22),
@@ -687,9 +728,9 @@ async fn resolve_host_config(config: &SshConfig, alias: &str) -> HostConfig {
             identity_files: Vec::new(),
             proxy_jump,
             identity_agent: None,
-        };
+        });
     }
-    config.resolve(alias)
+    Ok(config.resolve_for_connection(alias)?)
 }
 
 async fn connect_resolved(
@@ -829,7 +870,7 @@ async fn expand_proxy_jump_spec(
             return Err(SshError::ProxyJumpCycle { alias });
         }
 
-        let mut hop_cfg = resolve_host_config(config, &alias).await;
+        let mut hop_cfg = resolve_host_config(config, &alias).await?;
         apply_proxy_jump_overrides(entry, &mut hop_cfg);
         let nested_jump = hop_cfg.proxy_jump.take();
 
@@ -881,7 +922,27 @@ pub async fn expand_lease_hosts(hosts: &[String]) -> Result<Vec<String>, SshErro
     expand_lease_hosts_with_config(&config, hosts).await
 }
 
-async fn expand_lease_hosts_with_config(
+/// Best-effort request-time expansion while the vault may still be locked.
+/// A config diagnostic can mean the alias is actually vault-backed and only
+/// becomes resolvable during human approval, so preserve the original scope.
+/// Cycle/depth failures still return immediately.
+pub async fn expand_lease_hosts_for_request(hosts: &[String]) -> Result<Vec<String>, SshError> {
+    let config = SshConfig::load_default();
+    expand_lease_hosts_for_request_with_config(&config, hosts).await
+}
+
+async fn expand_lease_hosts_for_request_with_config(
+    config: &SshConfig,
+    hosts: &[String],
+) -> Result<Vec<String>, SshError> {
+    match expand_lease_hosts_with_config(config, hosts).await {
+        Ok(expanded) => Ok(expanded),
+        Err(SshError::Config(_)) => Ok(hosts.to_vec()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) async fn expand_lease_hosts_with_config(
     config: &SshConfig,
     hosts: &[String],
 ) -> Result<Vec<String>, SshError> {
@@ -909,7 +970,7 @@ async fn expand_lease_hosts_with_config(
 /// target probe must strictly verify and authenticate through that bastion.
 pub(crate) async fn host_key_confirmation_order(
     hosts: &[String],
-) -> Vec<HostKeyConfirmationTarget> {
+) -> Result<Vec<HostKeyConfirmationTarget>, SshError> {
     let config = SshConfig::load_default();
     host_key_confirmation_order_with_config(&config, hosts).await
 }
@@ -917,18 +978,11 @@ pub(crate) async fn host_key_confirmation_order(
 async fn host_key_confirmation_order_with_config(
     config: &SshConfig,
     hosts: &[String],
-) -> Vec<HostKeyConfirmationTarget> {
+) -> Result<Vec<HostKeyConfirmationTarget>, SshError> {
     let mut dependency_groups = Vec::with_capacity(hosts.len());
     let mut routes: Vec<(String, HostKeyProbeRoute)> = Vec::new();
     for host in hosts {
-        let route = match resolve_host_key_probe_route(config, host).await {
-            Ok(route) => route,
-            Err(e) => {
-                warn!(host, error = %e, "could not plan ProxyJump host-key confirmation route; \
-                       skipping the probe rather than bypassing the configured route");
-                continue;
-            }
-        };
+        let route = resolve_host_key_probe_route(config, host).await?;
         let dependencies: Vec<String> = route.hops.iter().map(|hop| hop.alias.clone()).collect();
         for (index, hop) in route.hops.iter().enumerate() {
             if !routes.iter().any(|(alias, _)| alias == &hop.alias) {
@@ -962,7 +1016,7 @@ async fn host_key_confirmation_order_with_config(
             route,
         });
     }
-    targets
+    Ok(targets)
 }
 
 fn dependency_first_aliases(groups: &[(String, Vec<String>)]) -> Vec<String> {
@@ -982,7 +1036,7 @@ fn dependency_first_aliases(groups: &[(String, Vec<String>)]) -> Vec<String> {
 /// `expand_proxy_jump_spec` so lease-request-time expansion and
 /// connect-time dialing agree on exactly what "the chain" means.
 async fn jump_chain_aliases(config: &SshConfig, alias: &str) -> Result<Vec<String>, SshError> {
-    let host_cfg = resolve_host_config(config, alias).await;
+    let host_cfg = resolve_host_config(config, alias).await?;
     let Some(jump_spec) = host_cfg.proxy_jump else {
         return Ok(Vec::new());
     };
@@ -1620,8 +1674,8 @@ Host myhost
 ";
         let cfg = SshConfig::parse(contents);
         let resolved = cfg.resolve("myhost");
-        // The unknown directive was skipped (and warned about), but parsing
-        // kept going and picked up the directive after it.
+        // Parsing is side-effect free: the unknown directive is retained as a
+        // target diagnostic, skipped, and later supported directives survive.
         assert_eq!(resolved.user, "deploy");
     }
 
@@ -1729,7 +1783,9 @@ Host sloosh-probe-other
             "sloosh-probe-hop2".to_string(),
         ];
 
-        let plan = host_key_confirmation_order_with_config(&config, &hosts).await;
+        let plan = host_key_confirmation_order_with_config(&config, &hosts)
+            .await
+            .unwrap();
         let aliases: Vec<&str> = plan.iter().map(|target| target.alias.as_str()).collect();
         assert_eq!(
             aliases,
@@ -1758,10 +1814,11 @@ Host sloosh-probe-cycle-b
     ProxyJump sloosh-probe-cycle-a
 ",
         );
-        let plan =
+        let error =
             host_key_confirmation_order_with_config(&config, &["sloosh-probe-cycle-a".to_string()])
-                .await;
-        assert!(plan.is_empty());
+                .await
+                .unwrap_err();
+        assert!(matches!(error, SshError::ProxyJumpCycle { .. }));
     }
 
     #[tokio::test]
@@ -1780,6 +1837,17 @@ Host sloosh-probe-cycle-b
         assert!(
             matches!(err, SshError::ProxyJumpTooDeep { limit } if limit == MAX_PROXY_JUMP_HOPS)
         );
+    }
+
+    #[tokio::test]
+    async fn request_scope_keeps_original_hosts_when_locked_config_cannot_be_resolved_safely() {
+        let config = SshConfig::parse("Match all\n    ProxyCommand helper\n");
+        let requested = vec!["sloosh-locked-vault-host".to_string()];
+
+        let expanded = expand_lease_hosts_for_request_with_config(&config, &requested)
+            .await
+            .unwrap();
+        assert_eq!(expanded, requested);
     }
 
     #[tokio::test]
