@@ -304,7 +304,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Copy-Item target\release\sloosh.exe,target\release\slooshd.exe $root
           Copy-Item packaging\windows\native-approval\target\release\sloosh-approval.exe $root
-          Copy-Item gui\src-tauri\target\release\Sloosh.exe $root
+          Copy-Item gui\src-tauri\target\release\sloosh-desktop.exe $root
           Copy-Item README.md,README.en.md,SECURITY.md,SUPPORT.md,CONTRIBUTING.md,LICENSE-APACHE,LICENSE-MIT $root
           New-Item -ItemType Directory -Force -Path "$root\docs\getting-started","$root\docs\internals","$root\skills\sloosh" | Out-Null
           Copy-Item docs\manual.md,docs\manual.zh-CN.md "$root\docs"

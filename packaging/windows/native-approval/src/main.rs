@@ -24,7 +24,7 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::System::WinRT::{
-    IUserConsentVerifierInterop, RO_INIT_SINGLETHREADED, RoInitialize,
+    IUserConsentVerifierInterop, RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
 };
 use windows::Win32::UI::Controls::{
     TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOGCONFIG, TDCBF_NO_BUTTON, TDCBF_YES_BUTTON,
@@ -32,8 +32,9 @@ use windows::Win32::UI::Controls::{
     TaskDialogIndirect,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows_future::{AsyncStatus, IAsyncOperation};
@@ -101,15 +102,6 @@ fn main() {
     if let Err(message) = trusted_parent() {
         send(&Response::error("untrusted_parent", &message));
         std::process::exit(1);
-    }
-    // SAFETY: the helper initializes WinRT once on its main thread.
-    match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
-        Ok(()) => {}
-        Err(error) => {
-            let message = format!("Could not initialize Windows Runtime: {error}");
-            send(&Response::error("unavailable", &message));
-            std::process::exit(1);
-        }
     }
     let owner = match OwnerWindow::create() {
         Ok(owner) => owner,
@@ -303,6 +295,51 @@ enum HelloError {
 }
 
 fn verify_hello(hwnd: HWND, message: &str) -> Result<(), HelloError> {
+    // The helper's main thread owns `hwnd` and must keep dispatching messages.
+    // Run the potentially blocking WinRT call in an MTA worker so Windows can
+    // synchronously message the owner without deadlocking this thread.
+    let hwnd_value = hwnd.0 as usize;
+    let message = message.to_owned();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("sloosh-windows-hello".into())
+        .spawn(move || {
+            let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+            let result = verify_hello_worker(hwnd, &message);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            HelloError::Unavailable(format!("Could not start Windows Hello: {error}"))
+        })?;
+
+    let started = Instant::now();
+    loop {
+        match receiver.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(HelloError::Unavailable(
+                    "Windows Hello worker stopped unexpectedly".to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        pump_window_messages();
+        if started.elapsed() >= HELLO_TIMEOUT {
+            return Err(HelloError::Unavailable(
+                "Windows Hello timed out".to_string(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn verify_hello_worker(hwnd: HWND, message: &str) -> Result<(), HelloError> {
+    // SAFETY: this dedicated worker initializes and uninitializes its own WinRT
+    // apartment; no WinRT interface escapes the worker.
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.map_err(|error| {
+        HelloError::Unavailable(format!("Could not initialize Windows Runtime: {error}"))
+    })?;
+    let _apartment = WinRtApartment;
     let interop: IUserConsentVerifierInterop =
         windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
             .map_err(|error| HelloError::Unavailable(error.to_string()))?;
@@ -310,7 +347,6 @@ fn verify_hello(hwnd: HWND, message: &str) -> Result<(), HelloError> {
     let operation: IAsyncOperation<UserConsentVerificationResult> =
         unsafe { interop.RequestVerificationForWindowAsync(hwnd, &HSTRING::from(message)) }
             .map_err(|error| HelloError::Unavailable(error.to_string()))?;
-    let started = Instant::now();
     loop {
         let status = operation
             .Status()
@@ -326,12 +362,6 @@ fn verify_hello(hwnd: HWND, message: &str) -> Result<(), HelloError> {
                         .unwrap_or_else(|error| error.to_string()),
                 ));
             }
-            _ if started.elapsed() >= HELLO_TIMEOUT => {
-                let _ = operation.Cancel();
-                return Err(HelloError::Unavailable(
-                    "Windows Hello timed out".to_string(),
-                ));
-            }
             _ => std::thread::sleep(Duration::from_millis(25)),
         }
     }
@@ -344,6 +374,27 @@ fn verify_hello(hwnd: HWND, message: &str) -> Result<(), HelloError> {
         other => Err(HelloError::Unavailable(format!(
             "Windows Hello verification failed: {other:?}"
         ))),
+    }
+}
+
+struct WinRtApartment;
+
+impl Drop for WinRtApartment {
+    fn drop(&mut self) {
+        // SAFETY: paired with the successful RoInitialize call on this worker.
+        unsafe { RoUninitialize() };
+    }
+}
+
+fn pump_window_messages() {
+    let mut message = MSG::default();
+    // SAFETY: message points to writable storage and every removed message is
+    // translated and dispatched on the thread that owns the helper HWND.
+    unsafe {
+        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 }
 
@@ -588,7 +639,7 @@ fn trusted_parent() -> Result<(), String> {
     let current_pid = unsafe { GetCurrentProcessId() };
     let parent_pid = parent_pid(current_pid).ok_or("Could not determine helper parent")?;
     let parent = process_path(parent_pid).ok_or("Could not resolve helper parent executable")?;
-    for allowed in ["slooshd.exe", "Sloosh.exe"] {
+    for allowed in ["slooshd.exe", "sloosh-desktop.exe"] {
         let expected = helper_dir.join(allowed);
         if paths_equal(&parent, &expected) {
             return Ok(());
@@ -696,8 +747,8 @@ mod tests {
     #[test]
     fn parent_path_comparison_normalizes_windows_prefix_and_case() {
         assert!(paths_equal(
-            Path::new(r"C:\Sloosh\Sloosh.exe"),
-            Path::new(r"\\?\c:\sloosh\sloosh.EXE")
+            Path::new(r"C:\Sloosh\sloosh-desktop.exe"),
+            Path::new(r"\\?\c:\sloosh\SLOOSH-DESKTOP.EXE")
         ));
     }
 }

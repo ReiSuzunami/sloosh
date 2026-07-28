@@ -60,7 +60,7 @@ Expand-Archive $file -DestinationPath "$env:LOCALAPPDATA\Programs\Sloosh"
 & "$env:LOCALAPPDATA\Programs\Sloosh\sloosh-*\sloosh.exe" --version
 ```
 
-必须把 `sloosh.exe`、`slooshd.exe`、`Sloosh.exe` 与
+必须把 `sloosh.exe`、`slooshd.exe`、`sloosh-desktop.exe` 与
 `sloosh-approval.exe` 保持在同一目录。客户端只信任固定 sibling path，不从 `PATH`
 搜索 helper。Windows Hello 由 Windows 选择人脸、指纹或设备 PIN。未签名社区 ZIP
 可能触发 SmartScreen；请先核对校验和，只在信任该 Release 时通过 Windows 自己的

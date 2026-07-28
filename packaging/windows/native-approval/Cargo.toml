@@ -4,10 +4,14 @@ version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "sloosh-approval"
 path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3.0.11"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

@@ -1,0 +1,3 @@
+// RT_MANIFEST is numeric resource type 24. Use the number directly so this
+// minimal resource file does not depend on windows.h preprocessor definitions.
+1 24 "sloosh-approval.manifest"

@@ -72,7 +72,7 @@ Extract each archive and run `sloosh --version` and `slooshd --version`. On
 macOS, also verify the DMG and its app bundle:
 
 On Windows, extract the ZIP, verify all four executables are siblings, run the
-two version commands, open `Sloosh.exe`, and manually test one enrollment,
+two version commands, open `sloosh-desktop.exe`, and manually test one enrollment,
 cancellation, and successful Windows Hello approval. Never automate or bypass
 the Hello prompt.
 

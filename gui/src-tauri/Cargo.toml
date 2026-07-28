@@ -9,7 +9,7 @@ publish = false
 custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
-name = "Sloosh"
+name = "sloosh-desktop"
 path = "src/main.rs"
 
 [build-dependencies]

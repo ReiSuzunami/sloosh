@@ -93,7 +93,7 @@ and executable mode. This deterministic rule lets Homebrew/Cargo/archive
 clients and the installed desktop share one daemon without trusting `PATH`
 lookup.
 
-The Windows ZIP keeps `sloosh.exe`, `slooshd.exe`, `Sloosh.exe`, and
+The Windows ZIP keeps `sloosh.exe`, `slooshd.exe`, `sloosh-desktop.exe`, and
 `sloosh-approval.exe` together. Both clients select the fixed sibling daemon,
 and native approval selects the fixed sibling helper; no Windows path searches
 `PATH`.

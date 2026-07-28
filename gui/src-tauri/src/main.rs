@@ -540,7 +540,7 @@ mod tests {
         }
         #[cfg(target_os = "windows")]
         {
-            let app = Path::new(r"C:\Program Files\Sloosh\Sloosh.exe");
+            let app = Path::new(r"C:\Program Files\Sloosh\sloosh-desktop.exe");
             assert_eq!(
                 bundled_daemon_path(app),
                 Some(PathBuf::from(r"C:\Program Files\Sloosh\slooshd.exe"))

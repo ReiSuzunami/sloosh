@@ -67,7 +67,7 @@ Expand-Archive $file -DestinationPath "$env:LOCALAPPDATA\Programs\Sloosh"
 & "$env:LOCALAPPDATA\Programs\Sloosh\sloosh-*\sloosh.exe" --version
 ```
 
-Keep `sloosh.exe`, `slooshd.exe`, `Sloosh.exe`, and
+Keep `sloosh.exe`, `slooshd.exe`, `sloosh-desktop.exe`, and
 `sloosh-approval.exe` together. Clients authenticate fixed sibling paths and
 never search `PATH` for helpers. Windows Hello uses the face, fingerprint, or
 device-PIN provider selected by Windows. Unsigned community ZIP binaries may
