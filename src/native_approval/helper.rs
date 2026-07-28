@@ -1,6 +1,9 @@
 //! Bundled native-helper process validation and bounded NDJSON IPC.
 
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -192,7 +195,12 @@ pub(super) fn helper_path() -> Option<PathBuf> {
                 .join("sloosh-approval"),
         )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        Some(exe.parent()?.join("sloosh-approval.exe"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     None
 }
 
@@ -207,12 +215,19 @@ pub(super) fn validate_helper(path: &Path) -> Result<(), NativeApprovalError> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(NativeApprovalError::Unavailable);
     }
-    // SAFETY: geteuid has no arguments and only reads process credentials.
-    let effective_uid = unsafe { libc::geteuid() };
-    if !matches!(metadata.uid(), 0) && metadata.uid() != effective_uid {
-        return Err(NativeApprovalError::Unavailable);
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no arguments and only reads process credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        if !matches!(metadata.uid(), 0) && metadata.uid() != effective_uid {
+            return Err(NativeApprovalError::Unavailable);
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(NativeApprovalError::Unavailable);
+        }
     }
-    if metadata.permissions().mode() & 0o022 != 0 {
+    #[cfg(windows)]
+    if metadata.file_attributes() & 0x400 != 0 {
         return Err(NativeApprovalError::Unavailable);
     }
     Ok(())

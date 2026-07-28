@@ -10,6 +10,7 @@ export type DaemonSnapshot = {
 };
 
 export type AppSnapshot = {
+  platform: 'macos' | 'windows' | string;
   daemon: DaemonSnapshot;
   vaultExists: boolean;
   skillReady: boolean;

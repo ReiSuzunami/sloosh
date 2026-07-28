@@ -15,7 +15,8 @@ sloosh init
 ```
 
 它会安装内嵌 Agent Skill 并初始化凭据 vault。仅命令行安装由人类在另一终端批准；
-macOS 桌面 App 通过自身的 Setup 与 Security 配置 Keychain、Touch ID 与可选审批 PIN。
+桌面 App 通过 Setup 与 Security 配置 macOS login Keychain + Touch ID，或 Windows
+Credential Manager + Windows Hello；macOS 还支持可选审批 PIN。
 
 验证结果：
 
@@ -63,21 +64,24 @@ profile 不读取无关 SSH 配置。
 
 ## 桌面 App
 
-macOS DMG 包含 Sloosh 桌面控制面与私有 `slooshd`，不会安装公共 CLI。需要终端或
-Agent 访问时，请另用 Homebrew、Cargo 或命令行压缩包安装 `sloosh`。App 位于
+macOS DMG 只包含桌面控制面与私有 daemon。Windows ZIP 把桌面端、CLI、daemon 与
+原生批准 helper 放在同一目录。macOS 需要终端或 Agent 访问时，请另用 Homebrew、
+Cargo 或命令行压缩包安装 `sloosh`。App 位于
 “应用程序”时，两个客户端会共用 App daemon 与状态；桌面端直接连接 daemon，不会
 通过 shell 调用 CLI。
 
-Setup 安装内嵌 Agent Skill 并初始化 vault；Security 配置 Touch ID、可选的 6 位
-Sloosh PIN 与共用 vault 空闲期。这些操作不会导入 SSH 私钥，也不会批准主机。
+Setup 安装内嵌 Agent Skill 并初始化 vault；Security 在 macOS 配置 Touch ID 与可选
+6 位 Sloosh PIN，在 Windows 配置 Windows Hello，并设置共用 vault 空闲期。这些操作
+不会导入 SSH 私钥，也不会批准主机。
 
-Hosts 管理与 CLI 相同的 vault 主机配置，可使用 Touch ID、Sloosh PIN 或 Master
+Hosts 管理与 CLI 相同的 vault 主机配置，可使用 Touch ID/Windows Hello、macOS
+Sloosh PIN 或 Master
 Password 解锁。Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
 Hosts 中输入的 SSH password 仅短暂存在，通过本地命令边界时使用脱敏 secret，提交后
 立即清空。
 
-达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
-App 会锁定 vault session。凭据、超时与审批边界以
+达到配置的空闲期、手动锁定、退出 App 或绝对会话上限时，App 会锁定 vault session；
+macOS 还会响应系统睡眠、屏幕睡眠与用户 session 失活。凭据、超时与审批边界以
 [SECURITY.md](../SECURITY.md) 为准。
 
 ## 批准访问
@@ -94,7 +98,7 @@ sloosh request myhost
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-配置完成的 macOS DMG 安装可直接通过 Touch ID 或审批 PIN 完成请求。未知 host key
+配置完成的桌面安装可直接通过 Touch ID、Windows Hello 或 macOS 审批 PIN 完成请求。未知 host key
 仍需人类核对指纹；ProxyJump 路由会在批准前完成校验。
 
 ## 持久会话

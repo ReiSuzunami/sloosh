@@ -4,8 +4,8 @@ This document specifies the current local client-to-daemon wire contract used
 by both `sloosh` and the desktop app. The exact
 version constant is `WIRE_PROTOCOL_VERSION = 3` in `src/proto.rs`.
 
-Protocol 3 is local IPC over a Unix domain socket. It combines NDJSON control
-messages with bounded binary frames for SFTP data. It is not a network API and
+Protocol 3 is local IPC over a Unix domain socket or Windows named pipe. It
+combines NDJSON control messages with bounded binary frames for SFTP data. It is not a network API and
 has no compatibility promise for arbitrary raw clients.
 
 ## 1. Version rule
@@ -344,8 +344,9 @@ existing pending request available for a new preview/approval attempt. If an
 invalid route is visible before `RequestLease` creates pending state, the
 request itself returns `Error` instead.
 
-On a DMG-installed Mac, daemon may satisfy a newly created pending request via
-its bundled Touch ID or PIN helper before replying. Success returns the already-valid
+On a configured macOS or Windows desktop installation, daemon may satisfy a
+newly created pending request via its bundled Touch ID/PIN or Windows Hello
+helper before replying. Success returns the already-valid
 `Ok` response for `RequestLease`; failure returns `LeaseRequestPending` exactly
 as before. Helper traffic uses anonymous child-process pipes, is not part of
 this wire protocol, and never exposes the generated bearer lease token to the

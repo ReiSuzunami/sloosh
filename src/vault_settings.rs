@@ -2,7 +2,6 @@ use crate::transport::unix::{ensure_private_dir, sloosh_home};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -75,18 +74,14 @@ impl VaultSettingsStore {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn for_test(path: PathBuf) -> Self {
         Self { path }
     }
 
     pub fn load(&self) -> Result<VaultTimeout, VaultSettingsError> {
         self.refuse_unsafe_target()?;
-        let input = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.path)
-        {
+        let input = match crate::platform_fs::open_private_read(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(VaultTimeout::default());
@@ -94,13 +89,7 @@ impl VaultSettingsStore {
             Err(error) => return Err(error.into()),
         };
         let metadata = input.metadata()?;
-        // SAFETY: geteuid has no arguments and only reads process credentials.
-        let effective_uid = unsafe { libc::geteuid() };
-        if !metadata.is_file()
-            || metadata.len() > MAX_SETTINGS_BYTES
-            || metadata.uid() != effective_uid
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        if metadata.len() > MAX_SETTINGS_BYTES {
             return Err(VaultSettingsError::UnsafeFile);
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -140,17 +129,12 @@ impl VaultSettingsStore {
             .path
             .with_extension(format!("tmp-{}-{suffix}", std::process::id()));
         let result = (|| -> Result<(), VaultSettingsError> {
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&temporary)?;
+            let mut output = crate::platform_fs::create_new_private(&temporary)?;
             output.write_all(&encoded)?;
             output.sync_all()?;
             drop(output);
             std::fs::rename(&temporary, &self.path)?;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+            crate::platform_fs::harden_path(&self.path)?;
             Ok(())
         })();
         if result.is_err() {
@@ -171,7 +155,7 @@ impl VaultSettingsStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

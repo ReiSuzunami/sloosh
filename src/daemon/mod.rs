@@ -46,9 +46,9 @@ use crate::native_approval;
 use crate::proto::{self, Request, Response};
 use crate::transport::unix;
 use crate::transport::{BindOutcome, Channel, MAX_RAW_FRAME_BYTES};
+use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
@@ -122,13 +122,15 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     forward::spawn_reaper();
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let mut sigterm = signal(SignalKind::terminate())?;
+    let termination = termination_signal();
+    tokio::pin!(termination);
 
     loop {
         tokio::select! {
             biased;
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
+            result = &mut termination => {
+                result?;
+                info!("received termination signal, shutting down");
                 break;
             }
             _ = shutdown_rx.changed() => {
@@ -198,13 +200,27 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+async fn termination_signal() -> io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    signal(SignalKind::terminate())?.recv().await;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn termination_signal() -> io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 async fn handle_connection(
     mut chan: unix::UnixChannel,
     start: Instant,
     pid: u32,
     shutdown_tx: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
-    let peer = chan.peer_pid().unwrap_or(None);
+    // Reject an unverified transport peer before reading even a Status
+    // request. On Windows `peer_pid` also enforces current-user token SID.
+    let peer = chan.peer_pid()?;
     let mut negotiated = false;
     debug!(?peer, "connection accepted");
 

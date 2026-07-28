@@ -473,7 +473,10 @@ pub(super) fn expand_tilde(path: &str) -> PathBuf {
 }
 
 pub(super) fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn ssh_config_path() -> PathBuf {
@@ -481,6 +484,12 @@ fn ssh_config_path() -> PathBuf {
 }
 
 pub(super) fn current_user() -> String {
+    #[cfg(windows)]
+    if let Ok(user) = std::env::var("USERNAME") {
+        if !user.is_empty() {
+            return user;
+        }
+    }
     if let Ok(user) = std::env::var("USER") {
         if !user.is_empty() {
             return user;
@@ -491,6 +500,7 @@ pub(super) fn current_user() -> String {
             return user;
         }
     }
+    #[cfg(unix)]
     // SAFETY: getuid/getpwuid are plain libc lookups with no preconditions;
     // the returned pointer is read immediately.
     unsafe {
@@ -503,7 +513,11 @@ pub(super) fn current_user() -> String {
             }
         }
     }
-    "root".to_string()
+    if cfg!(windows) {
+        "unknown".to_string()
+    } else {
+        "root".to_string()
+    }
 }
 
 pub(super) fn host_patterns_match(patterns: &[String], alias: &str) -> bool {

@@ -11,7 +11,9 @@ use crate::proto::{Request, Response, StatusReply, WIRE_PROTOCOL_VERSION};
 use crate::transport::Channel;
 use crate::transport::unix::{self, UnixChannel};
 use anyhow::Context;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -230,7 +232,8 @@ fn spawn_daemon_detached_with_executable(
     cmd.stdout(stdout);
     cmd.stderr(log_file);
 
-    // Safety: the closure only calls the async-signal-safe libc function
+    #[cfg(unix)]
+    // SAFETY: the closure only calls the async-signal-safe libc function
     // `setsid` before exec, as required by `pre_exec`'s contract.
     unsafe {
         cmd.pre_exec(|| {
@@ -239,6 +242,13 @@ fn spawn_daemon_detached_with_executable(
             }
             Ok(())
         });
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
 
     cmd.spawn()
@@ -296,7 +306,13 @@ fn select_daemon_executable(
 
     let sibling = current_executable
         .parent()
-        .map(|parent| parent.join("slooshd"))
+        .map(|parent| {
+            parent.join(if cfg!(windows) {
+                "slooshd.exe"
+            } else {
+                "slooshd"
+            })
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "could not locate slooshd beside {}",
@@ -315,8 +331,16 @@ fn select_daemon_executable(
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    #[cfg(unix)]
+    {
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    }
+
+    #[cfg(windows)]
+    {
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+    }
 }
 
 /// Validate the private daemon embedded in a macOS application bundle.
@@ -326,78 +350,92 @@ fn is_executable_file(path: &Path) -> bool {
 /// component down to the executable. Root-owned bundles and bundles owned by
 /// the current user are both supported.
 pub fn validate_bundled_daemon_executable(path: &Path) -> anyhow::Result<PathBuf> {
-    let helpers = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("bundled daemon has no Helpers directory"))?;
-    let contents = helpers
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("bundled daemon has no Contents directory"))?;
-    let app = contents
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("bundled daemon has no application bundle"))?;
-    if path.file_name() != Some(std::ffi::OsStr::new("slooshd"))
-        || helpers.file_name() != Some(std::ffi::OsStr::new("Helpers"))
-        || contents.file_name() != Some(std::ffi::OsStr::new("Contents"))
-        || app.extension() != Some(std::ffi::OsStr::new("app"))
+    #[cfg(windows)]
     {
-        anyhow::bail!(
-            "expected a daemon at <app>/Contents/Helpers/slooshd, got {}",
-            path.display()
-        );
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("bundled daemon {} is not a regular file", path.display());
+        }
+        std::fs::canonicalize(path)
+            .with_context(|| format!("failed to canonicalize {}", path.display()))
     }
 
-    // SAFETY: geteuid has no arguments and only reads process credentials.
-    let effective_uid = unsafe { libc::geteuid() };
-    let components = [app, contents, helpers, path];
-    for (index, component) in components.into_iter().enumerate() {
-        let metadata = std::fs::symlink_metadata(component)
-            .with_context(|| format!("failed to inspect {}", component.display()))?;
-        if metadata.file_type().is_symlink() {
+    #[cfg(unix)]
+    {
+        let helpers = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundled daemon has no Helpers directory"))?;
+        let contents = helpers
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundled daemon has no Contents directory"))?;
+        let app = contents
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bundled daemon has no application bundle"))?;
+        if path.file_name() != Some(std::ffi::OsStr::new("slooshd"))
+            || helpers.file_name() != Some(std::ffi::OsStr::new("Helpers"))
+            || contents.file_name() != Some(std::ffi::OsStr::new("Contents"))
+            || app.extension() != Some(std::ffi::OsStr::new("app"))
+        {
             anyhow::bail!(
-                "bundle component {} is a symbolic link",
-                component.display()
+                "expected a daemon at <app>/Contents/Helpers/slooshd, got {}",
+                path.display()
             );
         }
-        if index + 1 == components.len() {
-            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+
+        // SAFETY: geteuid has no arguments and only reads process credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        let components = [app, contents, helpers, path];
+        for (index, component) in components.into_iter().enumerate() {
+            let metadata = std::fs::symlink_metadata(component)
+                .with_context(|| format!("failed to inspect {}", component.display()))?;
+            if metadata.file_type().is_symlink() {
                 anyhow::bail!(
-                    "bundled daemon {} is not a regular executable file",
+                    "bundle component {} is a symbolic link",
                     component.display()
                 );
             }
-        } else if !metadata.is_dir() {
-            anyhow::bail!(
-                "bundle component {} is not a directory",
-                component.display()
-            );
+            if index + 1 == components.len() {
+                if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+                    anyhow::bail!(
+                        "bundled daemon {} is not a regular executable file",
+                        component.display()
+                    );
+                }
+            } else if !metadata.is_dir() {
+                anyhow::bail!(
+                    "bundle component {} is not a directory",
+                    component.display()
+                );
+            }
+            if !matches!(metadata.uid(), 0) && metadata.uid() != effective_uid {
+                anyhow::bail!(
+                    "bundle component {} is owned by unexpected uid {}",
+                    component.display(),
+                    metadata.uid()
+                );
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                anyhow::bail!(
+                    "bundle component {} is group- or other-writable",
+                    component.display()
+                );
+            }
         }
-        if !matches!(metadata.uid(), 0) && metadata.uid() != effective_uid {
-            anyhow::bail!(
-                "bundle component {} is owned by unexpected uid {}",
-                component.display(),
-                metadata.uid()
-            );
-        }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            anyhow::bail!(
-                "bundle component {} is group- or other-writable",
-                component.display()
-            );
-        }
-    }
 
-    let canonical_app = std::fs::canonicalize(app)
-        .with_context(|| format!("failed to canonicalize {}", app.display()))?;
-    let canonical_daemon = std::fs::canonicalize(path)
-        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-    if !canonical_daemon.starts_with(&canonical_app) {
-        anyhow::bail!(
-            "bundled daemon {} resolves outside {}",
-            path.display(),
-            app.display()
-        );
+        let canonical_app = std::fs::canonicalize(app)
+            .with_context(|| format!("failed to canonicalize {}", app.display()))?;
+        let canonical_daemon = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        if !canonical_daemon.starts_with(&canonical_app) {
+            anyhow::bail!(
+                "bundled daemon {} resolves outside {}",
+                path.display(),
+                app.display()
+            );
+        }
+        Ok(canonical_daemon)
     }
-    Ok(canonical_daemon)
 }
 
 fn open_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
@@ -405,21 +443,22 @@ fn open_daemon_log(path: &Path) -> anyhow::Result<std::fs::File> {
         unix::ensure_private_dir(parent)
             .with_context(|| format!("failed to secure {}", parent.display()))?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options
         .open(path)
         .with_context(|| format!("failed to open daemon log at {}", path.display()))?;
     unix::clear_extended_acl(&file)
         .with_context(|| format!("failed to clear daemon log ACL at {}", path.display()))?;
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("failed to secure daemon log at {}", path.display()))?;
     Ok(file)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::proto::StatusReply;

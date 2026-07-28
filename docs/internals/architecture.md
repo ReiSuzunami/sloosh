@@ -55,9 +55,10 @@ Ownership is deliberate:
   never opens that caller-supplied local path.
 - Human CLI temporarily unlocks its own vault cache during approval. Daemon has
   a separate cache and independently validates the approved host scope.
-- On DMG-installed macOS, daemon may spawn bundled `Sloosh Approval.app` over
-  anonymous pipes. Helper alone owns Keychain/Touch ID, secure PIN/Master
-  Password entry, and native confirmation
+- On desktop macOS, daemon may spawn bundled `Sloosh Approval.app`; on Windows
+  it spawns sibling `sloosh-approval.exe`. Both communicate over
+  anonymous pipes. Helper alone owns Keychain/Touch ID or Credential
+  Manager/Windows Hello, secure PIN/Master Password entry where supported, and native confirmation
   UI; daemon still owns host expansion and lease activation. Helper never
   listens on a socket and requesting process cannot send it approval messages.
 - `sloosh skill install/status` is CLI-only and never starts the daemon or
@@ -92,23 +93,31 @@ and executable mode. This deterministic rule lets Homebrew/Cargo/archive
 clients and the installed desktop share one daemon without trusting `PATH`
 lookup.
 
+The Windows ZIP keeps `sloosh.exe`, `slooshd.exe`, `Sloosh.exe`, and
+`sloosh-approval.exe` together. Both clients select the fixed sibling daemon,
+and native approval selects the fixed sibling helper; no Windows path searches
+`PATH`.
+
 ## 2. Local transport boundary
 
 `src/transport/` defines the `Channel` abstraction. macOS and Linux use Unix
-domain sockets implemented by `src/transport/unix.rs`; Windows Named Pipes are
-not implemented.
+domain sockets implemented by `src/transport/unix.rs`; Windows uses byte-mode
+named pipes from `src/transport/windows.rs` and rejects remote clients.
 
 Default socket locations:
 
 - Linux: `$XDG_RUNTIME_DIR/sloosh.sock`, falling back to
   `/tmp/sloosh-<euid>/sloosh.sock`.
 - macOS: `$SLOOSH_HOME/sloosh.sock`, normally `~/.sloosh/sloosh.sock`.
+- Windows: `\\.\pipe\sloosh-<state-path-hash>`; state defaults to
+  `%LOCALAPPDATA%\Sloosh`.
 - `$SLOOSH_SOCKET` overrides either default.
 
 Before sending ordinary requests, each client verifies that daemon peer eUID
 matches its own and that the peer executable resolves to its explicitly
 selected `slooshd` canonical path. Daemon gets client PID from kernel peer
-credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS) and uses it for
+credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS, named-pipe
+client/server PID plus process-token SID on Windows) and uses it for
 authorization and self-approval checks.
 
 These checks authenticate daemon to CLI and identify client process to daemon.
@@ -201,7 +210,9 @@ SSH-config-backed hosts. Lower-impact ignored options emit one stable-code
 warning. Human CLI plans the complete host-key confirmation route before
 sending `ApproveLease`, so a planning failure cannot activate a lease.
 
-DMG-installed macOS adds an internal adapter without changing wire protocol:
+Configured macOS and Windows desktops add an internal adapter without changing
+wire protocol. Windows replaces Keychain/Touch ID below with Credential
+Manager/Windows Hello while preserving the same two-stage scope expansion:
 
 ```text
 agent CLI          daemon                    native helper

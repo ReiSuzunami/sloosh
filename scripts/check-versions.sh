@@ -13,13 +13,18 @@ desktop_version="$(
     --no-deps --format-version 1 |
     jq -r '.packages[] | select(.name == "sloosh-desktop") | .version'
 )"
+windows_helper_version="$(
+  cargo metadata --manifest-path packaging/windows/native-approval/Cargo.toml \
+    --no-deps --format-version 1 |
+    jq -r '.packages[] | select(.name == "sloosh-windows-approval") | .version'
+)"
 tauri_version="$(jq -r '.version' gui/src-tauri/tauri.conf.json)"
 frontend_version="$(jq -r '.version' gui/package.json)"
 
-for candidate in "$desktop_version" "$tauri_version" "$frontend_version"; do
+for candidate in "$desktop_version" "$windows_helper_version" "$tauri_version" "$frontend_version"; do
   if [[ "$candidate" != "$root_version" ]]; then
-    printf 'version mismatch: root=%s desktop=%s tauri=%s frontend=%s\n' \
-      "$root_version" "$desktop_version" "$tauri_version" \
+    printf 'version mismatch: root=%s desktop=%s windows-helper=%s tauri=%s frontend=%s\n' \
+      "$root_version" "$desktop_version" "$windows_helper_version" "$tauri_version" \
       "$frontend_version" >&2
     exit 1
   fi

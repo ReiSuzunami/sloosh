@@ -16,7 +16,8 @@ Sloosh handles these security-sensitive assets:
 - local upload/download contents and remote SFTP contents;
 - trusted SSH host keys;
 - Agent instruction integrity under the configured Skill directories;
-- local state under `~/.sloosh`, including vault, socket, daemon log, audit log,
+- local state under `~/.sloosh` on Unix or `%LOCALAPPDATA%\Sloosh` on Windows,
+  including vault, socket/pipe endpoint, daemon log, audit log,
   known_hosts, and spool output.
 
 Command text and spool output can contain application secrets even when sloosh
@@ -27,7 +28,8 @@ unless they may also appear in audit/spool state.
 
 Sloosh assumes:
 
-- the kernel correctly reports Unix socket peer credentials;
+- the kernel correctly reports Unix-socket or Windows named-pipe peer process
+  identity and Windows process token ownership;
 - the OS user account, installed binary path, and human approval terminal are
   not already fully compromised;
 - the human checks the exact host list and verifies new host-key fingerprints
@@ -71,7 +73,9 @@ Every verified client connection checks both:
 - socket peer executable canonical path equals the explicitly selected
   `slooshd` executable canonical path.
 
-CLI and desktop refuse either mismatch. Release command-line builds select
+CLI and desktop refuse either mismatch. On Windows, named-pipe peers must also
+have the current user's token SID; other-user connections are rejected before
+the daemon reads even `Status`. Release command-line builds select
 their sibling `slooshd`, except that macOS prefers the private helper in the
 standard Applications install when present; source/debug builds keep selecting
 their build-tree sibling. The desktop selects only its own bundled helper.
@@ -97,8 +101,9 @@ and replacements.
 
 ### 4.2 Client identity and host authorization in the daemon
 
-The daemon gets the peer PID from `SO_PEERCRED` on Linux or `LOCAL_PEERPID` on
-macOS. It never accepts a caller-supplied PID as identity.
+The daemon gets the peer PID from `SO_PEERCRED` on Linux, `LOCAL_PEERPID` on
+macOS, or `GetNamedPipeClientProcessId` on Windows. It never accepts a
+caller-supplied PID as identity.
 
 An active lease is anchored to a PID plus process start time. The daemon keeps
 the kernel-provided subsecond resolution: Linux clock ticks and macOS `timeval`
@@ -146,7 +151,22 @@ Cancellation or helper failure leaves request pending. Unknown SSH
 host keys force terminal approval so fingerprint trust remains human CLI-owned.
 Native success returns no bearer lease token to requester.
 
-The PIN verifier is Argon2id with a random salt and versioned parameters in
+On Windows 11, sibling `sloosh-approval.exe` follows the same two-stage
+adapter. It validates that its parent is the sibling daemon or desktop,
+retrieves the vault password from Windows Credential Manager, and releases it
+only over inherited anonymous pipes so the daemon can independently expand the
+scope. It then presents the exact host list in a native Task Dialog and invokes
+`IUserConsentVerifierInterop::RequestVerificationForWindowAsync` with its own
+HWND. Only `Verified` activates the lease; cancellation, timeout, missing Hello
+configuration, helper failure, and unknown host keys retain terminal fallback.
+Windows may satisfy Hello with face, fingerprint, or the device PIN. A Hello
+result is local user verification, not a transferable cryptographic proof;
+the fixed helper/parent path and same-user daemon boundary are therefore part
+of this guarantee. Credential Manager holds a protected copy of the vault
+Master Password.
+
+On macOS, the Sloosh PIN verifier is Argon2id with a random salt and versioned
+parameters in
 `~/.sloosh/approval-pin.json`. The file is bounded, owner-only, symlink-refused,
 and atomically replaced at mode `0600`. Failed PIN attempts persist across
 process restart: attempts 5, 10, and 14 impose 30-second, 2-minute, and
@@ -244,8 +264,11 @@ Operational warning suppression is process-local and bounded to 1,024 hashed
 
 ### 4.5 Filesystem permissions and path handling
 
-Sloosh-owned private directories are created or repaired to `0700`.
-`ensure_private_dir` rejects symlinks, non-directories, and wrong ownership,
+Sloosh-owned private directories are created or repaired to `0700` on Unix.
+On Windows, `%LOCALAPPDATA%\Sloosh` (or `SLOOSH_HOME`) receives a protected,
+non-inherited DACL granting full control only to the current user, SYSTEM, and
+Administrators; child state inherits that DACL.
+On Unix, `ensure_private_dir` rejects symlinks, non-directories, and wrong ownership,
 then opens with `O_DIRECTORY | O_NOFOLLOW`. On macOS it clears extended ACLs
 before applying mode `0700`.
 
@@ -256,7 +279,8 @@ its mode or ACL.
 
 Specific files use these controls:
 
-- daemon socket: `0600` inside a private directory;
+- daemon socket: `0600` inside a private directory on Unix; on Windows a
+  remote-client-rejecting named pipe plus current-user SID verification;
 - daemon log and audit log: opened `0600` with `O_NOFOLLOW`; macOS extended
   ACLs are cleared;
 - spool files: encoded single-component host/session directories,
@@ -277,6 +301,11 @@ opened the same way. Directories and files must belong to the effective UID and
 must not be group- or other-writable. Skill and marker reads are bounded to 1
 MiB. Writes use a same-directory random `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`
 file at `0644`, fsync, and a descriptor-relative atomic commit.
+
+On Windows, the same fixed targets are resolved beneath the current user
+profile. Every existing path component is checked for reparse points, skill
+and marker reads remain bounded to 1 MiB, and writes use a same-directory
+`create_new` temporary file followed by `MoveFileExW` atomic replacement.
 
 The adjacent `.sloosh-managed.json` marker records the embedded Skill hash.
 Sloosh automatically replaces only an unchanged, previously managed Skill.

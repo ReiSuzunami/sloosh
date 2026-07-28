@@ -263,7 +263,7 @@ fn warn_malformed_audit_lines(count: u64) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

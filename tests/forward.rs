@@ -30,19 +30,29 @@ fn test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sloosh-fwd-itest-{tag}-{}-{}",
+    #[cfg(windows)]
+    return std::path::PathBuf::from(format!(
+        r"\\.\pipe\sloosh-fwd-itest-{tag}-{}-{}",
         std::process::id(),
         tag.len()
     ));
-    std::fs::create_dir_all(&dir).expect("create private socket dir");
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("secure socket dir");
+        let dir = std::env::temp_dir().join(format!(
+            "sloosh-fwd-itest-{tag}-{}-{}",
+            std::process::id(),
+            tag.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("create private socket dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("secure socket dir");
+        }
+        dir.join("sloosh.sock")
     }
-    dir.join("sloosh.sock")
 }
 
 /// Point `$SLOOSH_HOME` at a private temp directory for the rest of this

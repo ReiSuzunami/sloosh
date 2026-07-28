@@ -14,28 +14,36 @@ use sloosh::transport::Channel;
 use sloosh::transport::unix::UnixChannel;
 
 fn temp_socket_path(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sloosh-itest-{tag}-{}-{}",
+    #[cfg(windows)]
+    return std::path::PathBuf::from(format!(
+        r"\\.\pipe\sloosh-itest-{tag}-{}-{}",
         std::process::id(),
-        tag.len() // trivial extra entropy so parallel calls with the same tag still differ
+        tag.len()
     ));
-    std::fs::create_dir_all(&dir).expect("create private test directory");
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("secure private test directory");
+        let dir = std::env::temp_dir().join(format!(
+            "sloosh-itest-{tag}-{}-{}",
+            std::process::id(),
+            tag.len() // trivial extra entropy so parallel calls with the same tag still differ
+        ));
+        std::fs::create_dir_all(&dir).expect("create private test directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("secure private test directory");
+        }
+        dir.join("sloosh.sock")
     }
-    dir.join("sloosh.sock")
 }
 
 #[tokio::test]
 async fn status_round_trip_against_running_daemon() {
     let socket_path = temp_socket_path("status");
-    let test_home = socket_path
-        .parent()
-        .expect("test socket has a parent")
-        .join("home");
+    let test_home =
+        std::env::temp_dir().join(format!("sloosh-itest-status-home-{}", std::process::id()));
     let ssh_dir = test_home.join(".ssh");
     std::fs::create_dir_all(&ssh_dir).expect("create isolated OpenSSH config directory");
     std::fs::write(
@@ -265,6 +273,7 @@ async fn status_round_trip_against_running_daemon() {
         .expect("daemon task should not panic")
         .expect("daemon::run should return Ok");
 
+    #[cfg(unix)]
     assert!(
         !socket_path.exists(),
         "daemon should clean up its socket file on shutdown"

@@ -9,6 +9,10 @@ mod forward;
 mod host;
 mod log;
 mod session;
+#[cfg(unix)]
+mod skill;
+#[cfg(windows)]
+#[path = "skill_windows.rs"]
 mod skill;
 mod transfer;
 
@@ -18,7 +22,7 @@ use args::{
     VaultAction, VaultTimeoutArgs,
 };
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::proto::{self, HostRoute, HostSummary};
 use crate::proto::{Request, Response};
 use crate::transport::Channel;
@@ -30,17 +34,17 @@ use approval::{
     require_tty,
 };
 use daemon_cmd::{cmd_daemon, cmd_status};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use daemon_cmd::{daemon_connect_error, daemon_is_not_running_error};
 use forward::cmd_forward;
 use host::{cmd_add, cmd_host_edit, cmd_host_list, cmd_host_show, cmd_rm};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use host::{display_host_endpoint, escape_terminal_controls};
 use log::cmd_log;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use log::render_field_value;
 use session::{cmd_interrupt, cmd_kill, cmd_ls, cmd_open, cmd_peek, cmd_run, cmd_send};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use transfer::{LocalDownload, open_local_upload, resolve_local_path};
 use transfer::{cmd_get, cmd_put};
 
@@ -149,7 +153,7 @@ async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-const CLI_APPROVAL_SETUP: &str = "Approval setup:\n  The CLI uses out-of-band approval from another human terminal. Approve each pending lease with the printed `sloosh approve <ID>` command.\n  On macOS, the optional Sloosh desktop app owns login Keychain, Touch ID, and PIN enrollment in its Setup and Security screens. The CLI does not launch the native helper.";
+const CLI_APPROVAL_SETUP: &str = "Approval setup:\n  The CLI uses out-of-band approval from another human terminal. Approve each pending lease with the printed `sloosh approve <ID>` command.\n  The optional Sloosh desktop app owns native enrollment in Setup and Security: login Keychain with Touch ID/PIN on macOS, or Credential Manager with Windows Hello on Windows. The CLI does not launch the native helper.";
 
 fn cli_approval_setup_message() -> &'static str {
     CLI_APPROVAL_SETUP
@@ -245,7 +249,7 @@ pub fn install_embedded_skill() -> anyhow::Result<bool> {
     embedded_skill_ready()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;

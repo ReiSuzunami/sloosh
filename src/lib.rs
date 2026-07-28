@@ -9,6 +9,7 @@ pub mod daemon;
 pub(crate) mod diagnostics;
 pub mod local_approval;
 pub mod native_approval;
+pub(crate) mod platform_fs;
 pub mod procs;
 pub mod proto;
 pub mod transport;

@@ -13,7 +13,8 @@ relative symlink to this file.
 ## Project contract
 
 `sloosh` is a security-sensitive Rust 2024 CLI and daemon for persistent SSH
-sessions, human-approved host leases, SFTP, and forwarding on macOS and Linux.
+sessions, human-approved host leases, SFTP, and forwarding on macOS, Linux,
+and Windows 11.
 MSRV is Rust 1.85; runtime is Tokio with `russh` and `russh-sftp`.
 
 Read each owner relevant to the change:

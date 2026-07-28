@@ -18,12 +18,15 @@ Before the first SSH task, check whether the binary is available:
 command -v sloosh && sloosh --version
 ```
 
+In Windows PowerShell use `Get-Command sloosh; sloosh --version` instead.
+
 If it is missing or too old to provide `sloosh init` and `sloosh skill`, explain
 the official command-line package for the user's OS and ask before installing
 anything. Prefer the verified GitHub Release archive or Homebrew path described
 in the repository's installation guide. That package includes the managed
-`slooshd`; never start it directly. The macOS DMG is an optional desktop
-control plane and does not install the CLI. Do not use `curl | sh`, request
+  `slooshd`; never start it directly. The macOS DMG is an optional desktop
+  control plane and does not install the CLI. The Windows ZIP keeps CLI,
+  daemon, desktop, and Windows Hello helper together. Do not use `curl | sh`, request
 credentials, bypass Gatekeeper/SmartScreen, or silently invoke a package
 manager.
 
@@ -37,6 +40,10 @@ Once the CLI is available, explain the matching human-approval setup:
   The CLI and app then share the app's private daemon. The user handles every
   native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
   grants one-time access.
+- On Windows 11 with the desktop package, the human keeps all four executables
+  together and uses Setup and Security to enroll Credential Manager plus
+  Windows Hello. Windows may offer face, fingerprint, or the device PIN. The
+  human handles every Hello and SmartScreen prompt; never automate either.
 
 Then ask the user to run `sloosh init` themselves in their own terminal, stop,
 and wait. Never run it for them, fake a TTY, or enter a vault password. After
@@ -72,8 +79,9 @@ sloosh status                                # daemon/lease/session overview —
 
 - After `sloosh request <host>`, continue when it prints `authorized`. On a
   pending fallback, show the printed approval command to your user and **stop
-  and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
-  Touch ID or an approval PIN may complete the request without another terminal.
+  and wait** — do not poll in a loop or re-request. On configured desktop
+  installs, Touch ID, Windows Hello, or the macOS approval PIN may complete the
+  request without another terminal.
 - If `request` reports an invalid ProxyJump cycle or depth, show that error to
   the user and stop. Never retry with a subset of hosts or bypass the route.
 - Active leases idle out according to the human's shared vault timeout

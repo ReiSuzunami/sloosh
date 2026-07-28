@@ -455,7 +455,6 @@ fn vault_mutation_lock() -> &'static AsyncMutex<()> {
 
 fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultError> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
         // Only harden sloosh's dedicated state directory. Explicit test paths
@@ -485,12 +484,8 @@ fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultErr
     // Created 0600 *at open time* (not chmod'd afterwards), so there is no
     // window — however brief — in which another same-machine user could open
     // the temp file under a permissive default umask.
-    let mut tmp = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp_path)
-        .map_err(|source| VaultError::Write {
+    let mut tmp =
+        crate::platform_fs::create_new_private(&tmp_path).map_err(|source| VaultError::Write {
             path: tmp_path.clone(),
             source,
         })?;
@@ -508,6 +503,7 @@ fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultErr
             source,
         })
     });
+    #[cfg(unix)]
     let result = result.and_then(|()| {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::File::open(parent)
@@ -973,7 +969,7 @@ pub(crate) fn cache_test_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

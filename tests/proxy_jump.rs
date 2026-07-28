@@ -92,15 +92,25 @@ async fn grant_lease(hosts: &[&str]) {
 }
 
 async fn start_daemon(tag: &str) -> UnixChannel {
-    let dir = std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create private socket dir");
+    #[cfg(windows)]
+    let socket_path = std::path::PathBuf::from(format!(
+        r"\\.\pipe\sloosh-pj-itest-{tag}-{}-{}",
+        std::process::id(),
+        tag.len()
+    ));
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("secure socket dir");
-    }
-    let socket_path = dir.join("sloosh.sock");
+    let socket_path = {
+        let dir =
+            std::env::temp_dir().join(format!("sloosh-pj-itest-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create private socket dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("secure socket dir");
+        }
+        dir.join("sloosh.sock")
+    };
     let daemon_socket = socket_path.clone();
     tokio::spawn(async move {
         let _ = sloosh::daemon::run(daemon_socket).await;

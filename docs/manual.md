@@ -16,8 +16,8 @@ sloosh init
 
 It installs the embedded Agent Skill and initializes the credential vault.
 Command-line-only installations use approval from another human terminal. The
-macOS desktop app configures Keychain access, Touch ID, and an optional
-approval PIN through its own Setup and Security screens.
+desktop app configures Touch ID with login Keychain on macOS, or Windows Hello
+with Credential Manager on Windows, through Setup and Security.
 
 Verify the result:
 
@@ -71,26 +71,28 @@ consume unrelated SSH configuration.
 
 ## Desktop app
 
-The macOS DMG includes the Sloosh desktop control plane and its private
-`slooshd`; it does not install a public CLI. Install `sloosh` separately with
+The macOS DMG includes only the desktop control plane and its private daemon.
+The Windows ZIP keeps the desktop, CLI, daemon, and native approval helper in
+one directory. On macOS, install `sloosh` separately with
 Homebrew, Cargo, or the command-line archive when terminal or Agent access is
 needed. Both clients share the app daemon and state when the app is installed
 in Applications; the desktop talks to that daemon directly and never shells
 out to the CLI.
 
-Setup installs the embedded Agent Skill and initializes the vault; Security
-configures Touch ID, an optional 6-digit Sloosh PIN, and the shared vault
-timeout. These actions do not import SSH private keys or approve a host.
+Setup installs the embedded Agent Skill and initializes the vault. Security
+configures Touch ID and an optional Sloosh PIN on macOS, or Windows Hello on
+Windows, plus the shared vault timeout. These actions do not import SSH private
+keys or approve a host.
 
 Hosts manages the same vault-backed profiles as the CLI. Unlock it with Touch
-ID, the Sloosh PIN, or the Master Password. Master Password and PIN entry stay
+ID/Windows Hello, the macOS Sloosh PIN, or the Master Password. Secret entry stays
 in the bundled native helper and never enter the WebView. An SSH password
 entered in Hosts is transient, crosses the local command boundary as a redacted
 secret, and is cleared after submission.
 
-The app locks the vault session after its configured idle period and on system
-sleep, screen lock, user switch, manual lock, app exit, or the absolute session
-ceiling. Exact credential, timeout, and approval boundaries belong to
+The app locks the vault session after its configured idle period, manual lock,
+app exit, or the absolute session ceiling. On macOS it also reacts to system
+sleep, screen sleep, and user-session deactivation. Exact credential, timeout, and approval boundaries belong to
 [SECURITY.md](../SECURITY.md).
 
 ## Authorize access
@@ -108,8 +110,8 @@ command, a human runs that exact command in another terminal:
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-On a configured macOS DMG installation, Touch ID or the approval PIN may
-complete the request directly. Unknown host keys still require the human to
+On a configured desktop installation, Touch ID, Windows Hello, or the macOS
+approval PIN may complete the request directly. Unknown host keys still require the human to
 verify the fingerprint. ProxyJump routes are validated before approval.
 
 ## Persistent sessions

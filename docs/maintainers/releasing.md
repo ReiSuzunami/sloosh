@@ -4,7 +4,7 @@ Sloosh has three independent distribution channels:
 
 | Channel | Audience | Artifact |
 |---|---|---|
-| GitHub Releases | ordinary users | prebuilt command-line archives and macOS desktop DMG |
+| GitHub Releases | ordinary users | prebuilt command-line archives, macOS DMG, and Windows desktop ZIP |
 | Homebrew tap | macOS and Linux users | prebuilt `sloosh` + `slooshd` |
 | crates.io | Rust users | command-line source package compiled by `cargo install` |
 
@@ -44,11 +44,13 @@ git push origin "v$version"
 - `aarch64-apple-darwin` on an Apple silicon runner;
 - `x86_64-apple-darwin` on an Intel runner;
 - `x86_64-unknown-linux-musl` on an x86_64 Linux runner.
+- `x86_64-pc-windows-msvc` on a Windows runner.
 
 It combines `sloosh`, `slooshd`, and Tauri desktop slices into three universal
 binaries. The command-line archive contains the first two. The DMG contains
 only the desktop and private `slooshd`, then ad-hoc signs both, the payload app,
-and native installer. It packages Linux, generates `SHA256SUMS`, records GitHub
+and native installer. The Windows ZIP contains CLI, daemon, desktop, and the
+Windows Hello helper as four sibling executables. It packages Linux, generates `SHA256SUMS`, records GitHub
 build provenance attestations for a public repository, and creates the GitHub
 Release. No publishing secret is required; GitHub's scoped workflow token
 creates the release.
@@ -66,8 +68,13 @@ For a public repository, also verify every archive and the DMG with
 attestation availability depends on the GitHub plan, so the workflow does not
 make private releases depend on it.
 
-Extract both archives and run `sloosh --version` and `slooshd --version`. On
+Extract each archive and run `sloosh --version` and `slooshd --version`. On
 macOS, also verify the DMG and its app bundle:
+
+On Windows, extract the ZIP, verify all four executables are siblings, run the
+two version commands, open `Sloosh.exe`, and manually test one enrollment,
+cancellation, and successful Windows Hello approval. Never automate or bypass
+the Hello prompt.
 
 ```sh
 dmg="Sloosh-$version-macos-universal.dmg"

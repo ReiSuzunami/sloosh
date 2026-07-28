@@ -15,6 +15,7 @@ Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebr
 | 平台 | 文件 |
 |---|---|
 | macOS 11 或更新版本，Apple silicon 或 Intel | `Sloosh-<version>-macos-universal.dmg` 或 `sloosh-macos-universal.tar.gz` |
+| Windows 11 x86_64（build 22000 或更新） | `sloosh-windows-x86_64.zip` |
 | Linux x86_64，且 procfs 可读 | `sloosh-linux-x86_64-musl.tar.gz` |
 
 同时下载 `SHA256SUMS`，安装前校验所选文件。
@@ -48,6 +49,22 @@ install -d "$HOME/.local/bin"
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
 install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
 ```
+
+Windows（PowerShell）：
+
+```powershell
+$file = 'sloosh-windows-x86_64.zip'
+(Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+# 与 SHA256SUMS 对应条目核对后：
+Expand-Archive $file -DestinationPath "$env:LOCALAPPDATA\Programs\Sloosh"
+& "$env:LOCALAPPDATA\Programs\Sloosh\sloosh-*\sloosh.exe" --version
+```
+
+必须把 `sloosh.exe`、`slooshd.exe`、`Sloosh.exe` 与
+`sloosh-approval.exe` 保持在同一目录。客户端只信任固定 sibling path，不从 `PATH`
+搜索 helper。Windows Hello 由 Windows 选择人脸、指纹或设备 PIN。未签名社区 ZIP
+可能触发 SmartScreen；请先核对校验和，只在信任该 Release 时通过 Windows 自己的
+警告界面明确放行。Sloosh 不会关闭或绕过 SmartScreen。
 
 Linux：
 
@@ -89,11 +106,11 @@ sloosh init
 命令行包时使用终端审批；Linux 无需 Keychain 或生物识别权限，初始化会明确输出后续
 pending lease 所需的另一终端 `sloosh approve <ID>` 流程。
 
-原生设置由桌面 App 管理。打开 Setup 与 Security，在同一个 vault 上完成初始化或解锁，
-并把 vault 密码登记到 login Keychain，以 Touch ID 或可选本地 PIN 保护。独立分发的 CLI
-不会直接执行原生 helper。App 位于“应用程序”时，CLI 与桌面端会共用 App 私有 daemon；
-人类在 App 中完成登记后，CLI 发起的 lease request 仍可使用原生批准。`Always Allow`
-可避免重复 Keychain 提示，`Allow` 只授权一次。
+原生设置由桌面 App 管理。macOS 把 vault 密码登记到 login Keychain，以 Touch ID 或
+可选本地 PIN 保护；Windows 把凭据存入 Windows Credential Manager，并要求 Windows
+Hello。CLI 不会直接执行原生 helper。Windows 下四个 executable 保持在同一目录时，
+CLI 与桌面端选择相同 sibling daemon；人类在 App 中登记后，CLI lease request 也可
+使用原生批准。macOS 上 `Always Allow` 可避免重复 Keychain 提示，`Allow` 只授权一次。
 
 重复运行是安全的，已有 vault 不会改变。各步骤不是事务：如果 vault、daemon 或 Touch ID
 随后报错，已经安装的 Skill 会保留，修复问题后可直接重试。系统中登记的指纹变化会使
@@ -176,4 +193,7 @@ macOS 安装器或 DMG 打包资源，因此不能从 crate 构建 Sloosh DMG。
 
 从仓库 checkout 构建时，见 README 中的
 [源码构建步骤](../../README.md#从源码构建)。
+Windows 还需运行
+`cargo build --release --locked --manifest-path packaging/windows/native-approval/Cargo.toml`
+构建 helper，并把 `sloosh-approval.exe` 与其它 executable 放在同一目录。
 安装完成后，继续阅读[使用手册](../manual.zh-CN.md)。

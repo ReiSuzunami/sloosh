@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -17,10 +18,13 @@ impl TestHome {
             "sloosh-skill-itest-{tag}-{}-{nonce}",
             std::process::id()
         ));
+        #[cfg(unix)]
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .expect("create test HOME");
+        #[cfg(windows)]
+        std::fs::create_dir(&path).expect("create test HOME");
         Self(path)
     }
 

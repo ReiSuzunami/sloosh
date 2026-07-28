@@ -2,6 +2,7 @@
 /gui/node_modules/
 /gui/dist/
 /gui/src-tauri/target/
+/packaging/windows/native-approval/target/
 /gui/src-tauri/gen/
 /dist/
 /.claude-bridge/

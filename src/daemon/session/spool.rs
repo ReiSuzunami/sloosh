@@ -1,4 +1,5 @@
 //! Bounded, best-effort PTY output persistence.
+#![cfg_attr(all(test, windows), allow(dead_code))]
 //!
 //! Spooling must never become command authority: write, accounting, scan, or
 //! retention failures stop disk persistence only. The session memory ring and
@@ -7,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -532,7 +532,7 @@ pub(super) fn open_spool_file_under(
             return Err(error);
         }
     }
-    if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+    if let Err(error) = crate::platform_fs::harden_file(&file) {
         let _ = std::fs::remove_file(&path);
         return Err(error);
     }
@@ -554,13 +554,7 @@ fn create_spool_file(dir: &Path, seq: u64) -> std::io::Result<(PathBuf, std::fs:
             format!("{seq:08}-{:016x}.log", rand::random::<u64>())
         };
         let path = dir.join(filename);
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
+        match crate::platform_fs::create_new_private(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),

@@ -8,6 +8,13 @@
 //! per-platform module rather than trait methods, since a future Windows
 //! implementation swaps the whole module, not a generic parameter.
 
+#[cfg(unix)]
+pub mod unix;
+// Keep the platform-neutral call sites stable while the public module name is
+// migrated in a later incompatible cleanup. On Windows this module exposes
+// the same Channel-facing surface over owner-verified named pipes.
+#[cfg(windows)]
+#[path = "windows.rs"]
 pub mod unix;
 
 use serde::Serialize;

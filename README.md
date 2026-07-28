@@ -15,11 +15,12 @@
 
 - macOS 桌面控制面：`Sloosh-<version>-macos-universal.dmg`
 - macOS 命令行包：`sloosh-macos-universal.tar.gz`
+- Windows 11 x86_64（CLI、daemon、桌面端与 Windows Hello helper）：`sloosh-windows-x86_64.zip`
 - Linux x86_64：`sloosh-linux-x86_64-musl.tar.gz`
 
 DMG 只安装桌面控制面及其私有 daemon，不会把 `sloosh` CLI 放进 `PATH`。
 Homebrew、crates.io 与命令行压缩包提供 `sloosh` 和配套 `slooshd`，不包含或构建
-桌面 App。macOS 桌面 App 与 DMG 仅通过 GitHub Releases 发布。
+桌面 App。macOS DMG 与 Windows 桌面包仅通过 GitHub Releases 发布。
 
 校验和、平台要求与升级步骤见[安装指南](./docs/getting-started/installation.zh-CN.md)。
 
@@ -30,15 +31,17 @@ Homebrew、crates.io 与命令行压缩包提供 `sloosh` 和配套 `slooshd`，
 ```text
 你是我的 sloosh 安装向导。
 
-1. 检测操作系统与架构，执行 `command -v sloosh && sloosh --version`。仅使用官方仓库
+1. 检测操作系统与架构；Unix 执行 `command -v sloosh && sloosh --version`，Windows
+   PowerShell 执行 `Get-Command sloosh; sloosh --version`。仅使用官方仓库
    `https://github.com/ReiSuzunami/sloosh`。若未安装或版本过旧，检查最新 Release：
    为 CLI 选择 Homebrew 或对应命令行压缩包并验证 `SHA256SUMS`；没有 Release 时说明
-   Rust 1.85+ 源码构建方案。macOS DMG 是可选桌面控制面，不提供 CLI。任何安装前先
+   Rust 1.85+ 源码构建方案。macOS DMG 是可选桌面控制面，不提供 CLI；Windows ZIP
+   同时包含 CLI 与桌面端。任何安装前先
    征得我同意。禁止 `curl | sh`、静默调用包管理器、绕过平台保护，禁止索取或显示
    密码、SSH 密钥、vault secret 或 lease token。不要直接运行 `slooshd`。
 2. CLI 可用后，解释 `sloosh init`，让我在自己的交互式终端运行。你不得代跑、伪造
    TTY、输入或读取 secret。如果我还安装了桌面 App，引导我亲自打开 Setup/Security
-   完成原生解锁设置。
+   完成 Touch ID 或 Windows Hello 原生解锁设置。
 3. 等我确认完成后，只读运行 `sloosh skill status --agent auto` 和 `sloosh status`，
    报告结果。任何主机访问仍须带外人工批准。
 ```
@@ -55,8 +58,8 @@ cd sloosh
 cargo build --release --bins --locked
 ```
 
-命令行客户端与 daemon 分别位于 `target/release/sloosh` 和
-`target/release/slooshd`。
+命令行客户端与 daemon 分别位于 `target/release/sloosh[.exe]` 和
+`target/release/slooshd[.exe]`。Windows Hello helper 另见安装指南。
 
 ## 文档
 

@@ -32,17 +32,21 @@ pnpm --dir gui test:unit
 scripts/check-versions.sh
 scripts/check-lockfile-sync.sh
 cargo check --manifest-path gui/src-tauri/Cargo.toml --locked
+cargo test --manifest-path packaging/windows/native-approval/Cargo.toml --locked
+cargo check --manifest-path packaging/windows/native-approval/Cargo.toml --locked
 # Release binaries must embed the frontend rather than use devUrl:
 cargo build --manifest-path gui/src-tauri/Cargo.toml --locked --release \
   --features custom-protocol
-for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl; do
+for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl x86_64-pc-windows-msvc; do
   cargo deny --all-features --target "$target" \
     check advisories bans licenses sources
 done
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
+for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
   cargo deny --manifest-path gui/src-tauri/Cargo.toml --all-features \
     --target "$target" check advisories bans licenses sources
 done
+cargo deny --manifest-path packaging/windows/native-approval/Cargo.toml \
+  --target x86_64-pc-windows-msvc check advisories bans licenses sources
 git diff --check
 ```
 

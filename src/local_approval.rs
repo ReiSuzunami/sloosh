@@ -6,7 +6,6 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq as _;
@@ -91,7 +90,7 @@ impl PinStore {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn for_test(path: PathBuf) -> Self {
         Self {
             path,
@@ -214,20 +213,13 @@ impl PinStore {
 
     fn read(&self) -> Result<Option<PinFile>, PinError> {
         self.refuse_symlink()?;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&self.path)
-        {
+        let file = match crate::platform_fs::open_private_read(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let metadata = file.metadata()?;
-        if metadata.len() > MAX_PIN_FILE_BYTES
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        if metadata.len() > MAX_PIN_FILE_BYTES {
             return Err(PinError::UnsafeFile);
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -258,17 +250,12 @@ impl PinStore {
         ));
         let encoded = serde_json::to_vec_pretty(state).map_err(|_| PinError::Corrupt)?;
         let result = (|| -> Result<(), PinError> {
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&temp)?;
+            let mut output = crate::platform_fs::create_new_private(&temp)?;
             output.write_all(&encoded)?;
             output.sync_all()?;
             drop(output);
             std::fs::rename(&temp, &self.path)?;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+            crate::platform_fs::harden_path(&self.path)?;
             Ok(())
         })();
         if result.is_err() {
@@ -358,7 +345,7 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::proto::SecretString;

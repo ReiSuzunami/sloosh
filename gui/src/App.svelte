@@ -35,11 +35,16 @@
   let reducedMotion = $state(false);
   const enterDuration = $derived(reducedMotion ? 0 : 180);
   const exitDuration = $derived(reducedMotion ? 0 : 120);
+  const isWindows = $derived(snapshot?.platform === 'windows');
+  const biometricLabel = $derived(isWindows ? 'Windows Hello' : 'Touch ID');
+  const credentialStoreLabel = $derived(
+    isWindows ? 'Windows Credential Manager' : 'macOS login Keychain',
+  );
 
   const localApprovalReady = $derived(
     Boolean(
       snapshot?.vaultExists &&
-        (snapshot?.touchIdEnrolled || snapshot?.pin.state === 'ready'),
+        (snapshot?.touchIdEnrolled || (!isWindows && snapshot?.pin.state === 'ready')),
     ),
   );
   const setupComplete = $derived(
@@ -121,7 +126,9 @@
       return {
         tone: 'blocked',
         title: 'Approval method required',
-        description: 'Enable Touch ID or a six-digit approval PIN.',
+        description: isWindows
+          ? 'Enable Windows Hello approval.'
+          : 'Enable Touch ID or a six-digit approval PIN.',
         action: 'setup',
         actionLabel: 'Choose a method',
       };
@@ -186,7 +193,7 @@
     dismissApprovalSetup();
     queueMicrotask(() => {
       if (method === 'touch_id') {
-        void runAction('enable_touch_id', 'Touch ID approval enabled.');
+        void runAction('enable_touch_id', `${biometricLabel} approval enabled.`);
       } else {
         void runAction('enable_pin', 'Approval PIN enabled.');
       }
@@ -422,7 +429,7 @@
           </li>
           <li class:complete={localApprovalReady}>
             <span class="requirement-mark">{#if localApprovalReady}<Check size={12} />{/if}</span>
-            <span>Keychain approval</span>
+            <span>Native approval</span>
             <strong>{localApprovalReady ? 'Ready' : 'Required'}</strong>
           </li>
         </ul>
@@ -470,7 +477,7 @@
         <div class="setting-row">
           <div class="setting-icon"><LockKeyhole size={20} /></div>
           <div class="setting-copy">
-            <h3>macOS login Keychain</h3>
+            <h3>{credentialStoreLabel}</h3>
             <p>Protects a local vault credential; SSH private keys stay where you configured them</p>
           </div>
           <span class:enabled={localApprovalReady} class="state-label">
@@ -481,8 +488,8 @@
         <div class="setting-row">
           <div class="setting-icon"><Fingerprint size={20} /></div>
           <div class="setting-copy">
-            <h3>Touch ID</h3>
-            <p>System biometric authentication</p>
+            <h3>{biometricLabel}</h3>
+            <p>{isWindows ? 'Windows Hello user verification' : 'System biometric authentication'}</p>
             {#if approvalBlocker}<span class="constraint">{approvalBlocker}</span>{/if}
           </div>
           <div class="setting-actions">
@@ -504,7 +511,7 @@
           </div>
         </div>
 
-        <div class="setting-row">
+        {#if !isWindows}<div class="setting-row">
           <div class="setting-icon"><KeyRound size={20} /></div>
           <div class="setting-copy">
             <h3>Sloosh PIN</h3>
@@ -526,7 +533,7 @@
               </button>
             {/if}
           </div>
-        </div>
+        </div>{/if}
 
         <div class="setting-row">
           <div class="setting-icon"><Clock3 size={20} /></div>
@@ -560,11 +567,11 @@
         </div>
       </section>
 
-      {#if snapshot?.pin.state === 'ready' || snapshot?.pin.state === 'locked'}
+      {#if !isWindows && (snapshot?.pin.state === 'ready' || snapshot?.pin.state === 'locked')}
         <section class="danger-zone" aria-labelledby="danger-heading">
           <div>
             <h2 id="danger-heading">Disable approval PIN</h2>
-            <p>Touch ID remains available when configured.</p>
+            <p>{biometricLabel} remains available when configured.</p>
           </div>
           <button
             class="secondary-button danger-button"
@@ -642,10 +649,10 @@
         <li class:complete={localApprovalReady} class:current={Boolean(snapshot?.vaultExists) && !localApprovalReady}>
           <span class="step-number">{#if localApprovalReady}<Check size={14} />{:else}4{/if}</span>
           <div class="step-copy">
-            <h3>Keychain &amp; local approval</h3>
+            <h3>{credentialStoreLabel} &amp; local approval</h3>
             <p>
               {localApprovalReady && snapshot?.touchIdEnrolled
-                ? 'Keychain protected with Touch ID'
+                ? `${credentialStoreLabel} protected with ${biometricLabel}`
                 : localApprovalReady && snapshot?.pin.state === 'ready'
                   ? 'Keychain protected with Sloosh PIN'
                   : 'Choose how the native helper unlocks the protected credential'}
@@ -661,13 +668,13 @@
                 disabled={Boolean(approvalBlocker) || activeAction !== null}
                 title={approvalBlocker ?? undefined}
                 onclick={() => beginApprovalSetup('touch_id')}
-              >{activeAction === 'enable_touch_id' ? 'Enabling...' : 'Touch ID'}</button>
-              <button
+              >{activeAction === 'enable_touch_id' ? 'Enabling...' : biometricLabel}</button>
+              {#if !isWindows}<button
                 class="secondary-button"
                 disabled={Boolean(approvalBlocker) || activeAction !== null}
                 title={approvalBlocker ?? undefined}
                 onclick={() => beginApprovalSetup('pin')}
-              >{activeAction === 'enable_pin' ? 'Enabling...' : 'PIN'}</button>
+              >{activeAction === 'enable_pin' ? 'Enabling...' : 'PIN'}</button>{/if}
             </div>
           {/if}
         </li>
@@ -708,34 +715,36 @@
           title="Close"
         ><X size={17} /></button>
         <div>
-          <p class="section-kicker">macOS protection</p>
-          <h2 id="keychain-dialog-title">Allow Sloosh to use your login Keychain</h2>
+          <p class="section-kicker">{isWindows ? 'Windows protection' : 'macOS protection'}</p>
+          <h2 id="keychain-dialog-title">Allow Sloosh to use {credentialStoreLabel}</h2>
         </div>
       </header>
 
       <div class="keychain-summary">
         <span class="keychain-mark"><LockKeyhole size={22} /></span>
         <p id="keychain-dialog-description">
-          Sloosh stores a protected copy of your vault Master Password in the macOS login Keychain.
+          Sloosh stores a protected copy of your vault Master Password in {credentialStoreLabel}.
           The bundled native helper uses it only after you authenticate.
         </p>
       </div>
 
       <ol class="keychain-steps">
         <li><span>1</span><p>Confirm your Master Password in a native Sloosh window.</p></li>
-        <li>
+        {#if !isWindows}<li>
           <span>2</span>
           <p>
             If macOS asks whether <strong>Sloosh Approval</strong> may access the Keychain item,
             choose <strong>Always Allow</strong> on your Mac to avoid repeated prompts, or
             <strong>Allow</strong> for one-time access.
           </p>
-        </li>
+        </li>{/if}
         <li>
           <span>3</span>
           <p>
             {pendingApprovalMethod === 'touch_id'
-              ? 'Authenticate with Touch ID. Adding or removing fingerprints requires re-enrollment.'
+              ? isWindows
+                ? 'Authenticate with Windows Hello. Windows may offer face, fingerprint, or your device PIN.'
+                : 'Authenticate with Touch ID. Adding or removing fingerprints requires re-enrollment.'
               : 'Create and confirm a six-digit Sloosh PIN. Its verifier stays on this Mac.'}
           </p>
         </li>
@@ -752,7 +761,7 @@
       <footer>
         <button type="button" class="secondary-button" onclick={dismissApprovalSetup}>Cancel</button>
         <button type="button" class="primary-button" onclick={continueApprovalSetup}>
-          {pendingApprovalMethod === 'touch_id' ? 'Continue with Touch ID' : 'Continue to create PIN'}
+          {pendingApprovalMethod === 'touch_id' ? `Continue with ${biometricLabel}` : 'Continue to create PIN'}
           <ChevronRight size={16} />
         </button>
       </footer>

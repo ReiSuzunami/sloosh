@@ -18,6 +18,7 @@ When available, download these files from the
 | Platform | File |
 |---|---|
 | macOS 11 or newer, Apple silicon or Intel | `Sloosh-<version>-macos-universal.dmg` or `sloosh-macos-universal.tar.gz` |
+| Windows 11 x86_64 (build 22000 or newer) | `sloosh-windows-x86_64.zip` |
 | Linux x86_64 with readable procfs | `sloosh-linux-x86_64-musl.tar.gz` |
 
 Download `SHA256SUMS` from the same release and verify the selected file.
@@ -55,6 +56,23 @@ install -d "$HOME/.local/bin"
 install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
 install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
 ```
+
+Windows (PowerShell):
+
+```powershell
+$file = 'sloosh-windows-x86_64.zip'
+(Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+# Compare that value with SHA256SUMS, then:
+Expand-Archive $file -DestinationPath "$env:LOCALAPPDATA\Programs\Sloosh"
+& "$env:LOCALAPPDATA\Programs\Sloosh\sloosh-*\sloosh.exe" --version
+```
+
+Keep `sloosh.exe`, `slooshd.exe`, `Sloosh.exe`, and
+`sloosh-approval.exe` together. Clients authenticate fixed sibling paths and
+never search `PATH` for helpers. Windows Hello uses the face, fingerprint, or
+device-PIN provider selected by Windows. Unsigned community ZIP binaries may
+trigger SmartScreen; verify the checksum and use Windows' explicit warning UI
+only if you trust the release. Sloosh never disables or bypasses SmartScreen.
 
 Linux:
 
@@ -100,13 +118,13 @@ then creates the credential vault. Command-line-only installations use terminal
 approval; Linux requires no Keychain or biometric permission and initialization
 prints the separate-terminal `sloosh approve <ID>` fallback.
 
-The desktop app owns native setup. Open its Setup and Security screens to
-initialize or unlock the same vault and enroll the vault password in the login
-Keychain behind Touch ID or the optional local PIN. The separately distributed
-CLI never executes the native helper directly. When the app is installed in
-Applications, both clients use its private daemon, so CLI lease requests can
-still complete through native approval after the human has enrolled it in the
-app. `Always Allow` avoids repeated Keychain prompts; `Allow` grants one-time
+The desktop app owns native setup. On macOS it stores the vault password in
+login Keychain behind Touch ID or the optional local PIN. On Windows it stores
+the credential in Windows Credential Manager and requires Windows Hello. The
+CLI never executes the native helper directly. When all Windows binaries stay
+together, CLI and desktop select the same sibling daemon, so CLI lease requests
+can complete through native approval after desktop enrollment. On macOS,
+`Always Allow` avoids repeated Keychain prompts and `Allow` grants one-time
 access.
 
 Setup is safe to rerun: an existing vault is left alone. The steps are not a
@@ -204,4 +222,7 @@ it is not the no-build installation path.
 
 For a repository checkout, follow the concise
 [source-build steps in the README](../../README.en.md#build-from-source).
+On Windows, also build the native helper with
+`cargo build --release --locked --manifest-path packaging/windows/native-approval/Cargo.toml`
+and keep `sloosh-approval.exe` beside the other executables.
 After installation, continue with the [manual](../manual.md).

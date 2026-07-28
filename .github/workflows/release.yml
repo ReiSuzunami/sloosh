@@ -264,6 +264,62 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows-x86_64:
+    name: Build Windows x86_64
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
+
+      - name: Build and test Windows binaries
+        shell: pwsh
+        run: |
+          cargo test --all-targets --all-features --locked
+          cargo build --release --bins --locked
+          cargo test --manifest-path packaging/windows/native-approval/Cargo.toml --locked
+          cargo build --manifest-path packaging/windows/native-approval/Cargo.toml --release --locked
+          corepack enable
+          $packageManager = node -p "require('./gui/package.json').packageManager"
+          corepack prepare $packageManager --activate
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui build
+          cargo build --manifest-path gui/src-tauri/Cargo.toml --release --locked --features custom-protocol
+
+      - name: Package Windows archive
+        shell: pwsh
+        run: |
+          $version = '${{ needs.preflight.outputs.version }}'
+          $cliVersion = & target\release\sloosh.exe --version
+          $daemonVersion = & target\release\slooshd.exe --version
+          if ($cliVersion -ne "sloosh $version") { throw 'sloosh version mismatch' }
+          if ($daemonVersion -ne "slooshd $version") { throw 'slooshd version mismatch' }
+          $package = "sloosh-$version-windows-x86_64"
+          $root = Join-Path dist $package
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item target\release\sloosh.exe,target\release\slooshd.exe $root
+          Copy-Item packaging\windows\native-approval\target\release\sloosh-approval.exe $root
+          Copy-Item gui\src-tauri\target\release\Sloosh.exe $root
+          Copy-Item README.md,README.en.md,SECURITY.md,SUPPORT.md,CONTRIBUTING.md,LICENSE-APACHE,LICENSE-MIT $root
+          New-Item -ItemType Directory -Force -Path "$root\docs\getting-started","$root\docs\internals","$root\skills\sloosh" | Out-Null
+          Copy-Item docs\manual.md,docs\manual.zh-CN.md "$root\docs"
+          Copy-Item docs\getting-started\installation.md,docs\getting-started\installation.zh-CN.md "$root\docs\getting-started"
+          Copy-Item docs\internals\architecture.md,docs\internals\protocol.md "$root\docs\internals"
+          Copy-Item skills\sloosh\SKILL.md "$root\skills\sloosh"
+          Compress-Archive -Path $root -DestinationPath dist\sloosh-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-windows-x86_64
+          path: dist/sloosh-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 7
+
   macos-universal:
     name: Assemble macOS universal binary
     needs: [preflight, macos-arm64, macos-x86_64]
@@ -346,7 +402,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [preflight, linux-x86_64-musl, macos-universal]
+    needs: [preflight, linux-x86_64-musl, macos-universal, windows-x86_64]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -363,7 +419,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum *.tar.gz *.dmg > SHA256SUMS
+        run: sha256sum *.tar.gz *.dmg *.zip > SHA256SUMS
 
       - name: Attest release assets
         if: github.event.repository.visibility == 'public'
@@ -372,6 +428,7 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.dmg
+            dist/*.zip
             dist/SHA256SUMS
 
       - name: Create or refresh release

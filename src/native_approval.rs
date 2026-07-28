@@ -7,9 +7,9 @@
 use crate::daemon::{lease, ssh, vault};
 use crate::local_approval::{PinError, PinStatus, PinStore, PinVerify};
 use crate::proto::{LeaseActivatedInfo, LeaseRequestSummary, SecretString};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
 
 mod helper;
@@ -360,9 +360,12 @@ fn verify_pin(store: &PinStore, pin: &SecretString) -> Result<(), NativeApproval
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs::OpenOptions;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(unix)]
     fn temporary_helper_path(tag: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -395,7 +398,7 @@ mod tests {
         assert!(!success.take());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn native_approval_is_unavailable_off_macos() {
         assert!(helper_path().is_none());
@@ -418,6 +421,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn helper_validation_rejects_group_writable_executable() {
         let path = temporary_helper_path("group-writable");
@@ -436,6 +440,7 @@ mod tests {
         std::fs::remove_file(path).expect("remove temporary helper");
     }
 
+    #[cfg(unix)]
     #[test]
     fn helper_validation_accepts_owner_only_executable() {
         let path = temporary_helper_path("owner-only");

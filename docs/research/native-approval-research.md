@@ -35,7 +35,7 @@
 
 ## sloosh 分阶段路线
 
-1. **阶段 A（macOS 已实现）**：保留密码批准；DMG 内置 helper 将 vault 密码存入本机 login Keychain。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围，原生 UI 先确认完整列表，再执行 Touch ID 并比对登记时的 biometric domain state。取消、未知 host key、未登记或 helper 缺失均退回终端审批。
+1. **阶段 A（macOS/Windows 已实现）**：保留密码批准；macOS helper 使用 login Keychain + Touch ID，Windows sibling helper 使用 Credential Manager + Windows Hello。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围，原生 UI 先确认完整列表，再执行平台 user verification。取消、未知 host key、未登记或 helper 缺失均退回终端审批。Windows API 不提供等价的 biometric domain state，因此 Windows 重新登记以显式 Hello 成功为准。
 2. **阶段 B（本机密码学证明）**：每台客户端生成受 user presence 保护的签名密钥；守护进程发随机 nonce，客户端完成生物审批后签名，守护进程验签并把公钥绑定设备/租约。设计重放防护、密钥轮换、撤销与无生物回退。
 3. **阶段 C（发布与生态）**：需要公共下载时再接入 Apple Developer ID + notarization、Windows Store/MSIX/代码签名，或合规的 OSS 签名服务；证书预算与发布渠道独立于审批协议。
 

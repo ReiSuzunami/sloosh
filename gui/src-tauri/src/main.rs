@@ -43,6 +43,7 @@ struct DaemonSnapshot {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot {
+    platform: &'static str,
     daemon: DaemonSnapshot,
     vault_exists: bool,
     skill_ready: bool,
@@ -151,6 +152,7 @@ impl Controller {
             false
         };
         AppSnapshot {
+            platform: std::env::consts::OS,
             daemon,
             vault_exists,
             skill_ready: sloosh::cli::embedded_skill_ready().unwrap_or(false),
@@ -432,9 +434,22 @@ async fn get_app_snapshot(controller: tauri::State<'_, Controller>) -> Result<Ap
 
 #[cfg_attr(debug_assertions, allow(dead_code))]
 fn bundled_daemon_path(current_executable: &Path) -> Option<PathBuf> {
-    let macos = current_executable.parent()?;
-    let contents = macos.parent()?;
-    Some(contents.join("Helpers").join("slooshd"))
+    #[cfg(target_os = "macos")]
+    {
+        let macos = current_executable.parent()?;
+        let contents = macos.parent()?;
+        Some(contents.join("Helpers").join("slooshd"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(current_executable.parent()?.join("slooshd.exe"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        current_executable
+            .parent()
+            .map(|parent| parent.join("slooshd"))
+    }
 }
 
 fn daemon_executable() -> Result<PathBuf, String> {
@@ -447,7 +462,11 @@ fn daemon_executable() -> Result<PathBuf, String> {
     {
         Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("target/debug/slooshd"))
+            .join(if cfg!(windows) {
+                "target/debug/slooshd.exe"
+            } else {
+                "target/debug/slooshd"
+            }))
     }
 
     #[cfg(not(debug_assertions))]
@@ -509,12 +528,23 @@ mod tests {
 
     #[test]
     fn bundled_daemon_is_a_stable_helper_path() {
-        let app = Path::new("/Applications/Sloosh.app/Contents/MacOS/Sloosh");
-        assert_eq!(
-            bundled_daemon_path(app),
-            Some(PathBuf::from(
-                "/Applications/Sloosh.app/Contents/Helpers/slooshd"
-            ))
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let app = Path::new("/Applications/Sloosh.app/Contents/MacOS/Sloosh");
+            assert_eq!(
+                bundled_daemon_path(app),
+                Some(PathBuf::from(
+                    "/Applications/Sloosh.app/Contents/Helpers/slooshd"
+                ))
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let app = Path::new(r"C:\Program Files\Sloosh\Sloosh.exe");
+            assert_eq!(
+                bundled_daemon_path(app),
+                Some(PathBuf::from(r"C:\Program Files\Sloosh\slooshd.exe"))
+            );
+        }
     }
 }

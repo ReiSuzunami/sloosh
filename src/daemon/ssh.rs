@@ -26,7 +26,6 @@
 //! today.
 
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -664,7 +663,7 @@ pub fn record_sloosh_known_host(
 ) -> Result<(), SshError> {
     let path = sloosh_known_hosts_path();
     russh::keys::known_hosts::learn_known_hosts_path(hostname, port, key, &path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+    crate::platform_fs::harden_path(&path)
         .map_err(|e| SshError::KnownHosts(russh::keys::Error::IO(e)))?;
     Ok(())
 }
@@ -1298,6 +1297,7 @@ async fn try_agent_auth(
     host_cfg: &HostConfig,
     hash_alg: Option<HashAlg>,
 ) -> Result<bool, SshError> {
+    #[cfg(unix)]
     let mut agent = match &host_cfg.identity_agent {
         Some(IdentityAgentValue::Disabled) => return Ok(false),
         Some(IdentityAgentValue::Path(path)) => {
@@ -1310,6 +1310,30 @@ async fn try_agent_auth(
             Ok(agent) => agent,
             Err(_) => return Ok(false),
         },
+    };
+
+    #[cfg(windows)]
+    let mut agent = match &host_cfg.identity_agent {
+        Some(IdentityAgentValue::Disabled) => return Ok(false),
+        Some(IdentityAgentValue::Path(path)) => {
+            match russh::keys::agent::client::AgentClient::connect_named_pipe(path).await {
+                Ok(agent) => agent.dynamic(),
+                Err(_) => return Ok(false),
+            }
+        }
+        None => {
+            if let Some(path) = std::env::var_os("SSH_AUTH_SOCK") {
+                match russh::keys::agent::client::AgentClient::connect_named_pipe(path).await {
+                    Ok(agent) => agent.dynamic(),
+                    Err(_) => return Ok(false),
+                }
+            } else {
+                match russh::keys::agent::client::AgentClient::connect_pageant().await {
+                    Ok(agent) => agent.dynamic(),
+                    Err(_) => return Ok(false),
+                }
+            }
+        }
     };
     let Ok(identities) = agent.request_identities().await else {
         return Ok(false);

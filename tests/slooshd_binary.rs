@@ -1,7 +1,10 @@
 use std::process::Command;
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use sloosh::client::DaemonClient;
+#[cfg(unix)]
 use sloosh::proto::{Request, Response};
 
 #[test]
@@ -24,6 +27,7 @@ fn dedicated_daemon_has_its_own_minimal_cli_surface() {
     assert!(!legacy.status.success());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn dedicated_daemon_serves_verified_clients_without_cli_arguments() {
     use std::os::unix::fs::PermissionsExt;
@@ -86,6 +90,7 @@ async fn dedicated_daemon_serves_verified_clients_without_cli_arguments() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_stop_recovers_when_the_local_slooshd_file_is_missing() {
     use std::os::unix::fs::PermissionsExt;

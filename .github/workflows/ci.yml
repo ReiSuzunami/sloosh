@@ -69,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -130,6 +130,42 @@ jobs:
             -framework AppKit -framework Security
           xcrun swiftc -typecheck packaging/macos/native-approval.swift \
             -framework AppKit -framework LocalAuthentication -framework Security
+
+  windows-desktop:
+    name: Windows desktop + Hello helper
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check Windows Hello helper
+        run: |
+          cargo fmt --manifest-path packaging/windows/native-approval/Cargo.toml -- --check
+          cargo clippy --manifest-path packaging/windows/native-approval/Cargo.toml --locked -- -D warnings
+          cargo test --manifest-path packaging/windows/native-approval/Cargo.toml --locked
+
+      - name: Check frontend
+        run: |
+          corepack enable
+          $packageManager = node -p "require('./gui/package.json').packageManager"
+          corepack prepare $packageManager --activate
+          pnpm --dir gui install --frozen-lockfile
+          pnpm --dir gui check
+          pnpm --dir gui test:unit
+          pnpm --dir gui build
+
+      - name: Check Windows Tauri crate
+        run: |
+          cargo fmt --manifest-path gui/src-tauri/Cargo.toml -- --check
+          cargo clippy --manifest-path gui/src-tauri/Cargo.toml --locked -- -D warnings
+          cargo test --manifest-path gui/src-tauri/Cargo.toml --locked
+          cargo build --manifest-path gui/src-tauri/Cargo.toml --locked --release --features custom-protocol
 
   # Exercises tests/ssh_session.rs, tests/sftp_transfer.rs, and
   # tests/forward.rs against a real sshd, since they're skipped entirely by
@@ -224,12 +260,21 @@ jobs:
           - package: cli-linux-musl
             manifest: Cargo.toml
             target: x86_64-unknown-linux-musl
+          - package: cli-windows-x86_64
+            manifest: Cargo.toml
+            target: x86_64-pc-windows-msvc
           - package: desktop-macos-arm64
             manifest: gui/src-tauri/Cargo.toml
             target: aarch64-apple-darwin
           - package: desktop-macos-x86_64
             manifest: gui/src-tauri/Cargo.toml
             target: x86_64-apple-darwin
+          - package: desktop-windows-x86_64
+            manifest: gui/src-tauri/Cargo.toml
+            target: x86_64-pc-windows-msvc
+          - package: hello-helper-windows-x86_64
+            manifest: packaging/windows/native-approval/Cargo.toml
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

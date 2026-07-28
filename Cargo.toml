@@ -30,6 +30,7 @@ include = [
     "/skills/sloosh/**",
     "/src/**",
     "/tests/**",
+    "/vendor/pageant-0.2.0/**",
 ]
 
 [features]
@@ -43,7 +44,6 @@ clap = { version = "4.6.1", features = ["derive"] }
 libc = "0.2.186"
 rand = "0.9"
 rpassword = "7.5.4"
-russh = "0.62"
 russh-sftp = "2.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -54,3 +54,32 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "i
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+russh = "0.62"
+
+[target.'cfg(windows)'.dependencies]
+# aws-lc's Windows build requires external NASM/CMake tooling. Keep the
+# existing backend on released Unix platforms while using russh's supported
+# pure Cargo/MSVC-friendly backend for the Windows package.
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring", "rsa"] }
+windows = { version = "0.62.2", features = [
+    "Security_Credentials_UI",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[patch.crates-io]
+# pageant 0.2.x declares Rust 1.85 but uses let-chains stabilized later.
+# Keep russh's Windows agent support while carrying the minimal MSRV fix.
+pageant = { path = "vendor/pageant-0.2.0" }

@@ -8,11 +8,11 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ mod sftp;
 mod spool;
 
 pub use sftp::{DownloadTransfer, UploadTransfer, begin_get, begin_put};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use spool::{
     MAX_ENCODED_SPOOL_NAME_BYTES, MAX_SPOOL_DIR_BYTES, MAX_SPOOL_FILE_BYTES, MAX_SPOOL_ROOT_BYTES,
     SPOOL_LIMIT_MARKER, SpoolLedger, cleanup_spool_dir_preserving, cleanup_spool_root,
@@ -1332,7 +1332,7 @@ async fn reap_idle_sessions() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
