@@ -5,7 +5,7 @@ export type HostMode = 'add' | 'edit' | 'delete' | null;
 export type HostForm = {
   alias: string;
   hostname: string;
-  port: string;
+  port: string | number;
   user: string;
   auth: HostSummary['auth'];
   password: string;
@@ -74,7 +74,8 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
     return { ok: false, error: 'Alias and hostname are required.' };
   }
 
-  const port = form.port.trim() ? Number(form.port) : null;
+  const portValue = String(form.port).trim();
+  const port = portValue ? Number(portValue) : null;
   if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
     return { ok: false, error: 'Port must be an integer from 1 to 65535.' };
   }

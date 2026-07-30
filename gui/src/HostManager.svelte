@@ -315,7 +315,14 @@
 
   async function saveHost() {
     if (activeAction !== null) return;
-    const submission = buildHostSubmission(form, mode);
+    let submission;
+    try {
+      submission = buildHostSubmission(form, mode);
+    } catch (cause) {
+      const message = errorMessage(cause);
+      formError = message;
+      return;
+    }
     if (!submission.ok) {
       formError = submission.error;
       return;

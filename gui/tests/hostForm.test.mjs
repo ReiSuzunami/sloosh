@@ -74,3 +74,15 @@ test('host validation rejects invalid port and routes', () => {
   form.proxyJump = '   ';
   assert.match(hostForm.buildHostSubmission(form, 'add').error, /ProxyJump/);
 });
+
+test('numeric values from an input[type=number] are accepted', () => {
+  const form = hostForm.emptyHostForm();
+  form.alias = 'jump';
+  form.hostname = 'jump.example.com';
+  form.port = 56875;
+
+  const result = hostForm.buildHostSubmission(form, 'add');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.value.host.port, 56875);
+});

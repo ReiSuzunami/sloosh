@@ -1,6 +1,6 @@
 [package]
 name = "sloosh-desktop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -17,7 +17,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-sloosh = { version = "=0.2.2", path = "../.." }
+sloosh = { version = "=0.2.3", path = "../.." }
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-dialog = "=2.7.2"
 
