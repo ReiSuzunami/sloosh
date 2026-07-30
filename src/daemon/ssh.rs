@@ -26,7 +26,6 @@
 //! today.
 
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,12 +43,14 @@ use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::transport::unix::sloosh_home;
 
 mod config;
+mod known_hosts;
 mod route;
 
 pub use config::{HostConfig, IdentityAgentValue, SshConfig, SshConfigError};
 use config::{current_user, expand_tilde, home_dir};
 #[cfg(test)]
 use config::{glob_match, host_patterns_match};
+pub(crate) use known_hosts::{HostKeyTrustState, KnownHostMutation, KnownHostSource};
 #[cfg(test)]
 pub(crate) use route::ForwardRouteState;
 pub(crate) use route::{ForwardRoute, ForwardRouteLifecycle};
@@ -153,6 +154,24 @@ pub enum SshError {
         port: u16,
         line: usize,
     },
+
+    #[error(
+        "the stored host-key state changed before it could be updated; inspect the current \
+         endpoint and fingerprints again"
+    )]
+    HostKeyStateChanged,
+
+    #[error(
+        "the matching entry in ~/.sloosh/known_hosts is not a single Sloosh-managed host line, \
+         so it cannot be replaced safely; update that entry manually"
+    )]
+    HostKeyNotReplaceable,
+
+    #[error("refusing to update unsafe ~/.sloosh/known_hosts state: {reason}")]
+    UnsafeKnownHosts { reason: &'static str },
+
+    #[error("refusing to read ~/.sloosh/known_hosts because it exceeds the 1 MiB safety limit")]
+    KnownHostsTooLarge,
 
     #[error(
         "could not check the server's key against known_hosts — make sure ~/.ssh/known_hosts \
@@ -515,6 +534,20 @@ pub fn host_has_known_key(hostname: &str, port: u16) -> bool {
     )
 }
 
+pub(crate) fn inspect_host_key_trust(
+    hostname: &str,
+    port: u16,
+    observed: &PublicKey,
+) -> Result<HostKeyTrustState, SshError> {
+    known_hosts::inspect_at_paths(
+        hostname,
+        port,
+        observed,
+        &ssh_known_hosts_path(),
+        &sloosh_known_hosts_path(),
+    )
+}
+
 fn host_has_known_key_at_paths(
     hostname: &str,
     port: u16,
@@ -662,11 +695,28 @@ pub fn record_sloosh_known_host(
     port: u16,
     key: &PublicKey,
 ) -> Result<(), SshError> {
-    let path = sloosh_known_hosts_path();
-    russh::keys::known_hosts::learn_known_hosts_path(hostname, port, key, &path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| SshError::KnownHosts(russh::keys::Error::IO(e)))?;
-    Ok(())
+    known_hosts::commit_at_path(
+        &sloosh_known_hosts_path(),
+        hostname,
+        port,
+        key,
+        KnownHostMutation::Add,
+    )
+}
+
+pub(crate) fn replace_sloosh_known_host(
+    hostname: &str,
+    port: u16,
+    key: &PublicKey,
+    stored_fingerprint: &str,
+) -> Result<(), SshError> {
+    known_hosts::commit_at_path(
+        &sloosh_known_hosts_path(),
+        hostname,
+        port,
+        key,
+        KnownHostMutation::Replace { stored_fingerprint },
+    )
 }
 
 /// Resolve `alias` to the endpoint an actual connection would dial, with

@@ -38,6 +38,7 @@ sloosh host list
 sloosh host show myhost
 sloosh host add myhost --hostname server.example.com --user deploy --auth agent
 sloosh host edit myhost --port 2222
+sloosh host trust myhost
 sloosh host rm myhost
 ```
 
@@ -90,13 +91,20 @@ secret, and is cleared after submission. A private-key path can be typed
 directly when Finder hides `.ssh`, or selected with the file picker.
 
 Each host row also provides manual host-key trust and an end-to-end connection
-test. Trust shows the exact resolved endpoint and SHA256 fingerprint. Compare
-it with an independent source and confirm it explicitly; Sloosh re-resolves and
-re-probes before recording the key, and never replaces a mismatched known key.
-ProxyJump keys are presented dependency-first. Test connection requests a
-normal human-approved lease and verifies the TCP connection, SSH handshake,
-host key, configured authentication, and remote shell before cleaning up its
-reserved test session.
+test. Trust shows the exact resolved endpoint, key algorithm, and SHA256
+fingerprint. A changed key shows both stored and newly observed fingerprints
+plus the owning file. Compare the new value with an independent source before
+choosing the direct Add or Replace action. Sloosh re-resolves and re-probes
+before changing only `~/.sloosh/known_hosts`; it never modifies
+`~/.ssh/known_hosts`. If the preview changes, the dialog refreshes without
+writing. ProxyJump keys are presented dependency-first.
+
+`sloosh host trust myhost` provides the same human-only flow in a terminal.
+The connection-test action opens this trust dialog first when needed. After a
+successful Add or Replace, it automatically retries the normal
+human-approved lease and verifies the TCP connection, SSH handshake, host key,
+configured authentication, and remote shell before cleaning up its reserved
+test session.
 
 The app locks the vault session after its configured idle period and on system
 sleep, screen lock, user switch, manual lock, app exit, or the absolute session

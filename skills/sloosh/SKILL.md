@@ -60,6 +60,7 @@ of guessing.
 
 ```
 sloosh request myhost                       # ask a human to authorize myhost
+sloosh host trust myhost                    # human-only: inspect/add/replace a host key
 sloosh run myhost "npm test"                 # run a command in myhost's default session
 sloosh peek myhost                           # incremental output since your last peek
 sloosh put myhost ./build.tar.gz /srv/app/   # upload a local file over the same connection
@@ -86,7 +87,7 @@ sloosh status                                # daemon/lease/session overview —
   going), use `sloosh peek <host>` to follow up incrementally — do not
   re-run the command.
 - **Never ask the user for a password or key.** Host management
-  (`sloosh host add/edit/rm/list/show`) is something the user does themselves, interactively, in
+  (`sloosh host add/edit/trust/rm/list/show`) is something the user does themselves, interactively, in
   their own terminal. If a host isn't set up yet, tell them to run
   `sloosh host add` and wait. Humans may choose SSH agent, password, or an
   unencrypted Ed25519/ECDSA key-file profile plus direct, managed-host, or
@@ -95,6 +96,11 @@ sloosh status                                # daemon/lease/session overview —
 - `sloosh init`, `sloosh approve`, and every `sloosh host` command are human-only.
   Never work around their TTY checks. The Agent Skill cannot approve leases,
   initialize the vault, or grant itself new authority.
+- If an operation reports an unknown or changed host key, ask the user to open
+  Hosts in the desktop app or run `sloosh host trust <alias>` themselves, then
+  stop and wait. The user must compare the shown new fingerprint with an
+  independent source and choose Add/Replace/Recheck/Cancel. Never invoke the
+  trust command, edit either known_hosts file, or auto-accept a changed key.
 - Sessions keep their working directory and environment between calls; you
   don't need to `cd` back into place or re-`export` things every time.
 - `put` truncates an existing remote destination; check the path first. A

@@ -50,7 +50,17 @@ export type HostKeyPreview = {
   host: string;
   hostname: string;
   port: number;
+  algorithm: string;
   fingerprint: string;
+  state: 'new' | 'changed' | 'external_mismatch';
+  source: 'sloosh' | 'open_ssh' | null;
+  storedFingerprint: string | null;
+  replaceable: boolean;
+};
+
+export type HostKeyActionResult = {
+  preview: HostKeyPreview | null;
+  refreshed: boolean;
 };
 
 export type View = 'overview' | 'hosts' | 'security' | 'setup';

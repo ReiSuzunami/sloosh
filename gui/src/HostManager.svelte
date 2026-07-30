@@ -8,6 +8,7 @@
     Cable,
     Check,
     CircleAlert,
+    Copy,
     FileKey2,
     Fingerprint,
     FolderOpen,
@@ -31,6 +32,7 @@
   } from './hostForm';
   import type {
     AppSnapshot,
+    HostKeyActionResult,
     HostKeyPreview,
     HostSummary,
     VaultUnlockSnapshot,
@@ -56,7 +58,8 @@
   let formError = $state<string | null>(null);
   let form = $state<HostForm>(emptyHostForm());
   let keyPreview = $state<HostKeyPreview | null>(null);
-  let trustConfirmed = $state(false);
+  let keyPreviewMessage = $state<string | null>(null);
+  let retryConnectionAlias = $state<string | null>(null);
   let reducedMotion = $state(false);
   let unlock = $state<VaultUnlockSnapshot>({
     state: 'locked',
@@ -99,7 +102,11 @@
   function modal(node: HTMLDialogElement) {
     node.showModal();
     requestAnimationFrame(() => {
-      node.querySelector<HTMLInputElement>('input:not(:disabled)')?.focus();
+      node
+        .querySelector<HTMLElement>(
+          'input:not(:disabled), button:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        )
+        ?.focus();
     });
   }
 
@@ -158,7 +165,8 @@
       selected = null;
       formError = null;
       keyPreview = null;
-      trustConfirmed = false;
+      keyPreviewMessage = null;
+      retryConnectionAlias = null;
     } else if (wasLocked && hosts === null && activeAction === null) {
       queueMicrotask(() => void loadHosts());
     }
@@ -387,26 +395,29 @@
     }
   }
 
-  async function previewHostKey(host: HostSummary) {
+  async function loadHostKeyPreview(alias: string): Promise<HostKeyPreview | null> {
+    return invoke<HostKeyPreview | null>('preview_host_key', { alias });
+  }
+
+  async function previewHostKey(host: HostSummary, retryConnection = false) {
     if (activeAction !== null) return;
     activeAction = `preview_host_key:${host.alias}`;
     error = null;
     success = null;
+    keyPreviewMessage = null;
+    retryConnectionAlias = retryConnection ? host.alias : null;
     try {
-      const preview = await invoke<HostKeyPreview | null>('preview_host_key', {
-        alias: host.alias,
-      });
+      const preview = await loadHostKeyPreview(host.alias);
       if (preview) {
         keyPreview = preview;
-        trustConfirmed = false;
       } else {
         keyPreview = null;
-        trustConfirmed = false;
-        success = `All host keys for ${host.alias} are already recorded.`;
+        retryConnectionAlias = null;
+        success = `All host keys for ${host.alias} are trusted.`;
       }
     } catch (cause) {
       keyPreview = null;
-      trustConfirmed = false;
+      retryConnectionAlias = null;
       error = errorMessage(cause);
     } finally {
       activeAction = null;
@@ -416,29 +427,74 @@
   function closeKeyPreview() {
     if (activeAction !== null) return;
     keyPreview = null;
-    trustConfirmed = false;
+    keyPreviewMessage = null;
+    retryConnectionAlias = null;
+    error = null;
+    success = null;
   }
 
-  async function trustHostKey() {
-    if (!keyPreview || !trustConfirmed || activeAction !== null) return;
-    const trustedHost = keyPreview.host;
+  async function recheckHostKey() {
+    if (!keyPreview || activeAction !== null) return;
     const requestedHost = keyPreview.requestedHost;
-    activeAction = `trust_host_key:${trustedHost}`;
+    activeAction = `preview_host_key:${requestedHost}`;
+    keyPreviewMessage = null;
     error = null;
     success = null;
     try {
-      const next = await invoke<HostKeyPreview | null>('trust_host_key', {
-        preview: keyPreview,
-      });
-      keyPreview = next;
-      trustConfirmed = false;
-      if (!next) {
+      keyPreview = await loadHostKeyPreview(requestedHost);
+      if (!keyPreview) {
+        retryConnectionAlias = null;
         success = `All host keys for ${requestedHost} are trusted.`;
       }
     } catch (cause) {
-      keyPreview = null;
-      trustConfirmed = false;
-      error = errorMessage(cause);
+      keyPreviewMessage = errorMessage(cause);
+    } finally {
+      activeAction = null;
+    }
+  }
+
+  async function copyFingerprint() {
+    if (!keyPreview || activeAction !== null) return;
+    try {
+      await navigator.clipboard.writeText(keyPreview.fingerprint);
+      keyPreviewMessage = 'New fingerprint copied.';
+    } catch (cause) {
+      keyPreviewMessage = `Could not copy fingerprint: ${errorMessage(cause)}`;
+    }
+  }
+
+  async function applyHostKeyAction() {
+    if (!keyPreview || !keyPreview.replaceable || activeAction !== null) return;
+    const trustedHost = keyPreview.host;
+    const requestedHost = keyPreview.requestedHost;
+    const action = keyPreview.state === 'new' ? 'add' : 'replace';
+    activeAction = `trust_host_key:${trustedHost}`;
+    error = null;
+    success = null;
+    keyPreviewMessage = null;
+    try {
+      const result = await invoke<HostKeyActionResult>('trust_host_key', {
+        preview: keyPreview,
+        action,
+      });
+      keyPreview = result.preview;
+      if (result.refreshed) {
+        keyPreviewMessage = result.preview
+          ? 'The remote key changed while this dialog was open. Review the refreshed details.'
+          : 'The stored host-key state changed; all keys are trusted now.';
+        retryConnectionAlias = result.preview ? retryConnectionAlias : null;
+      } else if (!result.preview) {
+        const retryAlias = retryConnectionAlias;
+        retryConnectionAlias = null;
+        if (retryAlias) {
+          activeAction = `test_host_connection:${retryAlias}`;
+          success = await invoke<string>('test_host_connection', { alias: retryAlias });
+        } else {
+          success = `All host keys for ${requestedHost} are trusted.`;
+        }
+      }
+    } catch (cause) {
+      keyPreviewMessage = errorMessage(cause);
     } finally {
       activeAction = null;
     }
@@ -446,9 +502,9 @@
 
   async function testHostConnection(host: HostSummary) {
     if (activeAction !== null) return;
+    await previewHostKey(host, true);
+    if (keyPreview || error) return;
     activeAction = `test_host_connection:${host.alias}`;
-    error = null;
-    success = null;
     try {
       success = await invoke<string>('test_host_connection', { alias: host.alias });
     } catch (cause) {
@@ -781,6 +837,11 @@
       class="host-dialog confirm-dialog host-key-dialog"
       aria-modal="true"
       aria-labelledby="trust-host-key-title"
+      aria-describedby="trust-host-key-description trust-host-key-boundary"
+      oncancel={(event) => {
+        event.preventDefault();
+        closeKeyPreview();
+      }}
       in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
       out:fade={{ duration: exitDuration }}
     >
@@ -794,37 +855,73 @@
           title="Close"
         ><X size={17} /></button>
         <div>
-          <p class="section-kicker">Manual trust</p>
-          <h2 id="trust-host-key-title">Verify {keyPreview.host}</h2>
+          <p class="section-kicker">
+            {keyPreview.state === 'new' ? 'Untrusted remote key' : 'Remote key changed'}
+          </p>
+          <h2 id="trust-host-key-title">
+            {keyPreview.state === 'new' ? `Trust ${keyPreview.host}?` : `Review ${keyPreview.host}`}
+          </h2>
         </div>
       </header>
-      <p>
-        Sloosh reached this endpoint through the configured route. Compare the fingerprint with
-        a trusted, independent source before recording it.
+      <p id="trust-host-key-description">
+        {#if keyPreview.state === 'new'}
+          Sloosh has not trusted this endpoint yet. Compare the fingerprint with a trusted,
+          independent source before adding it.
+        {:else}
+          The endpoint presented a different key. Verify why it changed through an independent
+          channel before replacing anything.
+        {/if}
       </p>
       <dl class="host-key-details">
         <div><dt>Requested host</dt><dd>{keyPreview.requestedHost}</dd></div>
         <div><dt>Key belongs to</dt><dd>{keyPreview.host}</dd></div>
         <div><dt>Endpoint</dt><dd>{keyPreview.hostname.includes(':') ? `[${keyPreview.hostname}]:${keyPreview.port}` : `${keyPreview.hostname}:${keyPreview.port}`}</dd></div>
-        <div><dt>SHA256 fingerprint</dt><dd><code>{keyPreview.fingerprint}</code></dd></div>
+        <div><dt>Algorithm</dt><dd><code>{keyPreview.algorithm}</code></dd></div>
+        {#if keyPreview.storedFingerprint}
+          <div><dt>Stored fingerprint</dt><dd><code>{keyPreview.storedFingerprint}</code></dd></div>
+        {/if}
+        <div><dt>New fingerprint</dt><dd><code>{keyPreview.fingerprint}</code></dd></div>
+        {#if keyPreview.source}
+          <div>
+            <dt>Stored in</dt>
+            <dd><code>{keyPreview.source === 'sloosh' ? '~/.sloosh/known_hosts' : '~/.ssh/known_hosts'}</code></dd>
+          </div>
+        {/if}
       </dl>
-      <label class="trust-confirmation">
-        <input bind:checked={trustConfirmed} type="checkbox" />
-        <span>I independently verified this exact endpoint and fingerprint.</span>
-      </label>
-      <p class="trust-boundary">
-        A changed or mismatched key is never replaced here. Sloosh re-probes immediately before
-        writing <code>~/.sloosh/known_hosts</code>.
+      <p class="trust-boundary" id="trust-host-key-boundary">
+        {#if keyPreview.state === 'external_mismatch'}
+          This conflict comes from <code>~/.ssh/known_hosts</code>. Sloosh will not modify it;
+          resolve that entry manually, then recheck.
+        {:else if keyPreview.state === 'changed' && !keyPreview.replaceable}
+          This Sloosh entry is not a single replaceable host line. Update it manually, then recheck.
+        {:else}
+          Sloosh re-resolves and re-probes immediately before changing only
+          <code>~/.sloosh/known_hosts</code>.
+        {/if}
       </p>
+      {#if keyPreviewMessage}<p class="dialog-status" role="status">{keyPreviewMessage}</p>{/if}
       <footer>
         <button class="secondary-button" onclick={closeKeyPreview} disabled={activeAction !== null}>Cancel</button>
-        <button
-          class="primary-button"
-          onclick={() => void trustHostKey()}
-          disabled={!trustConfirmed || activeAction !== null}
-        >
-          {activeAction?.startsWith('trust_host_key:') ? 'Verifying again...' : 'Trust and continue'}
+        <button class="secondary-button" onclick={() => void copyFingerprint()} disabled={activeAction !== null}>
+          <Copy size={15} /> {keyPreview.state === 'new' ? 'Copy fingerprint' : 'Copy new'}
         </button>
+        <button class="secondary-button" onclick={() => void recheckHostKey()} disabled={activeAction !== null}>
+          <RefreshCw size={15} /> Recheck
+        </button>
+        {#if keyPreview.replaceable}
+        <button
+          class:destructive={keyPreview.state === 'changed'}
+          class="primary-button"
+          onclick={() => void applyHostKeyAction()}
+          disabled={activeAction !== null}
+        >
+          {activeAction?.startsWith('trust_host_key:')
+            ? 'Verifying again...'
+            : keyPreview.state === 'new'
+              ? 'Trust and retry'
+              : 'Replace + retry'}
+        </button>
+        {/if}
       </footer>
     </dialog>
 {/if}

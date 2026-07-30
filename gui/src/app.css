@@ -937,18 +937,9 @@ dd.positive { color: var(--success); }
 .host-key-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 0.78rem; }
 .host-key-details code { color: var(--ink); font-size: 0.72rem; }
 
-.trust-confirmation {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: start;
-  gap: var(--space-sm);
-  color: var(--ink);
-  font-size: 0.8125rem;
-  line-height: 1.45;
-}
-
-.trust-confirmation input { width: 1rem; height: 1rem; margin-top: 0.1rem; accent-color: var(--brand-ink); }
 .trust-boundary { color: var(--muted); font-size: 0.72rem; line-height: 1.5; }
+.dialog-status { margin: var(--space-md) 0 0; color: var(--brand-ink); font-size: 0.78rem; }
+.host-key-dialog footer { flex-wrap: wrap; }
 
 .route-preview {
   display: flex;

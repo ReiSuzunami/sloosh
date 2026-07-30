@@ -109,6 +109,16 @@ fn init_refuses_non_tty_before_installing_the_skill() {
 }
 
 #[test]
+fn host_trust_refuses_non_tty_before_prompting_for_a_secret() {
+    let home = TestHome::new("host-trust-non-tty");
+    let output = sloosh(home.path(), &["host", "trust", "example"]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("human-only command"), "{stderr}");
+    assert!(!stderr.contains("Master password"), "{stderr}");
+}
+
+#[test]
 fn embedded_skill_explains_split_cli_and_desktop_approval() {
     assert!(EMBEDDED_SKILL.contains("optional desktop"));
     assert!(EMBEDDED_SKILL.contains("control plane and does not install the CLI"));
@@ -116,6 +126,8 @@ fn embedded_skill_explains_split_cli_and_desktop_approval() {
     assert!(EMBEDDED_SKILL.contains("Always Allow"));
     assert!(EMBEDDED_SKILL.contains("command-line-only installs"));
     assert!(EMBEDDED_SKILL.contains("sloosh approve <ID>"));
+    assert!(EMBEDDED_SKILL.contains("sloosh host trust <alias>"));
+    assert!(EMBEDDED_SKILL.contains("Never invoke the"));
 }
 
 #[test]

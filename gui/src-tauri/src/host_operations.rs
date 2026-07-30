@@ -1,7 +1,10 @@
 //! Human-owned host-key bootstrap and end-to-end SSH connection checks.
 
 use serde::{Deserialize, Serialize};
-use sloosh::human_host_key::{self, HostKeyTrustPreview};
+use sloosh::human_host_key::{
+    self, HostKeyTrustAction, HostKeyTrustError, HostKeyTrustPreview, HostKeyTrustSource,
+    HostKeyTrustState,
+};
 use sloosh::proto::{Request, Response};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +20,12 @@ pub(crate) struct HostKeyPreview {
     host: String,
     hostname: String,
     port: u16,
+    algorithm: String,
     fingerprint: String,
+    state: HostKeyTrustState,
+    source: Option<HostKeyTrustSource>,
+    stored_fingerprint: Option<String>,
+    replaceable: bool,
 }
 
 impl From<HostKeyTrustPreview> for HostKeyPreview {
@@ -27,7 +35,12 @@ impl From<HostKeyTrustPreview> for HostKeyPreview {
             host: preview.host,
             hostname: preview.hostname,
             port: preview.port,
+            algorithm: preview.algorithm,
             fingerprint: preview.fingerprint,
+            state: preview.state,
+            source: preview.source,
+            stored_fingerprint: preview.stored_fingerprint,
+            replaceable: preview.replaceable,
         }
     }
 }
@@ -39,9 +52,21 @@ impl From<HostKeyPreview> for HostKeyTrustPreview {
             host: preview.host,
             hostname: preview.hostname,
             port: preview.port,
+            algorithm: preview.algorithm,
             fingerprint: preview.fingerprint,
+            state: preview.state,
+            source: preview.source,
+            stored_fingerprint: preview.stored_fingerprint,
+            replaceable: preview.replaceable,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostKeyActionResult {
+    preview: Option<HostKeyPreview>,
+    refreshed: bool,
 }
 
 async fn next_host_key_preview(
@@ -67,14 +92,24 @@ pub(crate) async fn preview_host_key(
 pub(crate) async fn trust_host_key(
     controller: tauri::State<'_, Controller>,
     preview: HostKeyPreview,
-) -> Result<Option<HostKeyPreview>, String> {
+    action: HostKeyTrustAction,
+) -> Result<HostKeyActionResult, String> {
     let controller = controller.inner().clone();
     let requested_host = preview.requested_host.clone();
     let master_password = controller.master_password()?;
-    human_host_key::trust_host_key(&preview.into(), &master_password)
-        .await
-        .map_err(|error| error.to_string())?;
-    next_host_key_preview(&controller, &requested_host).await
+    match human_host_key::apply_host_key_action(&preview.into(), action, &master_password).await {
+        Ok(()) => Ok(HostKeyActionResult {
+            preview: next_host_key_preview(&controller, &requested_host).await?,
+            refreshed: false,
+        }),
+        Err(HostKeyTrustError::PreviewChanged | HostKeyTrustError::AlreadyTrusted) => {
+            Ok(HostKeyActionResult {
+                preview: next_host_key_preview(&controller, &requested_host).await?,
+                refreshed: true,
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn connection_test_session() -> String {
@@ -176,7 +211,12 @@ mod tests {
             host: "jump".into(),
             hostname: "jump.example.com".into(),
             port: 2222,
+            algorithm: "ssh-ed25519".into(),
             fingerprint: "SHA256:example".into(),
+            state: HostKeyTrustState::Changed,
+            source: Some(HostKeyTrustSource::Sloosh),
+            stored_fingerprint: Some("SHA256:old".into()),
+            replaceable: true,
         };
         let desktop = HostKeyPreview::from(core.clone());
         assert_eq!(HostKeyTrustPreview::from(desktop), core);

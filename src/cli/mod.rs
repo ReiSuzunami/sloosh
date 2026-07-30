@@ -33,7 +33,7 @@ use daemon_cmd::{cmd_daemon, cmd_status};
 #[cfg(test)]
 use daemon_cmd::{daemon_connect_error, daemon_is_not_running_error};
 use forward::cmd_forward;
-use host::{cmd_add, cmd_host_edit, cmd_host_list, cmd_host_show, cmd_rm};
+use host::{cmd_add, cmd_host_edit, cmd_host_list, cmd_host_show, cmd_host_trust, cmd_rm};
 #[cfg(test)]
 use host::{display_host_endpoint, escape_terminal_controls};
 use log::cmd_log;
@@ -67,6 +67,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             HostAction::Show(args) => cmd_host_show(args).await,
             HostAction::Add(args) => cmd_add(args).await,
             HostAction::Edit(args) => cmd_host_edit(args).await,
+            HostAction::Trust(args) => cmd_host_trust(args).await,
             HostAction::Rm(args) => cmd_rm(args).await,
         },
         Command::Add(args) => cmd_add(args).await,

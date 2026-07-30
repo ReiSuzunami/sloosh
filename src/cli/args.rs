@@ -227,6 +227,8 @@ pub enum HostAction {
     Add(AddArgs),
     /// Edit an existing vault-backed host. Alias cannot be changed.
     Edit(HostEditArgs),
+    /// Inspect and explicitly trust a new or changed remote host key.
+    Trust(HostTrustArgs),
     /// Remove a vault-backed host.
     Rm(RmArgs),
 }
@@ -245,6 +247,12 @@ pub struct HostShowArgs {
     /// Print machine-readable JSON instead of labeled fields.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct HostTrustArgs {
+    /// Vault-backed host alias whose route should be checked dependency-first.
+    pub alias: String,
 }
 
 #[derive(Debug, Args)]
@@ -569,7 +577,7 @@ mod tests {
         let host = command
             .find_subcommand_mut("host")
             .expect("host subcommand");
-        for action in ["list", "show", "add", "edit", "rm"] {
+        for action in ["list", "show", "add", "edit", "trust", "rm"] {
             assert!(
                 host.find_subcommand_mut(action).is_some(),
                 "missing host {action}"

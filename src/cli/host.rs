@@ -1,7 +1,13 @@
 //! Vault-backed host inventory and credential enrollment commands.
 
-use super::args::{AddArgs, HostAuthArg, HostEditArgs, HostListArgs, HostShowArgs, RmArgs};
+use super::args::{
+    AddArgs, HostAuthArg, HostEditArgs, HostListArgs, HostShowArgs, HostTrustArgs, RmArgs,
+};
 use super::{bail_on_error_or_unexpected, prompt_master_password, require_tty, send_request};
+use crate::human_host_key::{
+    self, HostKeyTrustAction, HostKeyTrustError, HostKeyTrustPreview, HostKeyTrustSource,
+    HostKeyTrustState,
+};
 use crate::proto::{self, HostAuth, HostRoute, HostSummary, Request, Response, SecretString};
 
 pub(super) async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
@@ -108,6 +114,115 @@ pub(super) async fn cmd_host_show(args: HostShowArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_host_key_preview(preview: &HostKeyTrustPreview) {
+    println!();
+    println!(
+        "{}",
+        match preview.state {
+            HostKeyTrustState::New => "REMOTE HOST KEY IS NOT TRUSTED",
+            HostKeyTrustState::Changed | HostKeyTrustState::ExternalMismatch =>
+                "WARNING: REMOTE HOST KEY HAS CHANGED",
+        }
+    );
+    println!(
+        "Host:        {} ({})",
+        escape_terminal_controls(&preview.host),
+        escape_terminal_controls(&preview.requested_host)
+    );
+    println!(
+        "Endpoint:    {}:{}",
+        escape_terminal_controls(&preview.hostname),
+        preview.port
+    );
+    println!(
+        "Algorithm:   {}",
+        escape_terminal_controls(&preview.algorithm)
+    );
+    if let Some(stored) = preview.stored_fingerprint.as_deref() {
+        println!("Stored key:  {}", escape_terminal_controls(stored));
+    }
+    println!(
+        "New key:     {}",
+        escape_terminal_controls(&preview.fingerprint)
+    );
+    if let Some(source) = preview.source {
+        println!(
+            "Stored in:   {}",
+            match source {
+                HostKeyTrustSource::Sloosh => "~/.sloosh/known_hosts",
+                HostKeyTrustSource::OpenSsh => "~/.ssh/known_hosts",
+            }
+        );
+    }
+    println!(
+        "Verify the new fingerprint through a trusted, independent channel before continuing."
+    );
+}
+
+fn prompt_host_key_action(
+    preview: &HostKeyTrustPreview,
+) -> anyhow::Result<Option<HostKeyTrustAction>> {
+    let prompt = match preview.state {
+        HostKeyTrustState::New => "[a]dd, [r]echeck, or [c]ancel? ",
+        HostKeyTrustState::Changed if preview.replaceable => "[p]replace, [r]echeck, or [c]ancel? ",
+        HostKeyTrustState::Changed | HostKeyTrustState::ExternalMismatch => {
+            "[r]echeck or [c]ancel? "
+        }
+    };
+    loop {
+        eprint!("{prompt}");
+        use std::io::Write as _;
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "a" | "add" if preview.state == HostKeyTrustState::New => {
+                return Ok(Some(HostKeyTrustAction::Add));
+            }
+            "p" | "replace"
+                if preview.state == HostKeyTrustState::Changed && preview.replaceable =>
+            {
+                return Ok(Some(HostKeyTrustAction::Replace));
+            }
+            "r" | "recheck" => return Ok(None),
+            "c" | "cancel" | "" => anyhow::bail!("host-key trust cancelled"),
+            _ => eprintln!("Choose one of the actions shown."),
+        }
+    }
+}
+
+pub(super) async fn cmd_host_trust(args: HostTrustArgs) -> anyhow::Result<()> {
+    require_tty("host trust")?;
+    let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
+    loop {
+        let Some(preview) = human_host_key::preview_host_key(&args.alias, &master_password).await?
+        else {
+            println!("all host keys for '{}' are trusted", args.alias);
+            return Ok(());
+        };
+        print_host_key_preview(&preview);
+        if matches!(preview.state, HostKeyTrustState::ExternalMismatch) {
+            eprintln!(
+                "Sloosh will not modify ~/.ssh/known_hosts; resolve that entry manually, then recheck."
+            );
+        } else if !preview.replaceable {
+            eprintln!(
+                "This entry is not a single Sloosh-managed host line; update it manually, then recheck."
+            );
+        }
+        let Some(action) = prompt_host_key_action(&preview)? else {
+            continue;
+        };
+        match human_host_key::apply_host_key_action(&preview, action, &master_password).await {
+            Ok(()) => {}
+            Err(HostKeyTrustError::PreviewChanged | HostKeyTrustError::AlreadyTrusted) => {
+                eprintln!("Host-key state changed; refreshing before any write.");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 pub(super) async fn cmd_host_edit(args: HostEditArgs) -> anyhow::Result<()> {

@@ -232,14 +232,22 @@ flow or from the unlocked desktop Hosts screen, then retry. Native success uses
 existing `RequestLease -> Ok`; bearer lease token never returns to the
 requesting process. Password approval remains supported on every platform.
 
-Human CLI approval and the desktop Hosts trust flow confirm missing host keys
-in dependency order. Each jump is trusted before targets reached through it. A
-target probe follows the real ProxyJump route: intermediate hops use strict
-verification and normal authentication; only the final unknown target captures
-a key, stopping before authentication. Desktop confirmation repeats route
-resolution and the probe and requires the alias, endpoint, and fingerprint to
-match the displayed preview. Rejection, change, or probe failure records
-nothing.
+Human CLI approval, `sloosh host trust`, and the desktop Hosts trust flow
+inspect host keys in dependency order. Each jump is trusted before targets
+reached through it. A target probe follows the real ProxyJump route:
+intermediate hops use strict verification and normal authentication; only the
+final actionable target captures a key, stopping before authentication.
+
+The shared trust state is `Trusted`, `Unknown`, or `Changed` with an owning
+source. A simple changed entry owned by `~/.sloosh/known_hosts` is replaceable;
+a mismatch owned by `~/.ssh/known_hosts` is displayed but never mutated.
+Before Add or Replace, the process repeats route resolution and probing and
+requires the entire human-visible preview, including old and new
+fingerprints, to match. Sloosh then locks its private trust store, verifies the
+expected old state, and atomically renames a mode-0600 replacement. Rejection,
+stale state, probe failure, or a failure before rename records nothing. Rename
+is the commit point; a later parent-directory sync failure is logged as a
+durability warning without reporting the visible change as failed.
 
 ## 5. SSH sessions and output
 

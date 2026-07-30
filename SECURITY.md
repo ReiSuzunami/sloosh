@@ -151,9 +151,12 @@ validates the bundle signature.
 Cancellation or helper failure leaves request pending. Unknown SSH host keys
 force separate human confirmation: either the terminal approval flow or the
 unlocked desktop Hosts screen must show the resolved endpoint and SHA256
-fingerprint. Desktop confirmation re-resolves and re-probes immediately before
-recording, and a changed preview fails closed. Native success returns no bearer
-lease token to requester.
+fingerprint. New and changed keys are separate states; a changed key displays
+both fingerprints and the owning trust file. Desktop confirmation re-resolves
+and re-probes immediately before Add or Replace, and a changed preview refreshes
+without writing. Only a simple entry in `~/.sloosh/known_hosts` is replaceable;
+`~/.ssh/known_hosts` is never modified. Native success returns no bearer lease
+token to requester.
 
 The PIN verifier is Argon2id with a random salt and versioned parameters in
 `~/.sloosh/approval-pin.json`. The file is bounded, owner-only, symlink-refused,
@@ -373,13 +376,23 @@ probe stops before authenticating to that target.
 No key is recorded without human confirmation. Probe failure or rejection
 leaves the host unknown, and real SSH connection attempts remain fail closed.
 
-The desktop Hosts screen exposes the same bootstrap as an explicit manual
-operation. It temporarily unlocks a process-local vault cache, probes only the
-first still-unknown key in dependency order, and clears that cache after each
-operation. Before writing, it independently unlocks again, re-resolves the
-route, and re-probes; alias, endpoint, and SHA256 fingerprint must match the
-human-confirmed preview. Existing known keys are never replaced through this
-flow, so a mismatch remains a hard failure requiring separate investigation.
+The desktop Hosts screen and `sloosh host trust` expose the same bootstrap as
+an explicit human-only operation. It temporarily unlocks a process-local vault
+cache, probes only the first actionable key in dependency order, and clears
+that cache after each operation. Before writing, it independently unlocks
+again, re-resolves the route, and re-probes; alias, endpoint, algorithm, state,
+source, and old/new SHA256 fingerprints must match the human-reviewed preview.
+
+Unknown keys may be added. A changed key may be replaced only when the old
+entry is one simple Sloosh-managed host line in `~/.sloosh/known_hosts`.
+Mismatches sourced from `~/.ssh/known_hosts`, hashed entries, multi-host lines,
+and ambiguous duplicates remain hard failures requiring manual investigation.
+Sloosh serializes cooperating writers with an owner-only lock, verifies the
+expected old fingerprint under that lock, and atomically renames a mode-0600
+file. A stale preview, rejected action, failed probe, or pre-rename write
+failure does not commit a trust change. Rename is the commit point; a later
+parent-directory sync failure is logged instead of falsely reporting an
+uncommitted operation.
 
 The desktop connection test does not bypass leases. It requests an ordinary
 exact-scope lease, runs `true` in a fresh reserved PTY session, and then kills

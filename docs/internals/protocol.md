@@ -365,9 +365,11 @@ expire independently.
 ## 9. Host-key confirmation
 
 Host-key probing happens in the human CLI approval flow or the unlocked desktop
-Hosts screen; it is not a wire subprotocol. The desktop connection test reuses
-the existing `RequestLease`, `Run`, and `Kill` messages, so it adds no protocol
-shape or sequencing. Component flow belongs to
+Hosts screen; `sloosh host trust` and Add/Replace of
+`~/.sloosh/known_hosts` are local human-client operations, not a wire
+subprotocol. The desktop connection test reuses the existing `RequestLease`,
+`Run`, and `Kill` messages, so these additions do not change protocol 3 shape
+or sequencing. Component flow belongs to
 [`architecture.md`](architecture.md#4-approval-proxyjump-and-host-keys) and
 security guarantees to [`SECURITY.md`](../../SECURITY.md#47-host-key-bootstrap).
 Probe failure does not roll back lease activation or create trust.

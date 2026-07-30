@@ -35,6 +35,7 @@ sloosh host list
 sloosh host show myhost
 sloosh host add myhost --hostname server.example.com --user deploy --auth agent
 sloosh host edit myhost --port 2222
+sloosh host trust myhost
 sloosh host rm myhost
 ```
 
@@ -77,10 +78,14 @@ Hosts 中输入的 SSH password 仅短暂存在，通过本地命令边界时使
 立即清空。Finder 隐藏 `.ssh` 时，可直接输入私钥完整路径，也可继续使用文件选择器。
 
 每条主机记录还提供手动 host-key 信任与端到端连接测试。信任流程会显示实际解析的
-endpoint 与 SHA256 指纹；请通过独立来源核对后明确确认。Sloosh 写入前会重新解析路由并
-重新探测，且绝不会在此流程中替换已知但不匹配的 key。ProxyJump key 按依赖顺序逐个展示。
-连接测试会请求普通的人类批准 lease，并依次验证 TCP、SSH handshake、host key、配置的
-认证方式与远端 shell，最后清理专用测试 session。
+endpoint、key algorithm 与 SHA256 指纹；key 发生变化时，同时显示旧、新指纹及其来源文件。
+请通过独立来源核对新指纹，再直接选择新增或替换。Sloosh 写入前会重新解析路由并重新探测，
+且只会修改 `~/.sloosh/known_hosts`，绝不修改 `~/.ssh/known_hosts`。若预览期间状态又有
+变化，弹窗只刷新内容，不执行写入。ProxyJump key 按依赖顺序逐个展示。
+
+终端中的 `sloosh host trust myhost` 提供同样的人类专用流程。连接测试遇到未信任或变化的
+key 时会先打开该弹窗；成功新增或替换后自动重试普通的人类批准 lease，并依次验证 TCP、
+SSH handshake、host key、配置的认证方式与远端 shell，最后清理专用测试 session。
 
 达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
 App 会锁定 vault session。凭据、超时与审批边界以
