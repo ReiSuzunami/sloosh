@@ -46,9 +46,9 @@ in-memory state and terminates sessions and forwards.
 
 Ownership is deliberate:
 
-- CLI owns argument policy, human prompts, Agent Skill installation, approval
-  preview, routed host-key probes, and every local filesystem operation for
-  SFTP.
+- CLI owns argument policy, terminal human prompts, Agent Skill installation,
+  approval preview, routed host-key probes, and every local filesystem
+  operation for SFTP.
 - Daemon owns authorization, long-lived SSH state, remote SFTP handles, PTYs,
   spool, forwards, vault mutation/cache, and audit appends.
 - A transfer `local_path` crossing the socket is an audit/display label. Daemon
@@ -76,7 +76,12 @@ Ownership is deliberate:
   command boundary as `SecretString`, and is cleared after submission. Host
   form serialization sends SSH Password or key-file path only while adding a
   profile or explicitly changing its authentication; ordinary edits send
-  neither. On macOS, the desktop process maps Tauri's system-theme events to
+  neither. The key-file path may be typed directly or selected with the native
+  file picker. Hosts also provides a human-only host-key bootstrap that
+  re-probes a confirmed endpoint/fingerprint before recording it, plus an
+  end-to-end connection test that uses an ordinary daemon lease and a
+  short-lived reserved PTY session. On macOS, the desktop process maps Tauri's
+  system-theme events to
   explicit light/dark AppKit Dock icons while the bundle icon remains the
   launch-time fallback. The bundle keeps only its private daemon at
   `Helpers/slooshd`; it contains no public `sloosh` CLI and creates no CLI link.
@@ -221,16 +226,20 @@ PIN verification is a daemon-local state machine with persistent backoff. It
 does not alter the request's Master Password failure budget. A Master Password
 selected in native UI is verified by reopening the vault, then the daemon
 recomputes and compares the exact host scope before activation. Cancellation,
-missing enrollment, helper failure, or any unknown SSH host key keeps request
-pending and returns normal terminal-approval instructions. Native success uses
-existing `RequestLease -> Ok`; bearer lease token never returns to requesting
-process. Password approval remains supported on every platform.
+missing enrollment, helper failure, or any unknown SSH host key keeps the
+request pending. The human may bootstrap missing keys in the terminal approval
+flow or from the unlocked desktop Hosts screen, then retry. Native success uses
+existing `RequestLease -> Ok`; bearer lease token never returns to the
+requesting process. Password approval remains supported on every platform.
 
-After activation, human CLI confirms missing host keys in dependency order.
-Each jump is trusted before targets reached through it. A target probe follows
-the real ProxyJump route: intermediate hops use strict verification and normal
-authentication; only final unknown target captures a key, stopping before
-authentication. Rejection or probe failure records nothing.
+Human CLI approval and the desktop Hosts trust flow confirm missing host keys
+in dependency order. Each jump is trusted before targets reached through it. A
+target probe follows the real ProxyJump route: intermediate hops use strict
+verification and normal authentication; only the final unknown target captures
+a key, stopping before authentication. Desktop confirmation repeats route
+resolution and the probe and requires the alias, endpoint, and fingerprint to
+match the displayed preview. Rejection, change, or probe failure records
+nothing.
 
 ## 5. SSH sessions and output
 

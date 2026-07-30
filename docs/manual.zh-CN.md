@@ -74,7 +74,13 @@ Sloosh PIN 与共用 vault 空闲期。这些操作不会导入 SSH 私钥，也
 Hosts 管理与 CLI 相同的 vault 主机配置，可使用 Touch ID、Sloosh PIN 或 Master
 Password 解锁。Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
 Hosts 中输入的 SSH password 仅短暂存在，通过本地命令边界时使用脱敏 secret，提交后
-立即清空。
+立即清空。Finder 隐藏 `.ssh` 时，可直接输入私钥完整路径，也可继续使用文件选择器。
+
+每条主机记录还提供手动 host-key 信任与端到端连接测试。信任流程会显示实际解析的
+endpoint 与 SHA256 指纹；请通过独立来源核对后明确确认。Sloosh 写入前会重新解析路由并
+重新探测，且绝不会在此流程中替换已知但不匹配的 key。ProxyJump key 按依赖顺序逐个展示。
+连接测试会请求普通的人类批准 lease，并依次验证 TCP、SSH handshake、host key、配置的
+认证方式与远端 shell，最后清理专用测试 session。
 
 达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
 App 会锁定 vault session。凭据、超时与审批边界以
@@ -95,8 +101,8 @@ sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
 配置完成的 macOS DMG 安装会先在原生审批弹窗中选择 Touch ID、审批 PIN 或 vault
-Master Password，再通过第二步安全认证完成请求。未知 host key 仍需人类核对指纹；
-ProxyJump 路由会在批准前完成校验。
+Master Password，再通过第二步安全认证完成请求。未知 host key 仍需人类在终端审批流程
+或已解锁的桌面 Hosts 页面核对指纹；ProxyJump 路由会在批准前完成校验。
 
 ## 持久会话
 

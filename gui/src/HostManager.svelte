@@ -29,7 +29,12 @@
     type HostForm,
     type HostMode,
   } from './hostForm';
-  import type { AppSnapshot, HostSummary, VaultUnlockSnapshot } from './types';
+  import type {
+    AppSnapshot,
+    HostKeyPreview,
+    HostSummary,
+    VaultUnlockSnapshot,
+  } from './types';
   import { canStartVaultUnlockStatusSync } from './vaultUnlock';
 
   let {
@@ -50,6 +55,8 @@
   let success = $state<string | null>(null);
   let formError = $state<string | null>(null);
   let form = $state<HostForm>(emptyHostForm());
+  let keyPreview = $state<HostKeyPreview | null>(null);
+  let trustConfirmed = $state(false);
   let reducedMotion = $state(false);
   let unlock = $state<VaultUnlockSnapshot>({
     state: 'locked',
@@ -150,6 +157,8 @@
       mode = null;
       selected = null;
       formError = null;
+      keyPreview = null;
+      trustConfirmed = false;
     } else if (wasLocked && hosts === null && activeAction === null) {
       queueMicrotask(() => void loadHosts());
     }
@@ -378,6 +387,77 @@
     }
   }
 
+  async function previewHostKey(host: HostSummary) {
+    if (activeAction !== null) return;
+    activeAction = `preview_host_key:${host.alias}`;
+    error = null;
+    success = null;
+    try {
+      const preview = await invoke<HostKeyPreview | null>('preview_host_key', {
+        alias: host.alias,
+      });
+      if (preview) {
+        keyPreview = preview;
+        trustConfirmed = false;
+      } else {
+        keyPreview = null;
+        trustConfirmed = false;
+        success = `All host keys for ${host.alias} are already recorded.`;
+      }
+    } catch (cause) {
+      keyPreview = null;
+      trustConfirmed = false;
+      error = errorMessage(cause);
+    } finally {
+      activeAction = null;
+    }
+  }
+
+  function closeKeyPreview() {
+    if (activeAction !== null) return;
+    keyPreview = null;
+    trustConfirmed = false;
+  }
+
+  async function trustHostKey() {
+    if (!keyPreview || !trustConfirmed || activeAction !== null) return;
+    const trustedHost = keyPreview.host;
+    const requestedHost = keyPreview.requestedHost;
+    activeAction = `trust_host_key:${trustedHost}`;
+    error = null;
+    success = null;
+    try {
+      const next = await invoke<HostKeyPreview | null>('trust_host_key', {
+        preview: keyPreview,
+      });
+      keyPreview = next;
+      trustConfirmed = false;
+      if (!next) {
+        success = `All host keys for ${requestedHost} are trusted.`;
+      }
+    } catch (cause) {
+      keyPreview = null;
+      trustConfirmed = false;
+      error = errorMessage(cause);
+    } finally {
+      activeAction = null;
+    }
+  }
+
+  async function testHostConnection(host: HostSummary) {
+    if (activeAction !== null) return;
+    activeAction = `test_host_connection:${host.alias}`;
+    error = null;
+    success = null;
+    try {
+      success = await invoke<string>('test_host_connection', { alias: host.alias });
+    } catch (cause) {
+      error = errorMessage(cause);
+    } finally {
+      activeAction = null;
+    }
+  }
+
   function endpoint(host: HostSummary): string {
     if (host.port === null) return host.hostname;
     return host.hostname.includes(':')
@@ -513,6 +593,20 @@
           <div class="host-actions">
             <button
               class="icon-button"
+              onclick={() => void previewHostKey(host)}
+              disabled={activeAction !== null}
+              aria-label={`Trust host key for ${host.alias}`}
+              title={`Inspect and trust host key for ${host.alias}`}
+            ><Fingerprint size={16} /></button>
+            <button
+              class="icon-button"
+              onclick={() => void testHostConnection(host)}
+              disabled={activeAction !== null}
+              aria-label={`Test connection to ${host.alias}`}
+              title={`Test SSH connection to ${host.alias}`}
+            ><Cable size={16} /></button>
+            <button
+              class="icon-button"
               onclick={() => openEdit(host)}
               disabled={activeAction !== null}
               aria-label={`Edit ${host.alias}`}
@@ -619,12 +713,12 @@
                 <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                   <span>Private key file</span>
                   <div class="file-picker-row">
-                    <input value={form.keyFile} readonly autocomplete="off" placeholder="No file selected" aria-label="Selected private key file" />
+                    <input bind:value={form.keyFile} autocomplete="off" placeholder="/Users/name/.ssh/id_ed25519" aria-label="Private key file path" />
                     <button type="button" class="secondary-button" onclick={() => void chooseKeyFile()} disabled={activeAction !== null}>
                       <FolderOpen size={15} /> Choose…
                     </button>
                   </div>
-                  <small>For encrypted keys, load the key into ssh-agent and choose SSH agent.</small>
+                  <small>Type a full path when Finder hides <code>.ssh</code>, or choose a file. For encrypted keys, use SSH agent.</small>
                 </label>
               {/if}
             {/if}
@@ -678,6 +772,60 @@
           </button>
         </footer>
       </form>
+    </dialog>
+{/if}
+
+{#if keyPreview}
+    <dialog
+      use:modal
+      class="host-dialog confirm-dialog host-key-dialog"
+      aria-modal="true"
+      aria-labelledby="trust-host-key-title"
+      in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
+      out:fade={{ duration: exitDuration }}
+    >
+      <header>
+        <button
+          type="button"
+          class="icon-button dialog-close"
+          onclick={closeKeyPreview}
+          disabled={activeAction !== null}
+          aria-label="Close"
+          title="Close"
+        ><X size={17} /></button>
+        <div>
+          <p class="section-kicker">Manual trust</p>
+          <h2 id="trust-host-key-title">Verify {keyPreview.host}</h2>
+        </div>
+      </header>
+      <p>
+        Sloosh reached this endpoint through the configured route. Compare the fingerprint with
+        a trusted, independent source before recording it.
+      </p>
+      <dl class="host-key-details">
+        <div><dt>Requested host</dt><dd>{keyPreview.requestedHost}</dd></div>
+        <div><dt>Key belongs to</dt><dd>{keyPreview.host}</dd></div>
+        <div><dt>Endpoint</dt><dd>{keyPreview.hostname.includes(':') ? `[${keyPreview.hostname}]:${keyPreview.port}` : `${keyPreview.hostname}:${keyPreview.port}`}</dd></div>
+        <div><dt>SHA256 fingerprint</dt><dd><code>{keyPreview.fingerprint}</code></dd></div>
+      </dl>
+      <label class="trust-confirmation">
+        <input bind:checked={trustConfirmed} type="checkbox" />
+        <span>I independently verified this exact endpoint and fingerprint.</span>
+      </label>
+      <p class="trust-boundary">
+        A changed or mismatched key is never replaced here. Sloosh re-probes immediately before
+        writing <code>~/.sloosh/known_hosts</code>.
+      </p>
+      <footer>
+        <button class="secondary-button" onclick={closeKeyPreview} disabled={activeAction !== null}>Cancel</button>
+        <button
+          class="primary-button"
+          onclick={() => void trustHostKey()}
+          disabled={!trustConfirmed || activeAction !== null}
+        >
+          {activeAction?.startsWith('trust_host_key:') ? 'Verifying again...' : 'Trust and continue'}
+        </button>
+      </footer>
     </dialog>
 {/if}
 

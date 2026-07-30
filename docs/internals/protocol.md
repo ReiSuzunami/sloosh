@@ -362,10 +362,12 @@ The daemon also rejects approval from a process ancestry containing the pending
 request's anchor. Wrong-password attempts are limited, and pending requests
 expire independently.
 
-## 9. Host-key confirmation after activation
+## 9. Host-key confirmation
 
-Host-key probing happens in human CLI after activation; it is not a wire
-subprotocol. Component flow belongs to
+Host-key probing happens in the human CLI approval flow or the unlocked desktop
+Hosts screen; it is not a wire subprotocol. The desktop connection test reuses
+the existing `RequestLease`, `Run`, and `Kill` messages, so it adds no protocol
+shape or sequencing. Component flow belongs to
 [`architecture.md`](architecture.md#4-approval-proxyjump-and-host-keys) and
 security guarantees to [`SECURITY.md`](../../SECURITY.md#47-host-key-bootstrap).
 Probe failure does not roll back lease activation or create trust.

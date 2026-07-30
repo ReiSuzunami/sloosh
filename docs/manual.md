@@ -86,7 +86,17 @@ Hosts manages the same vault-backed profiles as the CLI. Unlock it with Touch
 ID, the Sloosh PIN, or the Master Password. Master Password and PIN entry stay
 in the bundled native helper and never enter the WebView. An SSH password
 entered in Hosts is transient, crosses the local command boundary as a redacted
-secret, and is cleared after submission.
+secret, and is cleared after submission. A private-key path can be typed
+directly when Finder hides `.ssh`, or selected with the file picker.
+
+Each host row also provides manual host-key trust and an end-to-end connection
+test. Trust shows the exact resolved endpoint and SHA256 fingerprint. Compare
+it with an independent source and confirm it explicitly; Sloosh re-resolves and
+re-probes before recording the key, and never replaces a mismatched known key.
+ProxyJump keys are presented dependency-first. Test connection requests a
+normal human-approved lease and verifies the TCP connection, SSH handshake,
+host key, configured authentication, and remote shell before cleaning up its
+reserved test session.
 
 The app locks the vault session after its configured idle period and on system
 sleep, screen lock, user switch, manual lock, app exit, or the absolute session
@@ -111,8 +121,8 @@ sloosh approve REQUEST_ID_FROM_OUTPUT
 On a configured macOS DMG installation, choose Touch ID, the approval PIN, or
 the vault Master Password in the native approval prompt. The selected method
 is authenticated in a second secure step. Unknown host keys still require the
-human to verify the fingerprint. ProxyJump routes are validated before
-approval.
+human to verify the fingerprint in the terminal approval flow or the unlocked
+desktop Hosts screen. ProxyJump routes are validated before approval.
 
 ## Persistent sessions
 

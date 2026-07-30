@@ -4,6 +4,7 @@ mod desktop_unlock;
 mod dock_icon;
 mod gui_error;
 mod host_commands;
+mod host_operations;
 mod system_lock;
 
 use desktop_unlock::{DEFAULT_ABSOLUTE_TIMEOUT, DesktopUnlockSession, UnlockMethod, UnlockStatus};
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use host_commands::{add_host, list_hosts, remove_host, update_host};
+use host_operations::{preview_host_key, test_host_connection, trust_host_key};
 
 #[derive(Clone)]
 struct Controller {
@@ -496,7 +498,10 @@ fn main() {
             list_hosts,
             add_host,
             update_host,
-            remove_host
+            remove_host,
+            preview_host_key,
+            trust_host_key,
+            test_host_connection
         ])
         .build(tauri::generate_context!())
         .expect("build Sloosh desktop app");

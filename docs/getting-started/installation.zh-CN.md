@@ -22,7 +22,7 @@ Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebr
 macOS DMG：
 
 ```sh
-version=0.2.3
+version=0.2.4
 dmg="Sloosh-$version-macos-universal.dmg"
 grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
 open "$dmg"

@@ -45,4 +45,12 @@ export type HostSummary = {
     | { type: 'proxy_jump'; spec: string };
 };
 
+export type HostKeyPreview = {
+  requestedHost: string;
+  host: string;
+  hostname: string;
+  port: number;
+  fingerprint: string;
+};
+
 export type View = 'overview' | 'hosts' | 'security' | 'setup';

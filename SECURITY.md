@@ -148,9 +148,12 @@ independently verifies the PIN before activation. At runtime Sloosh rejects a
 native helper that is a symlink, has an
 unexpected owner, or is group- or other-writable; the installer separately
 validates the bundle signature.
-Cancellation or helper failure leaves request pending. Unknown SSH
-host keys force terminal approval so fingerprint trust remains human CLI-owned.
-Native success returns no bearer lease token to requester.
+Cancellation or helper failure leaves request pending. Unknown SSH host keys
+force separate human confirmation: either the terminal approval flow or the
+unlocked desktop Hosts screen must show the resolved endpoint and SHA256
+fingerprint. Desktop confirmation re-resolves and re-probes immediately before
+recording, and a changed preview fails closed. Native success returns no bearer
+lease token to requester.
 
 The PIN verifier is Argon2id with a random salt and versioned parameters in
 `~/.sloosh/approval-pin.json`. The file is bounded, owner-only, symlink-refused,
@@ -370,6 +373,21 @@ probe stops before authenticating to that target.
 No key is recorded without human confirmation. Probe failure or rejection
 leaves the host unknown, and real SSH connection attempts remain fail closed.
 
+The desktop Hosts screen exposes the same bootstrap as an explicit manual
+operation. It temporarily unlocks a process-local vault cache, probes only the
+first still-unknown key in dependency order, and clears that cache after each
+operation. Before writing, it independently unlocks again, re-resolves the
+route, and re-probes; alias, endpoint, and SHA256 fingerprint must match the
+human-confirmed preview. Existing known keys are never replaced through this
+flow, so a mismatch remains a hard failure requiring separate investigation.
+
+The desktop connection test does not bypass leases. It requests an ordinary
+exact-scope lease, runs `true` in a fresh reserved PTY session, and then kills
+that session. Success therefore covers TCP reachability, SSH handshake,
+host-key verification, configured authentication, and a working remote shell.
+Pending approval, unknown keys, mismatches, ProxyJump lease coverage, and
+authentication errors remain fail closed.
+
 ## 5. Request capability boundary
 
 The daemon, not the CLI, is the authority for host operations. Current request
@@ -403,6 +421,11 @@ additional authority after that gate.
 A TTY check is CLI policy, not a server-side protocol credential. A raw same-UID
 client can send the underlying vault requests, but still needs the relevant
 password and state preconditions.
+
+Desktop host-key preview/record operations are not daemon wire requests. They
+are reachable only through the unlocked human desktop control plane, perform
+key exchange only against the final unknown target, and retain the same strict
+ProxyJump dependency behavior described above.
 
 Touch ID, PIN, and Master Password are local helper policy, not proof carried
 on wire. Security property comes from trusted helper checking its parent

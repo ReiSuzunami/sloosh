@@ -32,8 +32,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
@@ -453,6 +455,14 @@ fn vault_mutation_lock() -> &'static AsyncMutex<()> {
     MUTATION.get_or_init(|| AsyncMutex::new(()))
 }
 
+/// Serializes changes to cache ownership. Lease activation/expiry and
+/// short-lived human desktop operations must never overwrite or clear each
+/// other's decrypted vault state.
+fn cache_lifecycle_lock() -> &'static AsyncMutex<()> {
+    static LIFECYCLE: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LIFECYCLE.get_or_init(|| AsyncMutex::new(()))
+}
+
 fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultError> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
@@ -836,11 +846,23 @@ pub async fn add_entry(
     password: &[u8],
     replace: bool,
 ) -> Result<(), VaultError> {
-    add_entry_at(&vault_path(), alias, entry, password, replace).await
+    add_entry_with_lifecycle_at(&vault_path(), alias, entry, password, replace).await
+}
+
+async fn add_entry_with_lifecycle_at(
+    path: &Path,
+    alias: &str,
+    entry: HostEntry,
+    password: &[u8],
+    replace: bool,
+) -> Result<(), VaultError> {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    add_entry_at(path, alias, entry, password, replace).await
 }
 
 /// Remove a host entry, re-encrypting and saving the whole vault.
 pub async fn rm_entry(alias: &str, password: &[u8]) -> Result<(), VaultError> {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
     rm_entry_at(&vault_path(), alias, password).await
 }
 
@@ -856,6 +878,7 @@ pub async fn update_entry(
     new_auth: Option<AuthMethod>,
     password: &[u8],
 ) -> Result<(), VaultError> {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
     update_entry_at(&vault_path(), metadata, new_auth, password).await
 }
 
@@ -865,10 +888,17 @@ pub async fn update_entry(
 // is responsible for calling `clear_cache()` when the last lease expires.
 // ---------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheOwner {
+    Lease,
+    Temporary(u64),
+}
+
 struct UnlockedVault {
     data: VaultData,
     kdf: KdfParamsFile,
     key: Zeroizing<[u8; 32]>,
+    owner: CacheOwner,
 }
 
 fn cache() -> &'static AsyncMutex<Option<UnlockedVault>> {
@@ -880,14 +910,35 @@ fn cache() -> &'static AsyncMutex<Option<UnlockedVault>> {
 /// Unlock the vault (verifying `password`) and populate the cache, for use
 /// by `approve` when activating a new lease.
 pub async fn unlock_for_lease(password: &[u8]) -> Result<(), VaultError> {
-    unlock_for_lease_at(&vault_path(), password).await
+    unlock_for_lease_with_lifecycle_at(&vault_path(), password).await
+}
+
+async fn unlock_for_lease_with_lifecycle_at(
+    path: &Path,
+    password: &[u8],
+) -> Result<(), VaultError> {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    unlock_for_lease_at(path, password).await
 }
 
 async fn unlock_for_lease_at(path: &Path, password: &[u8]) -> Result<(), VaultError> {
+    populate_cache_at(path, password, CacheOwner::Lease).await
+}
+
+async fn populate_cache_at(
+    path: &Path,
+    password: &[u8],
+    owner: CacheOwner,
+) -> Result<(), VaultError> {
     let _mutation = vault_mutation_lock().lock().await;
     let (data, kdf, key) = unlock_material_at(path, password)?;
     let mut guard = cache().lock().await;
-    *guard = Some(UnlockedVault { data, kdf, key });
+    *guard = Some(UnlockedVault {
+        data,
+        kdf,
+        key,
+        owner,
+    });
     Ok(())
 }
 
@@ -895,8 +946,103 @@ async fn unlock_for_lease_at(path: &Path, password: &[u8]) -> Result<(), VaultEr
 /// active lease expires or is otherwise dropped. `VaultData` and the key
 /// both zeroize themselves on drop.
 pub async fn clear_cache() {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    clear_cache_under_lifecycle().await;
+}
+
+async fn clear_cache_under_lifecycle() {
     let mut guard = cache().lock().await;
     *guard = None;
+}
+
+async fn clear_temporary_cache(owner: CacheOwner) {
+    let mut guard = cache().lock().await;
+    if guard.as_ref().is_some_and(|cached| cached.owner == owner) {
+        *guard = None;
+    }
+}
+
+struct TemporaryCacheGuard {
+    owner: CacheOwner,
+    armed: bool,
+}
+
+impl TemporaryCacheGuard {
+    async fn clear(mut self) {
+        clear_temporary_cache(self.owner).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryCacheGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut guard) = cache().try_lock() {
+            if guard
+                .as_ref()
+                .is_some_and(|cached| cached.owner == self.owner)
+            {
+                *guard = None;
+            }
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let owner = self.owner;
+            runtime.spawn(async move {
+                clear_temporary_cache(owner).await;
+            });
+        }
+    }
+}
+
+/// Failure from a short-lived cache owner used by a human desktop operation.
+#[derive(Debug)]
+pub(crate) enum TemporaryCacheError<E> {
+    CacheInUse,
+    Vault(VaultError),
+    Operation(E),
+}
+
+/// Temporarily unlock the process cache while no lease owns it.
+///
+/// The lifecycle lock remains held through `operation`, so concurrent lease
+/// activation/expiry cannot replace or clear this cache. The temporary cache
+/// is zeroized before ownership is released.
+pub(crate) async fn with_temporary_cache<T, E, F, Fut>(
+    password: &[u8],
+    operation: F,
+) -> Result<T, TemporaryCacheError<E>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    with_temporary_cache_at(&vault_path(), password, operation).await
+}
+
+async fn with_temporary_cache_at<T, E, F, Fut>(
+    path: &Path,
+    password: &[u8],
+    operation: F,
+) -> Result<T, TemporaryCacheError<E>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    if cache().lock().await.is_some() {
+        return Err(TemporaryCacheError::CacheInUse);
+    }
+    static TEMPORARY_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let owner = CacheOwner::Temporary(TEMPORARY_CACHE_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    populate_cache_at(path, password, owner)
+        .await
+        .map_err(TemporaryCacheError::Vault)?;
+    let temporary_cache = TemporaryCacheGuard { owner, armed: true };
+    let result = operation().await.map_err(TemporaryCacheError::Operation);
+    temporary_cache.clear().await;
+    result
 }
 
 /// Whether the vault is currently cached in memory (i.e. at least one
@@ -946,10 +1092,15 @@ async fn refresh_cache_if_present(path: &Path, data: &VaultData, password: &[u8]
         // re-populate it correctly.
         match read_vault_file(path).and_then(|f| derive_key(password, &f.kdf).map(|k| (f, k))) {
             Ok((file, key)) => {
+                let owner = guard
+                    .as_ref()
+                    .map(|cached| cached.owner)
+                    .expect("cache presence checked above");
                 *guard = Some(UnlockedVault {
                     data: data.clone(),
                     kdf: file.kdf,
                     key,
+                    owner,
                 });
             }
             Err(_) => {
@@ -1429,6 +1580,7 @@ mod tests {
             data: VaultData::default(),
             kdf: file.kdf,
             key,
+            owner: CacheOwner::Lease,
         });
 
         let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
@@ -1519,6 +1671,7 @@ mod tests {
                 data: unlock_at(&path, b"pw").unwrap(),
                 kdf: file.kdf,
                 key,
+                owner: CacheOwner::Lease,
             });
         }
 
@@ -1528,6 +1681,150 @@ mod tests {
 
         clear_cache().await;
         assert!(!is_cached().await);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn temporary_cache_cannot_clear_a_concurrent_lease_unlock() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("temporary-cache-lifecycle");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+
+        let (temporary_started_tx, temporary_started_rx) = tokio::sync::oneshot::channel();
+        let (release_temporary_tx, release_temporary_rx) = tokio::sync::oneshot::channel();
+        let temporary_path = path.clone();
+        let temporary = tokio::spawn(async move {
+            with_temporary_cache_at(&temporary_path, b"pw", || async move {
+                temporary_started_tx.send(()).unwrap();
+                release_temporary_rx.await.unwrap();
+                Ok::<_, ()>(())
+            })
+            .await
+        });
+        temporary_started_rx.await.unwrap();
+
+        let lease_path = path.clone();
+        let lease_unlock =
+            tokio::spawn(
+                async move { unlock_for_lease_with_lifecycle_at(&lease_path, b"pw").await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            !lease_unlock.is_finished(),
+            "lease unlock must wait for temporary cache cleanup"
+        );
+
+        release_temporary_tx.send(()).unwrap();
+        temporary.await.unwrap().unwrap();
+        lease_unlock.await.unwrap().unwrap();
+        assert!(
+            is_cached().await,
+            "concurrent lease must retain cache ownership after temporary cleanup"
+        );
+
+        clear_cache().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn cancelled_temporary_operation_zeroizes_its_cache() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("temporary-cache-cancel");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let operation_path = path.clone();
+        let operation = tokio::spawn(async move {
+            with_temporary_cache_at(&operation_path, b"pw", || async move {
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                Ok::<_, ()>(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        assert!(is_cached().await);
+
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        assert!(
+            !is_cached().await,
+            "cancelling temporary work must synchronously clear its cache"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn panicked_temporary_operation_zeroizes_its_cache() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("temporary-cache-panic");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+
+        let operation_path = path.clone();
+        let operation = tokio::spawn(async move {
+            with_temporary_cache_at(&operation_path, b"pw", || async move {
+                panic!("synthetic temporary operation panic");
+                #[allow(unreachable_code)]
+                Ok::<(), ()>(())
+            })
+            .await
+        });
+        assert!(operation.await.unwrap_err().is_panic());
+        assert!(
+            !is_cached().await,
+            "panicking temporary work must synchronously clear its cache"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn temporary_cache_serializes_vault_mutation() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("temporary-cache-mutation");
+        let _ = std::fs::remove_file(&path);
+        create_at(&path, &VaultData::default(), b"pw").unwrap();
+
+        let (temporary_started_tx, temporary_started_rx) = tokio::sync::oneshot::channel();
+        let (release_temporary_tx, release_temporary_rx) = tokio::sync::oneshot::channel();
+        let temporary_path = path.clone();
+        let temporary = tokio::spawn(async move {
+            with_temporary_cache_at(&temporary_path, b"pw", || async move {
+                temporary_started_tx.send(()).unwrap();
+                release_temporary_rx.await.unwrap();
+                Ok::<_, ()>(())
+            })
+            .await
+        });
+        temporary_started_rx.await.unwrap();
+
+        let mutation_path = path.clone();
+        let mutation = tokio::spawn(async move {
+            add_entry_with_lifecycle_at(&mutation_path, "web", sample_entry(), b"pw", false).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !mutation.is_finished(),
+            "vault mutation must wait for temporary cache cleanup"
+        );
+
+        release_temporary_tx.send(()).unwrap();
+        temporary.await.unwrap().unwrap();
+        mutation.await.unwrap().unwrap();
+        assert!(unlock_at(&path, b"pw").unwrap().hosts.contains_key("web"));
+        assert!(
+            !is_cached().await,
+            "mutation must not create cache ownership after temporary cleanup"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
