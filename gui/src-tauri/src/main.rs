@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod desktop_unlock;
-mod dock_icon;
 mod gui_error;
 mod host_commands;
 mod host_operations;
@@ -505,7 +504,9 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("build Sloosh desktop app");
-    app.run(|app_handle, event| dock_icon::handle_run_event(app_handle, &event));
+    // Keep the macOS Dock icon bundle-owned. A process-level AppKit override
+    // bypasses the adaptive asset catalog's platform sizing and effects.
+    app.run(|_, _| {});
 }
 
 #[cfg(test)]

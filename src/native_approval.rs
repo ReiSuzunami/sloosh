@@ -54,6 +54,7 @@ fn map_helper_error(code: String, message: String) -> NativeApprovalError {
     match code.as_str() {
         "not_enrolled" => NativeApprovalError::NotEnrolled,
         "cancelled" => NativeApprovalError::Cancelled,
+        "timeout" => NativeApprovalError::TimedOut,
         _ => NativeApprovalError::Helper(message),
     }
 }
@@ -113,6 +114,12 @@ pub fn is_available() -> bool {
 pub struct NativeApprovalStatus {
     pub touch_id_enrolled: bool,
     pub pin_credential_stored: bool,
+}
+
+#[derive(Debug)]
+pub enum NativeApprovalOutcome {
+    Human(LeaseActivatedInfo),
+    SystemAgent(LeaseActivatedInfo),
 }
 
 pub async fn status() -> Result<NativeApprovalStatus, NativeApprovalError> {
@@ -266,7 +273,7 @@ pub async fn remove_pin_credential() -> Result<(), NativeApprovalError> {
 
 pub async fn try_approve(
     info: &LeaseRequestSummary,
-) -> Result<LeaseActivatedInfo, NativeApprovalError> {
+) -> Result<NativeApprovalOutcome, NativeApprovalError> {
     let mut helper = HelperProcess::spawn().await?;
     let master_password = match helper
         .exchange(&HelperRequest::Begin {
@@ -289,9 +296,9 @@ pub async fn try_approve(
     let mut cleanup = NativePreviewCleanup::armed();
     let result = finish_native_approval(helper, info, &master_password).await;
     match result {
-        Ok(activated) => {
+        Ok(outcome) => {
             cleanup.disarm();
-            Ok(activated)
+            Ok(outcome)
         }
         Err(error) => {
             cleanup.cleanup().await;
@@ -304,7 +311,7 @@ async fn finish_native_approval(
     mut helper: HelperProcess,
     info: &LeaseRequestSummary,
     master_password: &SecretString,
-) -> Result<LeaseActivatedInfo, NativeApprovalError> {
+) -> Result<NativeApprovalOutcome, NativeApprovalError> {
     let approved_hosts =
         lease::preview_native_approval(&info.id, master_password.expose_secret().as_bytes())
             .await?;
@@ -313,6 +320,29 @@ async fn finish_native_approval(
         if !ssh::host_has_known_key(&hostname, port) {
             return Err(NativeApprovalError::HostKeyConfirmationRequired);
         }
+    }
+    if ssh::scope_uses_system_agent(&approved_hosts).await? {
+        match helper.exchange(&HelperRequest::CompleteSystemAgent).await? {
+            HelperResponse::SystemAgentReady => helper.finish().await?,
+            HelperResponse::Error { code, message } => {
+                return Err(map_helper_error(code, message));
+            }
+            _ => {
+                return Err(NativeApprovalError::InvalidData(
+                    "unexpected system-agent completion response".into(),
+                ));
+            }
+        }
+        return match lease::approve_lease_system_agent(&info.id, Some(&approved_hosts)).await? {
+            lease::SystemAgentApprovalOutcome::Activated(activated) => {
+                Ok(NativeApprovalOutcome::SystemAgent(activated))
+            }
+            lease::SystemAgentApprovalOutcome::NotEligible => {
+                Err(NativeApprovalError::InvalidData(
+                    "system-agent scope changed before lease activation".into(),
+                ))
+            }
+        };
     }
     let pin_store = PinStore::current_user();
     let allow_pin = matches!(pin_store.status()?, PinStatus::Ready);
@@ -338,12 +368,14 @@ async fn finish_native_approval(
         verify_pin(&pin_store, &pin)?;
     }
     let approval_password = entered_master_password.as_ref().unwrap_or(master_password);
-    Ok(lease::approve_lease_native(
-        &info.id,
-        approval_password.expose_secret().as_bytes(),
-        &approved_hosts,
-    )
-    .await?)
+    Ok(NativeApprovalOutcome::Human(
+        lease::approve_lease_native(
+            &info.id,
+            approval_password.expose_secret().as_bytes(),
+            &approved_hosts,
+        )
+        .await?,
+    ))
 }
 
 fn verify_pin(store: &PinStore, pin: &SecretString) -> Result<(), NativeApprovalError> {
@@ -384,6 +416,10 @@ mod tests {
             map_helper_error("cancelled".into(), "ignored".into()),
             NativeApprovalError::Cancelled
         ));
+        assert!(matches!(
+            map_helper_error("timeout".into(), "ignored".into()),
+            NativeApprovalError::TimedOut
+        ));
     }
 
     #[test]
@@ -418,6 +454,19 @@ mod tests {
             serde_json::to_value(HelperRequest::CompletePinUnlock { verified: true }).unwrap(),
             serde_json::json!({ "type": "complete_pin_unlock", "verified": true })
         );
+        assert_eq!(
+            serde_json::to_value(HelperRequest::CompleteSystemAgent).unwrap(),
+            serde_json::json!({ "type": "complete_system_agent" })
+        );
+    }
+
+    #[test]
+    fn helper_system_agent_response_is_typed() {
+        let response: HelperResponse = serde_json::from_value(serde_json::json!({
+            "type": "system_agent_ready"
+        }))
+        .unwrap();
+        assert!(matches!(response, HelperResponse::SystemAgentReady));
     }
 
     #[test]

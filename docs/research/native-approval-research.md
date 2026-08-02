@@ -35,7 +35,7 @@
 
 ## sloosh 分阶段路线
 
-1. **阶段 A（macOS 已实现）**：保留密码批准；DMG 内置 helper 将 vault 密码存入本机 login Keychain。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围，原生 UI 先确认完整列表并选择 Touch ID、Sloosh PIN 或 Master Password，再执行对应认证。Touch ID 比对登记时的 biometric domain state；PIN 由 daemon 的持久退避状态机验证；Master Password 重新解锁 vault 并触发范围二次比对。取消、未知 host key、未登记或 helper 缺失均退回终端审批。
+1. **阶段 A（macOS 已实现）**：保留密码批准；DMG 内置 helper 将 vault 密码存入本机 login Keychain。helper 校验父进程后只向 Sloosh 提供密码；daemon 解密 vault、独立展开主机范围。完整 scope 仅使用默认系统 SSH Agent 时，daemon 激活受认证方式约束的限时 lease，不显示人工审批窗口；其他 scope 的原生 UI 直接提供 Touch ID、Sloosh PIN、Master Password 三个按钮，点击即执行对应认证，不再列表选择后 Continue。Touch ID 比对登记时的 biometric domain state；PIN 由 daemon 的持久退避状态机验证；Master Password 重新解锁 vault 并触发范围二次比对。取消、未知 host key、未登记或 helper 缺失均退回终端审批。
 2. **阶段 B（本机密码学证明）**：每台客户端生成受 user presence 保护的签名密钥；守护进程发随机 nonce，客户端完成生物审批后签名，守护进程验签并把公钥绑定设备/租约。设计重放防护、密钥轮换、撤销与无生物回退。
 3. **阶段 C（发布与生态）**：需要公共下载时再接入 Apple Developer ID + notarization、Windows Store/MSIX/代码签名，或合规的 OSS 签名服务；证书预算与发布渠道独立于审批协议。
 

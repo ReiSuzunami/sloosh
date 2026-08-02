@@ -40,7 +40,9 @@ async fn status_round_trip_against_running_daemon() {
     std::fs::create_dir_all(&ssh_dir).expect("create isolated OpenSSH config directory");
     std::fs::write(
         ssh_dir.join("config"),
-        "Host cycle-a\n    ProxyJump cycle-b\nHost cycle-b\n    ProxyJump cycle-a\n",
+        "Host cycle-a\n    ProxyJump cycle-b\nHost cycle-b\n    ProxyJump cycle-a\n\
+         Host agent-only\n    HostName agent.example.test\n\
+         Host custom-agent\n    HostName custom.example.test\n    IdentityAgent /tmp/custom-agent.sock\n",
     )
     .expect("write isolated cyclic OpenSSH config");
     // SAFETY: this test process does not read SLOOSH_SOCKET concurrently
@@ -130,6 +132,30 @@ async fn status_round_trip_against_running_daemon() {
         matches!(invalid_route, Some(Response::Error { ref message }) if message.contains("ProxyJump") && message.contains("cycle") && message.contains("cycle-a")),
         "{invalid_route:?}"
     );
+
+    chan.send(&Request::RequestLease {
+        hosts: vec!["agent-only".to_string()],
+    })
+    .await
+    .expect("send system-agent RequestLease");
+    assert_eq!(
+        chan.recv::<Response>()
+            .await
+            .expect("recv automatic RequestLease response"),
+        Some(Response::Ok)
+    );
+
+    chan.send(&Request::RequestLease {
+        hosts: vec!["custom-agent".to_string()],
+    })
+    .await
+    .expect("send custom-agent RequestLease");
+    assert!(matches!(
+        chan.recv::<Response>()
+            .await
+            .expect("recv custom-agent RequestLease response"),
+        Some(Response::LeaseRequestPending(_))
+    ));
 
     chan.send(&Request::InitVault {
         master_password: SecretString::new("masterpw"),

@@ -15,9 +15,11 @@ sloosh init
 ```
 
 It installs the embedded Agent Skill and initializes the credential vault.
-Command-line-only installations use approval from another human terminal. The
-macOS desktop app configures Keychain access, Touch ID, and an optional
-approval PIN through its own Setup and Security screens.
+Command-line-only installations use approval from another human terminal for
+password, key-file, and custom-agent scopes. Default system SSH-agent-only
+scopes authorize automatically. The macOS desktop app configures Keychain
+access, Touch ID, and an optional approval PIN through its own Setup and
+Security screens.
 
 Verify the result:
 
@@ -45,6 +47,16 @@ sloosh host rm myhost
 Authentication choices are SSH agent, a vault-backed password, or an
 unencrypted Ed25519/ECDSA key path. RSA and encrypted private keys must be
 loaded into ssh-agent.
+
+A vault profile configured with `--auth agent` uses the default system
+`$SSH_AUTH_SOCK` and can skip human lease approval once the daemon can inspect
+the unlocked vault. The DMG Keychain preview supplies that state without an
+approval prompt; a CLI-only cold vault remains pending because absence from an
+encrypted vault cannot be inferred safely. An OpenSSH-config-backed host gets
+the same automatic path only when the complete target and ProxyJump scope uses
+the default agent and has no `IdentityFile` or custom `IdentityAgent`. The
+lease remains process-bound and time-limited; changing a host away from that
+policy makes the automatic lease unusable.
 
 Routes can be direct, through another managed profile, or an advanced
 OpenSSH ProxyJump expression:
@@ -101,8 +113,8 @@ writing. ProxyJump keys are presented dependency-first.
 
 `sloosh host trust myhost` provides the same human-only flow in a terminal.
 The connection-test action opens this trust dialog first when needed. After a
-successful Add or Replace, it automatically retries the normal
-human-approved lease and verifies the TCP connection, SSH handshake, host key,
+successful Add or Replace, it automatically retries the normal lease flow and
+verifies the TCP connection, SSH handshake, host key,
 configured authentication, and remote shell before cleaning up its reserved
 test session.
 
@@ -126,11 +138,14 @@ command, a human runs that exact command in another terminal:
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-On a configured macOS DMG installation, choose Touch ID, the approval PIN, or
-the vault Master Password in the native approval prompt. The selected method
-is authenticated in a second secure step. Unknown host keys still require the
-human to verify the fingerprint in the terminal approval flow or the unlocked
-desktop Hosts screen. ProxyJump routes are validated before approval.
+If the complete scope is system-SSH-agent-only, `request` activates a bounded
+lease without human approval. Otherwise, a configured macOS DMG installation
+shows every target and ProxyJump dependency in a bounded, scrollable scope list,
+followed by direct Touch ID, approval PIN, and vault Master Password buttons.
+Select one to start that secure method without a list-selection/Continue step.
+Unknown host keys still require the human to verify the fingerprint in the
+terminal approval flow or the unlocked desktop Hosts screen. ProxyJump routes
+are validated before authorization.
 
 ## Persistent sessions
 
@@ -198,8 +213,8 @@ sloosh vault timeout 15
 ```
 
 The timeout is shared by the desktop vault and idle CLI/Agent leases. It does
-not replace per-request host approval. Exact lease and vault rules belong to
-[SECURITY.md](../SECURITY.md).
+not replace approval outside the system-agent-only policy. Exact lease and
+vault rules belong to [SECURITY.md](../SECURITY.md).
 
 ## Status, logs, and daemon
 

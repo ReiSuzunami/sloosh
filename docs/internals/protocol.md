@@ -344,11 +344,17 @@ existing pending request available for a new preview/approval attempt. If an
 invalid route is visible before `RequestLease` creates pending state, the
 request itself returns `Error` instead.
 
-On a DMG-installed Mac, daemon may satisfy a newly created pending request via
-its bundled native helper. Human first chooses Touch ID, PIN, or Master
-Password after reviewing the exact host scope, then completes that method in a
-second secure step. Success returns the already-valid `Ok` response for
-`RequestLease`; failure returns `LeaseRequestPending` exactly as before. Helper
+Before human approval, daemon may activate a pending request automatically when
+the exact target and ProxyJump scope uses only default system SSH-agent
+authentication with no key-file or custom-agent fallback. The resulting lease
+is method-restricted and returns the existing `Ok` response for `RequestLease`.
+
+On a DMG-installed Mac, bundled helper can unlock the vault for authoritative
+scope inspection. A system-agent-only scope completes with no approval UI.
+Otherwise, helper shows the exact scope with direct Touch ID, PIN, and Master
+Password buttons; clicking one immediately starts that secure method. Success
+returns the already-valid `Ok` response for `RequestLease`; failure returns
+`LeaseRequestPending` exactly as before. Helper
 traffic uses anonymous child-process pipes, is not part of this wire protocol,
 and never exposes the generated bearer lease token to the requesting
 connection. Therefore this optional path does not change protocol 3 message
@@ -358,7 +364,8 @@ become protocol fields. GUI vault initialization uses the existing `InitVault`
 `SecretString` over the verified owner-only Unix socket, preserving the daemon
 as vault authority.
 
-The daemon also rejects approval from a process ancestry containing the pending
+No request or response field changed, so this behavior remains protocol 3.
+The daemon also rejects human approval from a process ancestry containing the pending
 request's anchor. Wrong-password attempts are limited, and pending requests
 expire independently.
 

@@ -71,7 +71,7 @@ async fn require_lease(
     peer: Option<u32>,
     host: &str,
     lease_token: &Option<String>,
-) -> Result<(), Response> {
+) -> Result<bool, Response> {
     let Some(pid) = peer else {
         return Err(Response::Error {
             message: format!(
@@ -81,12 +81,11 @@ async fn require_lease(
             ),
         });
     };
-    if lease::check_authorized(pid, host, lease_token.as_deref()).await {
-        Ok(())
-    } else {
-        Err(Response::Error {
+    match lease::resolve_grant(pid, host, lease_token.as_deref()).await {
+        Some(grant) => Ok(grant.requires_system_agent()),
+        None => Err(Response::Error {
             message: no_lease_message(host),
-        })
+        }),
     }
 }
 
@@ -276,10 +275,11 @@ async fn handle_connection(
                 let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => {
+                    Ok(target_requires_system_agent) => {
                         let lease_ctx = ssh::LeaseContext {
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
+                            target_requires_system_agent,
                         };
                         audit::record(
                             "run_started",
@@ -327,7 +327,7 @@ async fn handle_connection(
             } => {
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::peek(&host, session, tail, raw).await {
+                    Ok(_) => match session::peek(&host, session, tail, raw).await {
                         Ok(reply) => Response::Peek(reply),
                         Err(e) => Response::Error {
                             message: e.to_string(),
@@ -346,7 +346,7 @@ async fn handle_connection(
                 let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::send(&host, &keys, session, newline).await {
+                    Ok(_) => match session::send(&host, &keys, session, newline).await {
                         Ok(()) => {
                             // Never log `keys`: it can carry a password/answer
                             // typed into an interactive prompt (docs/internals/architecture.md).
@@ -371,7 +371,7 @@ async fn handle_connection(
                 let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::interrupt(&host, session).await {
+                    Ok(_) => match session::interrupt(&host, session).await {
                         Ok(()) => {
                             audit::record(
                                 "interrupt",
@@ -393,10 +393,11 @@ async fn handle_connection(
             } => {
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => {
+                    Ok(target_requires_system_agent) => {
                         let lease_ctx = ssh::LeaseContext {
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
+                            target_requires_system_agent,
                         };
                         match session::open(&host, &name, lease_ctx).await {
                             Ok(summary) => Response::Session(summary),
@@ -420,7 +421,7 @@ async fn handle_connection(
                 let session_hint = session.clone().unwrap_or_else(|| "default".to_string());
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => match session::kill(&host, session).await {
+                    Ok(_) => match session::kill(&host, session).await {
                         Ok(()) => {
                             audit::record(
                                 "session_killed",
@@ -442,14 +443,19 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
-                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
-                    chan.send(&denied).await?;
-                    continue;
-                }
+                let target_requires_system_agent =
+                    match require_lease(peer, &host, &lease_token).await {
+                        Ok(restricted) => restricted,
+                        Err(denied) => {
+                            chan.send(&denied).await?;
+                            continue;
+                        }
+                    };
                 let caller_pid = peer.expect("require_lease Ok implies peer is Some");
                 let lease_ctx = ssh::LeaseContext {
                     caller_pid,
                     lease_token: lease_token.clone(),
+                    target_requires_system_agent,
                 };
                 let mut upload =
                     match session::begin_put(&host, session, &local_path, &remote_path, lease_ctx)
@@ -497,14 +503,19 @@ async fn handle_connection(
                 session,
                 lease_token,
             } => {
-                if let Err(denied) = require_lease(peer, &host, &lease_token).await {
-                    chan.send(&denied).await?;
-                    continue;
-                }
+                let target_requires_system_agent =
+                    match require_lease(peer, &host, &lease_token).await {
+                        Ok(restricted) => restricted,
+                        Err(denied) => {
+                            chan.send(&denied).await?;
+                            continue;
+                        }
+                    };
                 let caller_pid = peer.expect("require_lease Ok implies peer is Some");
                 let lease_ctx = ssh::LeaseContext {
                     caller_pid,
                     lease_token: lease_token.clone(),
+                    target_requires_system_agent,
                 };
                 let mut download =
                     match session::begin_get(&host, session, &remote_path, &local_path, lease_ctx)
@@ -545,10 +556,11 @@ async fn handle_connection(
             } => {
                 let resp = match require_lease(peer, &host, &lease_token).await {
                     Err(denied) => denied,
-                    Ok(()) => {
+                    Ok(target_requires_system_agent) => {
                         let lease_ctx = ssh::LeaseContext {
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
+                            target_requires_system_agent,
                         };
                         let opened = match direction {
                             proto::ForwardDirection::Local { spec } => {
@@ -620,29 +632,65 @@ async fn handle_connection(
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
                             lease::RequestOutcome::Pending(info) => {
-                                if info.vault_exists {
-                                    match native_approval::try_approve(&info).await {
-                                        Ok(activated) => {
-                                            audit::record(
-                                                "lease_approved_native",
-                                                serde_json::json!({
-                                                    "hosts": activated.hosts,
-                                                    "anchor_name": activated.anchor_name,
-                                                    "anchor_pid": activated.anchor_pid,
-                                                }),
-                                            );
-                                            // Native approval occurs on requesting
-                                            // connection. Return existing idempotent success
-                                            // shape, never bearer escape-hatch token.
-                                            Response::Ok
-                                        }
-                                        Err(error) => {
-                                            debug!(%error, request_id = %info.id, "native approval unavailable; keeping request pending");
-                                            Response::LeaseRequestPending(info)
+                                match lease::approve_lease_system_agent(&info.id, None).await {
+                                    Ok(lease::SystemAgentApprovalOutcome::Activated(activated)) => {
+                                        audit::record(
+                                            "lease_approved_system_agent",
+                                            serde_json::json!({
+                                                "hosts": activated.hosts,
+                                                "anchor_name": activated.anchor_name,
+                                                "anchor_pid": activated.anchor_pid,
+                                            }),
+                                        );
+                                        Response::Ok
+                                    }
+                                    Ok(lease::SystemAgentApprovalOutcome::NotEligible)
+                                        if info.vault_exists =>
+                                    {
+                                        match native_approval::try_approve(&info).await {
+                                            Ok(native_approval::NativeApprovalOutcome::Human(
+                                                activated,
+                                            )) => {
+                                                audit::record(
+                                                    "lease_approved_native",
+                                                    serde_json::json!({
+                                                        "hosts": activated.hosts,
+                                                        "anchor_name": activated.anchor_name,
+                                                        "anchor_pid": activated.anchor_pid,
+                                                    }),
+                                                );
+                                                // Native approval occurs on requesting
+                                                // connection. Return existing idempotent success
+                                                // shape, never bearer escape-hatch token.
+                                                Response::Ok
+                                            }
+                                            Ok(
+                                                native_approval::NativeApprovalOutcome::SystemAgent(
+                                                    activated,
+                                                ),
+                                            ) => {
+                                                audit::record(
+                                                    "lease_approved_system_agent",
+                                                    serde_json::json!({
+                                                        "hosts": activated.hosts,
+                                                        "anchor_name": activated.anchor_name,
+                                                        "anchor_pid": activated.anchor_pid,
+                                                    }),
+                                                );
+                                                Response::Ok
+                                            }
+                                            Err(error) => {
+                                                debug!(%error, request_id = %info.id, "native approval unavailable; keeping request pending");
+                                                Response::LeaseRequestPending(info)
+                                            }
                                         }
                                     }
-                                } else {
-                                    Response::LeaseRequestPending(info)
+                                    Ok(lease::SystemAgentApprovalOutcome::NotEligible) => {
+                                        Response::LeaseRequestPending(info)
+                                    }
+                                    Err(error) => Response::Error {
+                                        message: error.to_string(),
+                                    },
                                 }
                             }
                         }

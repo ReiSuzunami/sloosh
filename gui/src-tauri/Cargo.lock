@@ -4144,7 +4144,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sloosh"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -4171,7 +4171,7 @@ dependencies = [
 
 [[package]]
 name = "sloosh-desktop"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "block2",
  "objc2",

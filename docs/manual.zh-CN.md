@@ -14,7 +14,8 @@
 sloosh init
 ```
 
-它会安装内嵌 Agent Skill 并初始化凭据 vault。仅命令行安装由人类在另一终端批准；
+它会安装内嵌 Agent Skill 并初始化凭据 vault。仅命令行安装中，password、key-file 与
+自定义 Agent scope 由人类在另一终端批准；仅使用默认系统 SSH Agent 的 scope 自动授权。
 macOS 桌面 App 通过自身的 Setup 与 Security 配置 Keychain、Touch ID 与可选审批 PIN。
 
 验证结果：
@@ -41,6 +42,13 @@ sloosh host rm myhost
 
 认证方式包括 SSH agent、vault 加密密码，或未加密 Ed25519/ECDSA 私钥路径。RSA 与
 加密私钥必须先载入 ssh-agent。
+
+使用 `--auth agent` 的 vault profile 只使用默认系统 `$SSH_AUTH_SOCK`；daemon 能检查
+已解锁 vault 后可跳过人工 lease 批准。DMG Keychain 预览可无审批弹窗提供该状态；仅 CLI
+的冷启动 vault 仍会 pending，因为不能把加密 vault 中“看不到”误判成“不存在”。OpenSSH
+配置主机只有在目标与完整 ProxyJump scope 都使用默认 Agent，且没有 `IdentityFile` 或
+自定义 `IdentityAgent` 时才走相同自动路径。lease 仍绑定进程并受超时限制；主机离开该
+策略后，自动 lease 会立即失效。
 
 路由可以直连、经过另一条受管主机配置，或使用高级 OpenSSH ProxyJump：
 
@@ -84,7 +92,7 @@ endpoint、key algorithm 与 SHA256 指纹；key 发生变化时，同时显示�
 变化，弹窗只刷新内容，不执行写入。ProxyJump key 按依赖顺序逐个展示。
 
 终端中的 `sloosh host trust myhost` 提供同样的人类专用流程。连接测试遇到未信任或变化的
-key 时会先打开该弹窗；成功新增或替换后自动重试普通的人类批准 lease，并依次验证 TCP、
+key 时会先打开该弹窗；成功新增或替换后自动重试普通 lease 流程，并依次验证 TCP、
 SSH handshake、host key、配置的认证方式与远端 shell，最后清理专用测试 session。
 
 达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
@@ -105,9 +113,11 @@ sloosh request myhost
 sloosh approve REQUEST_ID_FROM_OUTPUT
 ```
 
-配置完成的 macOS DMG 安装会先在原生审批弹窗中选择 Touch ID、审批 PIN 或 vault
-Master Password，再通过第二步安全认证完成请求。未知 host key 仍需人类在终端审批流程
-或已解锁的桌面 Hosts 页面核对指纹；ProxyJump 路由会在批准前完成校验。
+若完整 scope 仅使用系统 SSH Agent，`request` 无需人工批准即可激活限时 lease。其他
+scope 在配置完成的 macOS DMG 安装中会先用有界、可滚动列表显示全部目标主机与
+ProxyJump 依赖，再直接提供 Touch ID、审批 PIN、vault Master Password 三个按钮；
+点击即进入对应安全认证，不再先列表选择再点 Continue。未知 host key 仍需人类在终端
+审批流程或已解锁的桌面 Hosts 页面核对指纹；ProxyJump 路由会在授权前校验。
 
 ## 持久会话
 
@@ -169,8 +179,8 @@ sloosh vault timeout
 sloosh vault timeout 15
 ```
 
-该值由桌面 vault 与空闲 CLI/Agent lease 共用，但不会替代逐请求主机批准。精确 lease
-与 vault 规则以 [SECURITY.md](../SECURITY.md) 为准。
+该值由桌面 vault 与空闲 CLI/Agent lease 共用，但不会替代系统 Agent 自动策略之外的批准。
+精确 lease 与 vault 规则以 [SECURITY.md](../SECURITY.md) 为准。
 
 ## 状态、日志与 daemon
 

@@ -34,9 +34,11 @@ then update every affected owner and translation in the same change.
 
 ## Guardrails
 
-- Daemon is authority. Host access needs a human-approved lease bound to PID
-  plus start time, or a valid `SLOOSH_LEASE` token. Approval stays out of band
-  and cannot come from requesting process tree.
+- Daemon is authority. Host access needs a lease bound to PID plus start time,
+  or a valid `SLOOSH_LEASE` token. Exact scopes using only default system SSH
+  Agent authentication may receive a method-restricted lease automatically;
+  every other lease needs out-of-band human approval that cannot come from the
+  requesting process tree.
 - Wire protocol remains version 3 until a concrete incompatible schema,
   framing, default, or sequencing change. Such changes require a version bump
   and mismatch/upgrade tests. CLI verifies daemon eUID and executable path,

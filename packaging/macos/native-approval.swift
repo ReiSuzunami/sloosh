@@ -17,6 +17,42 @@ private enum AuthenticationResult {
     case failure(Response)
 }
 
+private struct AuthenticationEvaluationOutcome {
+    let succeeded: Bool
+    let error: Error?
+}
+
+private final class AuthenticationEvaluationState {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var outcome: AuthenticationEvaluationOutcome?
+    private var closed = false
+
+    func complete(succeeded: Bool, error: Error?) {
+        lock.lock()
+        guard !closed else {
+            lock.unlock()
+            return
+        }
+        outcome = AuthenticationEvaluationOutcome(succeeded: succeeded, error: error)
+        closed = true
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    func wait(seconds: Int) -> AuthenticationEvaluationOutcome? {
+        guard semaphore.wait(timeout: .now() + .seconds(seconds)) == .success else {
+            lock.lock()
+            closed = true
+            lock.unlock()
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return outcome
+    }
+}
+
 private enum CredentialResult {
     case success(StoredCredential)
     case failure(Response)
@@ -145,22 +181,21 @@ private func authenticate(reason: String) -> AuthenticationResult {
         return .failure(.error("unavailable", policyError?.localizedDescription ?? "Touch ID is unavailable"))
     }
 
-    let semaphore = DispatchSemaphore(value: 0)
-    var succeeded = false
-    var evaluationError: Error?
+    let evaluation = AuthenticationEvaluationState()
     context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, error in
-        succeeded = success
-        evaluationError = error
-        semaphore.signal()
+        evaluation.complete(succeeded: success, error: error)
     }
-    semaphore.wait()
+    guard let outcome = evaluation.wait(seconds: 60) else {
+        context.invalidate()
+        return .failure(.error("timeout", "Touch ID approval timed out after 60 seconds"))
+    }
 
-    guard succeeded, let domainState = context.evaluatedPolicyDomainState else {
-        let code = (evaluationError as? LAError)?.code
+    guard outcome.succeeded, let domainState = context.evaluatedPolicyDomainState else {
+        let code = (outcome.error as? LAError)?.code
         if code == .userCancel || code == .systemCancel || code == .appCancel || code == .userFallback {
             return .failure(.error("cancelled", "Touch ID approval was cancelled"))
         }
-        return .failure(.error("unavailable", evaluationError?.localizedDescription ?? "Touch ID authentication failed"))
+        return .failure(.error("unavailable", outcome.error?.localizedDescription ?? "Touch ID authentication failed"))
     }
     return .success(domainState)
 }
@@ -242,25 +277,201 @@ private func alertIcon(systemSymbolName: String, accessibilityDescription: Strin
     ) ?? applicationIcon()
 }
 
-private final class ApprovalMethodPickerView: NSView {
-    private var choices: [(method: ApprovalMethod, button: NSButton)] = []
-    private(set) var selectedMethod: ApprovalMethod
+private enum ApprovalLayout {
+    static let contentWidth: CGFloat = 400
+    static let methodHeight: CGFloat = 142
+}
+
+private func displayHost(_ host: String) -> String {
+    host.unicodeScalars.map { scalar in
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator:
+            return "\\u{\(String(scalar.value, radix: 16, uppercase: true))}"
+        default:
+            return String(scalar)
+        }
+    }.joined()
+}
+
+private final class HostScopeView: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private static let headerHeight: CGFloat = 18
+    private static let headerSpacing: CGFloat = 6
+    private static let minimumRowHeight: CGFloat = 34
+    private static let maximumListHeight: CGFloat = 208
+    private static let fieldFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
+    private let hosts: [String]
+    private let rowHeights: [CGFloat]
+
+    init(hosts: [String]) {
+        self.hosts = hosts
+        self.rowHeights = hosts.map(Self.heightForRow)
+        let contentHeight = rowHeights.reduce(0, +)
+        let listHeight = min(contentHeight, Self.maximumListHeight)
+        let height = Self.headerHeight + Self.headerSpacing + listHeight
+        super.init(frame: NSRect(x: 0, y: 0, width: ApprovalLayout.contentWidth, height: height))
+
+        let heading = NSTextField(labelWithString: "Hosts in scope")
+        heading.font = .systemFont(ofSize: 12, weight: .semibold)
+        heading.textColor = .secondaryLabelColor
+        heading.frame = NSRect(
+            x: 0,
+            y: listHeight + Self.headerSpacing,
+            width: 240,
+            height: Self.headerHeight
+        )
+
+        let count = NSTextField(
+            labelWithString: "\(hosts.count) \(hosts.count == 1 ? "host" : "hosts")"
+        )
+        count.alignment = .right
+        count.font = .systemFont(ofSize: 11, weight: .regular)
+        count.textColor = .tertiaryLabelColor
+        count.frame = NSRect(
+            x: 250,
+            y: listHeight + Self.headerSpacing,
+            width: ApprovalLayout.contentWidth - 250,
+            height: Self.headerHeight
+        )
+        count.setAccessibilityElement(false)
+
+        let tableView = NSTableView(
+            frame: NSRect(
+                x: 0,
+                y: 0,
+                width: ApprovalLayout.contentWidth,
+                height: contentHeight
+            )
+        )
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("host"))
+        column.width = ApprovalLayout.contentWidth - 2
+        column.resizingMask = .autoresizingMask
+        tableView.addTableColumn(column)
+        tableView.headerView = nil
+        tableView.backgroundColor = .clear
+        tableView.rowHeight = Self.minimumRowHeight
+        tableView.intercellSpacing = .zero
+        tableView.gridStyleMask = .solidHorizontalGridLineMask
+        tableView.gridColor = .separatorColor
+        tableView.selectionHighlightStyle = .none
+        tableView.allowsTypeSelect = false
+        tableView.focusRingType = .none
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.setAccessibilityLabel("SSH hosts in scope")
+
+        let scrollView = NSScrollView(
+            frame: NSRect(
+                x: 0,
+                y: 0,
+                width: ApprovalLayout.contentWidth,
+                height: listHeight
+            )
+        )
+        scrollView.borderType = .lineBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = contentHeight > listHeight
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = tableView
+        tableView.reloadData()
+
+        addSubview(heading)
+        addSubview(count)
+        addSubview(scrollView)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("\(hosts.count) SSH \(hosts.count == 1 ? "host" : "hosts") in scope")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private static func heightForRow(_ host: String) -> CGFloat {
+        let fieldWidth = ApprovalLayout.contentWidth - 49
+        let bounds = (displayHost(host) as NSString).boundingRect(
+            with: NSSize(width: fieldWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: fieldFont]
+        )
+        return max(minimumRowHeight, ceil(bounds.height) + 14)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        hosts.count
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        viewFor tableColumn: NSTableColumn?,
+        row: Int
+    ) -> NSView? {
+        let host = hosts[row]
+        let displayedHost = displayHost(host)
+        let rowHeight = rowHeights[row]
+        let cell = NSTableCellView(
+            frame: NSRect(x: 0, y: 0, width: tableView.bounds.width, height: rowHeight)
+        )
+
+        let icon = NSImageView(
+            frame: NSRect(x: 11, y: max((rowHeight - 16) / 2, 0), width: 16, height: 16)
+        )
+        icon.image = NSImage(
+            systemSymbolName: "network",
+            accessibilityDescription: nil
+        )
+        icon.contentTintColor = .secondaryLabelColor
+        icon.setAccessibilityElement(false)
+
+        let hostField = NSTextField(labelWithString: displayedHost)
+        hostField.frame = NSRect(
+            x: 37,
+            y: 7,
+            width: max(tableView.bounds.width - 49, 0),
+            height: max(rowHeight - 14, 20)
+        )
+        hostField.autoresizingMask = [.width]
+        hostField.font = Self.fieldFont
+        hostField.lineBreakMode = .byCharWrapping
+        hostField.usesSingleLineMode = false
+        hostField.maximumNumberOfLines = 0
+        hostField.cell?.wraps = true
+        hostField.cell?.isScrollable = false
+        hostField.isSelectable = true
+        hostField.setAccessibilityLabel("Host \(row + 1) of \(hosts.count)")
+        hostField.setAccessibilityValue(displayedHost)
+
+        cell.imageView = icon
+        cell.textField = hostField
+        cell.addSubview(icon)
+        cell.addSubview(hostField)
+        return cell
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        rowHeights[row]
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        selectionIndexesForProposedSelection proposedSelectionIndexes: IndexSet
+    ) -> IndexSet {
+        IndexSet()
+    }
+}
+
+private final class ApprovalMethodButtonsView: NSView {
+    private(set) var selectedMethod: ApprovalMethod?
 
     init(touchIDAvailable: Bool, pinAvailable: Bool) {
-        var methods: [ApprovalMethod] = []
-        if touchIDAvailable {
-            methods.append(.touchID)
-        }
-        if pinAvailable {
-            methods.append(.pin)
-        }
-        methods.append(.masterPassword)
-        selectedMethod = methods[0]
+        super.init(frame: NSRect(
+            x: 0,
+            y: 0,
+            width: ApprovalLayout.contentWidth,
+            height: ApprovalLayout.methodHeight
+        ))
 
-        let height = CGFloat(30 + methods.count * 28)
-        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: height))
-
-        let heading = NSTextField(labelWithString: "Approval method")
+        let heading = NSTextField(labelWithString: "Approve with")
         heading.font = .systemFont(ofSize: 12, weight: .semibold)
         heading.textColor = .secondaryLabelColor
 
@@ -273,16 +484,22 @@ private final class ApprovalMethodPickerView: NSView {
         stack.addArrangedSubview(heading)
         addSubview(stack)
 
-        for method in methods {
+        for method in [ApprovalMethod.touchID, .pin, .masterPassword] {
             let button = NSButton(
-                radioButtonWithTitle: method.title,
+                title: method.title,
                 target: self,
-                action: #selector(selectMethod(_:))
+                action: #selector(chooseMethod(_:))
             )
+            button.bezelStyle = .rounded
             button.tag = method.rawValue
-            button.state = method == selectedMethod ? .on : .off
+            button.alignment = .left
+            button.widthAnchor.constraint(equalToConstant: ApprovalLayout.contentWidth).isActive = true
+            button.isEnabled = switch method {
+            case .touchID: touchIDAvailable
+            case .pin: pinAvailable
+            case .masterPassword: true
+            }
             button.setAccessibilityLabel(method.title)
-            choices.append((method, button))
             stack.addArrangedSubview(button)
         }
     }
@@ -292,14 +509,13 @@ private final class ApprovalMethodPickerView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    @objc private func selectMethod(_ sender: NSButton) {
+    @objc private func chooseMethod(_ sender: NSButton) {
         guard let method = ApprovalMethod(rawValue: sender.tag) else {
             return
         }
         selectedMethod = method
-        for choice in choices {
-            choice.button.state = choice.method == method ? .on : .off
-        }
+        NSApplication.shared.stopModal(withCode: .OK)
+        window?.orderOut(nil)
     }
 }
 
@@ -666,26 +882,45 @@ private func confirm(
     enrolledDomainState: Data?,
     allowPin: Bool
 ) -> Response {
+    guard !hosts.isEmpty else {
+        return .error("invalid_request", "Approval request has no hosts")
+    }
     activateApplication()
 
     let alert = NSAlert()
     alert.alertStyle = .informational
     alert.icon = applicationIcon()
     alert.messageText = "Approve SSH access"
-    let escapedHosts = hosts.map { "- \($0.debugDescription)" }.joined(separator: "\n")
-    alert.informativeText = "Review the exact host scope, then choose how to approve:\n\n\(escapedHosts)"
-    let picker = ApprovalMethodPickerView(
+    alert.informativeText = "Review all target and ProxyJump hosts below, then approve with one method."
+    let hostScope = HostScopeView(hosts: hosts)
+    let methodButtons = ApprovalMethodButtonsView(
         touchIDAvailable: enrolledDomainState != nil,
         pinAvailable: allowPin
     )
-    alert.accessoryView = picker
-    alert.addButton(withTitle: "Continue")
+    let contentSpacing: CGFloat = 16
+    let content = NSView(
+        frame: NSRect(
+            x: 0,
+            y: 0,
+            width: ApprovalLayout.contentWidth,
+            height: hostScope.frame.height + contentSpacing + methodButtons.frame.height
+        )
+    )
+    methodButtons.frame.origin = .zero
+    hostScope.frame.origin = NSPoint(
+        x: 0,
+        y: methodButtons.frame.height + contentSpacing
+    )
+    content.addSubview(hostScope)
+    content.addSubview(methodButtons)
+    alert.accessoryView = content
     alert.addButton(withTitle: "Cancel")
-    guard alert.runModal() == .alertFirstButtonReturn else {
+    alert.runModal()
+    guard let selectedMethod = methodButtons.selectedMethod else {
         return .error("cancelled", "Native approval was cancelled")
     }
 
-    switch picker.selectedMethod {
+    switch selectedMethod {
     case .pin:
         return promptPin(
             title: "Enter approval PIN",
@@ -883,8 +1118,16 @@ case "begin":
         exit(1)
     }
     send(.unlocked(stored.masterPassword))
-    guard let second = receive(), second.type == "confirm", let hosts = second.hosts else {
-        send(.error("invalid_request", "Missing host confirmation request"))
+    guard let second = receive() else {
+        send(.error("invalid_request", "Missing approval continuation request"))
+        exit(1)
+    }
+    if second.type == "complete_system_agent" {
+        send(.simple("system_agent_ready"))
+        exit(0)
+    }
+    guard second.type == "confirm", let hosts = second.hosts else {
+        send(.error("invalid_request", "Invalid approval continuation request"))
         exit(1)
     }
     let confirmation = confirm(

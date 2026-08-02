@@ -39,6 +39,7 @@ pub(super) enum HelperRequest<'a> {
         hosts: &'a [String],
         allow_pin: bool,
     },
+    CompleteSystemAgent,
     PromptMasterPassword {
         purpose: &'a str,
         confirm: bool,
@@ -61,6 +62,7 @@ pub(super) enum HelperResponse {
         master_password: SecretString,
     },
     Approved,
+    SystemAgentReady,
     MasterPasswordEntered {
         master_password: SecretString,
     },

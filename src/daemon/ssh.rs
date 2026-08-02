@@ -201,6 +201,13 @@ pub enum SshError {
     AuthFailed { host: String },
 
     #[error(
+        "automatic access for '{host}' permits only the default system SSH agent, but the \
+         resolved authentication method changed. Request a new lease; Password, Key File, \
+         IdentityFile, and custom IdentityAgent access require human approval."
+    )]
+    SystemAgentAuthRequired { host: String },
+
+    #[error(
         "the ProxyJump chain for this host is too deep ({limit} hops max, including hops pulled \
          in by a jump host's own ProxyJump) — sloosh refuses to dial an unbounded chain. Simplify \
          the `ProxyJump` entries involved, or connect through fewer nested jump hosts."
@@ -311,6 +318,10 @@ pub struct Connection {
 pub struct LeaseContext {
     pub caller_pid: u32,
     pub lease_token: Option<String>,
+    /// Captured from the exact target grant at operation start. Authentication
+    /// enforces it against the same credential snapshot it consumes, closing
+    /// the host-edit race between lease validation and SSH authentication.
+    pub target_requires_system_agent: bool,
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
@@ -655,7 +666,7 @@ async fn capture_host_key_via_hops(
     for (index, hop) in hops.iter().enumerate() {
         let handle = if index == 0 {
             let tcp = open_tcp(&hop.hostname, hop.port).await?;
-            connect_over_stream(tcp, hop, None).await?
+            connect_over_stream(tcp, hop, None, false).await?
         } else {
             let previous = handles
                 .last()
@@ -668,7 +679,7 @@ async fn capture_host_key_via_hops(
                     port: hop.port,
                     source,
                 })?;
-            connect_over_stream(channel.into_stream(), hop, None).await?
+            connect_over_stream(channel.into_stream(), hop, None, false).await?
         };
         handles.push(handle);
     }
@@ -794,7 +805,13 @@ async fn connect_resolved(
     }
 
     let tcp = open_tcp(&host_cfg.hostname, host_cfg.port).await?;
-    let handle = connect_over_stream(tcp, &host_cfg, route).await?;
+    let handle = connect_over_stream(
+        tcp,
+        &host_cfg,
+        route,
+        lease_ctx.target_requires_system_agent,
+    )
+    .await?;
     Ok(Connection {
         handle,
         resolved: host_cfg,
@@ -826,7 +843,13 @@ async fn connect_via_proxy_jump(
         // otherwise elided — fall back to a direct connection rather than
         // erroring on what amounts to a no-op ProxyJump.
         let tcp = open_tcp(&target_cfg.hostname, target_cfg.port).await?;
-        let handle = connect_over_stream(tcp, &target_cfg, route).await?;
+        let handle = connect_over_stream(
+            tcp,
+            &target_cfg,
+            route,
+            lease_ctx.target_requires_system_agent,
+        )
+        .await?;
         return Ok(Connection {
             handle,
             resolved: target_cfg,
@@ -836,12 +859,15 @@ async fn connect_via_proxy_jump(
 
     let mut handles: Vec<russh::client::Handle<Handler>> = Vec::with_capacity(chain.len());
     for (i, hop_cfg) in chain.iter().enumerate() {
-        ensure_hop_leased(hop_cfg, &target_cfg.alias, lease_ctx).await?;
+        // An automatic target grant covered the full resolved chain when it
+        // was activated; a separate human hop grant must not broaden it.
+        let hop_requires_system_agent = lease_ctx.target_requires_system_agent
+            || ensure_hop_leased(hop_cfg, &target_cfg.alias, lease_ctx).await?;
         if i == 0 {
             let tcp = open_tcp(&hop_cfg.hostname, hop_cfg.port).await?;
             // Intermediate hops never route forwarded-tcpip channels: only
             // the final target's `Handler` gets `route`.
-            let handle = connect_over_stream(tcp, hop_cfg, None).await?;
+            let handle = connect_over_stream(tcp, hop_cfg, None, hop_requires_system_agent).await?;
             handles.push(handle);
         } else {
             let prev = handles
@@ -861,7 +887,8 @@ async fn connect_via_proxy_jump(
                     source,
                 })?;
             let stream = channel.into_stream();
-            let handle = connect_over_stream(stream, hop_cfg, None).await?;
+            let handle =
+                connect_over_stream(stream, hop_cfg, None, hop_requires_system_agent).await?;
             handles.push(handle);
         }
     }
@@ -881,7 +908,13 @@ async fn connect_via_proxy_jump(
             source,
         })?;
     let stream = channel.into_stream();
-    let handle = connect_over_stream(stream, &target_cfg, route).await?;
+    let handle = connect_over_stream(
+        stream,
+        &target_cfg,
+        route,
+        lease_ctx.target_requires_system_agent,
+    )
+    .await?;
 
     Ok(Connection {
         handle,
@@ -941,24 +974,22 @@ async fn ensure_hop_leased(
     hop_cfg: &HostConfig,
     target: &str,
     lease_ctx: &LeaseContext,
-) -> Result<(), SshError> {
+) -> Result<bool, SshError> {
     if vault::get_entry(&hop_cfg.alias).await.is_none() {
-        return Ok(());
+        return Ok(false);
     }
-    let authorized = lease::check_authorized(
+    let grant = lease::resolve_grant(
         lease_ctx.caller_pid,
         &hop_cfg.alias,
         lease_ctx.lease_token.as_deref(),
     )
     .await;
-    if authorized {
-        Ok(())
-    } else {
-        Err(SshError::JumpHostLeaseRequired {
+    grant
+        .map(|grant| grant.requires_system_agent())
+        .ok_or_else(|| SshError::JumpHostLeaseRequired {
             hop: hop_cfg.alias.clone(),
             target: target.to_string(),
         })
-    }
 }
 
 /// Expand `hosts` (as requested via `Request::RequestLease`) to also include
@@ -979,6 +1010,44 @@ pub async fn expand_lease_hosts(hosts: &[String]) -> Result<Vec<String>, SshErro
 pub async fn expand_lease_hosts_for_request(hosts: &[String]) -> Result<Vec<String>, SshError> {
     let config = SshConfig::load_default();
     expand_lease_hosts_for_request_with_config(&config, hosts).await
+}
+
+/// Whether every host in an exact lease scope can authenticate only through
+/// the default system SSH agent.
+///
+/// A locked vault makes absence from [`vault::get_entry`] ambiguous, so it is
+/// never treated as an OpenSSH-config host. Config-backed hosts qualify only
+/// when they use `$SSH_AUTH_SOCK` and have no local `IdentityFile` fallback.
+/// This keeps an automatic lease from silently authorizing key-file or custom
+/// agent credentials.
+pub async fn scope_uses_system_agent(hosts: &[String]) -> Result<bool, SshError> {
+    if vault::exists() && !vault::is_cached().await {
+        return Ok(false);
+    }
+
+    // Unit tests must not consume the developer's real ~/.ssh/config.
+    #[cfg(test)]
+    let config = SshConfig::default();
+    #[cfg(not(test))]
+    let config = SshConfig::load_default();
+    for host in hosts {
+        if let Some(entry) = vault::get_entry(host).await {
+            if !matches!(entry.auth, vault::AuthMethod::Agent) {
+                return Ok(false);
+            }
+            continue;
+        }
+
+        let host_config = config.resolve_for_connection(host)?;
+        if !config_uses_system_agent_only(&host_config) {
+            return Ok(false);
+        }
+    }
+    Ok(!hosts.is_empty())
+}
+
+fn config_uses_system_agent_only(config: &HostConfig) -> bool {
+    config.identity_agent.is_none() && config.identity_files.is_empty()
 }
 
 async fn expand_lease_hosts_for_request_with_config(
@@ -1183,6 +1252,7 @@ async fn connect_over_stream<S>(
     stream: S,
     host_cfg: &HostConfig,
     route: Option<ForwardRoute>,
+    require_system_agent: bool,
 ) -> Result<russh::client::Handle<Handler>, SshError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1196,7 +1266,7 @@ where
     let mut handle = russh::client::connect_stream(config, stream, handler)
         .await
         .map_err(|e| add_handshake_context(e, &host_cfg.hostname, host_cfg.port))?;
-    authenticate(&mut handle, host_cfg).await?;
+    authenticate(&mut handle, host_cfg, require_system_agent).await?;
     Ok(handle)
 }
 
@@ -1206,6 +1276,7 @@ where
 async fn authenticate(
     handle: &mut russh::client::Handle<Handler>,
     host_cfg: &HostConfig,
+    require_system_agent: bool,
 ) -> Result<(), SshError> {
     let hash_alg = handle
         .best_supported_rsa_hash()
@@ -1214,9 +1285,24 @@ async fn authenticate(
         .flatten()
         .flatten();
 
+    // Resolve the vault credential once, then both validate and consume this
+    // exact snapshot. A concurrent host edit cannot swap Password/Key File in
+    // after an automatic system-agent lease was checked.
+    let vault_entry = vault::get_entry(&host_cfg.alias).await;
+    if require_system_agent
+        && !auth_matches_system_agent_policy(
+            vault_entry.as_ref().map(|entry| &entry.auth),
+            host_cfg,
+        )
+    {
+        return Err(SshError::SystemAgentAuthRequired {
+            host: host_cfg.alias.clone(),
+        });
+    }
+
     // Vault profiles are explicit: use exactly the method the human chose.
     // This avoids surprising fallback from Password/Key File to ssh-agent.
-    if let Some(entry) = vault::get_entry(&host_cfg.alias).await {
+    if let Some(entry) = vault_entry {
         return match entry.auth {
             vault::AuthMethod::Agent => {
                 if try_agent_auth(handle, host_cfg, hash_alg).await? {
@@ -1321,6 +1407,17 @@ async fn authenticate(
     Err(SshError::AuthFailed {
         host: host_cfg.alias.clone(),
     })
+}
+
+fn auth_matches_system_agent_policy(
+    vault_auth: Option<&vault::AuthMethod>,
+    host_cfg: &HostConfig,
+) -> bool {
+    match vault_auth {
+        Some(vault::AuthMethod::Agent) => true,
+        Some(vault::AuthMethod::Password { .. } | vault::AuthMethod::KeyFile { .. }) => false,
+        None => config_uses_system_agent_only(host_cfg),
+    }
 }
 
 fn reject_unsafe_local_rsa(key: &PrivateKey, path: &Path) -> Result<(), SshError> {
@@ -1995,6 +2092,42 @@ Host myhost
         let cfg = SshConfig::parse(contents);
         let resolved = cfg.resolve("myhost");
         assert_eq!(resolved.identity_agent, Some(IdentityAgentValue::Disabled));
+    }
+
+    #[test]
+    fn system_agent_scope_rejects_custom_agent_and_identity_file_fallbacks() {
+        let default_agent = SshConfig::default().resolve("web");
+        assert!(config_uses_system_agent_only(&default_agent));
+        assert!(auth_matches_system_agent_policy(None, &default_agent));
+        assert!(auth_matches_system_agent_policy(
+            Some(&vault::AuthMethod::Agent),
+            &default_agent,
+        ));
+        assert!(!auth_matches_system_agent_policy(
+            Some(&vault::AuthMethod::Password {
+                password: "test-secret".to_string(),
+            }),
+            &default_agent,
+        ));
+        assert!(!auth_matches_system_agent_policy(
+            Some(&vault::AuthMethod::KeyFile {
+                path: "~/.ssh/id_ed25519".to_string(),
+            }),
+            &default_agent,
+        ));
+
+        let custom_agent =
+            SshConfig::parse("Host web\n  IdentityAgent ~/.1password/agent.sock\n").resolve("web");
+        assert!(!config_uses_system_agent_only(&custom_agent));
+        assert!(!auth_matches_system_agent_policy(None, &custom_agent));
+
+        let disabled_agent = SshConfig::parse("Host web\n  IdentityAgent none\n").resolve("web");
+        assert!(!config_uses_system_agent_only(&disabled_agent));
+
+        let identity_file =
+            SshConfig::parse("Host web\n  IdentityFile ~/.ssh/id_ed25519\n").resolve("web");
+        assert!(!config_uses_system_agent_only(&identity_file));
+        assert!(!auth_matches_system_agent_policy(None, &identity_file));
     }
 
     #[test]

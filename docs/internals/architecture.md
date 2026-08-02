@@ -71,8 +71,9 @@ Ownership is deliberate:
   time-bounded desktop session containing one zeroizing `SecretString` in Rust
   memory; only status and countdowns enter the WebView.
   Its idle timeout comes from the same owner-only `vault-settings.json` used by
-  daemon leases, while each Agent request still needs its own exact-scope human
-  approval. SSH Password is transient WebView state, crosses the local Tauri
+  daemon leases. Each Agent request still needs an exact-scope lease; only a
+  default-system-agent-only scope may activate it without human approval. SSH
+  Password is transient WebView state, crosses the local Tauri
   command boundary as `SecretString`, and is cleared after submission. Host
   form serialization sends SSH Password or key-file path only while adding a
   profile or explicitly changing its authentication; ordinary edits send
@@ -80,10 +81,12 @@ Ownership is deliberate:
   file picker. Hosts also provides a human-only host-key bootstrap that
   re-probes a confirmed endpoint/fingerprint before recording it, plus an
   end-to-end connection test that uses an ordinary daemon lease and a
-  short-lived reserved PTY session. On macOS, the desktop process maps Tauri's
-  system-theme events to
-  explicit light/dark AppKit Dock icons while the bundle icon remains the
-  launch-time fallback. The bundle keeps only its private daemon at
+  short-lived reserved PTY session. On macOS, the packaged desktop leaves the
+  Dock icon bundle-owned through `CFBundleIconName` and the adaptive
+  `Assets.car`; it does not replace that icon with a process-level AppKit image,
+  so macOS retains platform sizing and effects. Direct Tauri bundles and the
+  package fallback use the same transparent, safe-margin static icon. The
+  bundle keeps only its private daemon at
   `Helpers/slooshd`; it contains no public `sloosh` CLI and creates no CLI link.
 
 The command-line distribution always keeps `sloosh` and `slooshd` in the same
@@ -151,6 +154,13 @@ minute vault timeout; the daemon reads it independently and retains its separate
 8-hour hard lifetime cap. Exact lifetimes and reaper intervals belong to
 `SECURITY.md`.
 
+Active leases record whether they came from human approval or the automatic
+system-agent policy. Automatic activation requires every exact target and
+ProxyJump alias to use vault `Agent` authentication or default
+`$SSH_AUTH_SOCK` with no `IdentityFile` or custom `IdentityAgent`. The daemon
+rechecks that restriction whenever it resolves caller authority and whenever a
+stable forward grant is used. Human-approved leases are not method-restricted.
+
 ### Stable `LeaseGrant`
 
 A short-lived CLI PID cannot own a background forward. At creation,
@@ -170,8 +180,9 @@ Lease expiry has three intentional outcomes:
 
 ## 4. Approval, ProxyJump, and host keys
 
-Request-time host scope may be incomplete while vault is locked. Approval
-therefore resolves scope independently on human and daemon sides:
+Request-time host scope may be incomplete while vault is locked. A scope the
+daemon can authoritatively prove is system-agent-only activates automatically.
+Every other scope resolves approval independently on human and daemon sides:
 
 ```text
 agent CLI       daemon                         human CLI
@@ -215,13 +226,20 @@ agent CLI          daemon                    native helper
     |                 |---------- begin --------->|
     |                 |<------ password ----------| login Keychain
     |                 | unlock + expand exact list|
+    |                 | system Agent? -> activate |
     |                 |---------- list ---------->|
-    |                 | human confirms + chooses  |
+    |                 | direct method buttons     |
     |                 |<-- Touch ID/PIN/Master ----| native secure input
     |                 | compare again + activate  |
     |<------ Ok ------|                            |
 ```
 
+For a system-agent-only scope, helper returns the Keychain credential used for
+authoritative preview and exits without showing approval UI; daemon activates
+a method-restricted lease. Other scopes show every target and ProxyJump
+dependency plus three direct Touch ID, PIN, and Master Password buttons, with
+no picker-plus-Continue step. The exact scope is a bounded scroll view so long
+aliases or many dependencies cannot expand the approval window without limit.
 PIN verification is a daemon-local state machine with persistent backoff. It
 does not alter the request's Master Password failure budget. A Master Password
 selected in native UI is verified by reopening the vault, then the daemon
@@ -380,6 +398,5 @@ gui/
   src/               Svelte status, setup, and transient host forms
     hostForm.ts      pure host validation and command serialization
   src-tauri/         fixed desktop command allowlist and bundle configuration
-    dock_icon.rs     macOS Dock icon synchronization with system appearance
     host_commands.rs vault-backed host command boundary
 ```

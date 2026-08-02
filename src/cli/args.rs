@@ -7,10 +7,11 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "sloosh",
     version,
-    about = "SSH-in-the-loop: persistent remote shells + human-approved credential access for coding agents",
+    about = "SSH-in-the-loop: persistent remote shells + scoped credential access for coding agents",
     long_about = "sloosh gives a coding agent persistent SSH shells (cwd/env/background jobs survive \
-across calls) while keeping credentials out of the agent's reach: connecting to a host requires a \
-human to approve a lease out-of-band. Run `sloosh status` any time you're unsure what's going on."
+across calls) while keeping credentials out of the agent's reach. System SSH-agent-only scopes get \
+bounded leases automatically; password, key-file, and custom-agent scopes require out-of-band human \
+approval. Run `sloosh status` any time you're unsure what's going on."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -37,7 +38,7 @@ pub enum Command {
     Ls(LsArgs),
     /// Kill a session (terminates the remote shell).
     Kill(KillArgs),
-    /// Request an access lease for one or more hosts (agent side of authorization).
+    /// Request a scoped lease; system SSH-agent-only scopes authorize automatically.
     Request(RequestArgs),
     /// Approve a pending lease request (human side, run in another terminal).
     Approve(ApproveArgs),

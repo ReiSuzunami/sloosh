@@ -150,7 +150,7 @@ async fn cmd_init(args: InitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-const CLI_APPROVAL_SETUP: &str = "Approval setup:\n  The CLI uses out-of-band approval from another human terminal. Approve each pending lease with the printed `sloosh approve <ID>` command.\n  On macOS, the optional Sloosh desktop app owns login Keychain, Touch ID, and PIN enrollment in its Setup and Security screens. The CLI does not launch the native helper.";
+const CLI_APPROVAL_SETUP: &str = "Approval setup:\n  Scopes using only the default system SSH agent, with no key-file fallback, authorize automatically. Approve every other pending lease from another human terminal with the printed `sloosh approve <ID>` command.\n  On macOS, the optional Sloosh desktop app owns login Keychain, Touch ID, and PIN enrollment in its Setup and Security screens. The CLI does not launch the native helper.";
 
 fn cli_approval_setup_message() -> &'static str {
     CLI_APPROVAL_SETUP

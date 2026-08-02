@@ -6,9 +6,9 @@
 //! intended behavior, not a bug):
 //!
 //! - **Pending requests**: created by `sloosh request <host>...`, waiting
-//!   for a human to run `sloosh approve <id>` in another terminal. Expire
-//!   after [`PENDING_EXPIRY`].
-//! - **Active leases**: created by `approve`, binding a set of hosts to an
+//!   for automatic system-agent policy or a human `sloosh approve <id>` in
+//!   another terminal. Expire after [`PENDING_EXPIRY`].
+//! - **Active leases**: created by automatic policy or `approve`, binding a set of hosts to an
 //!   "anchor" process (docs/internals/architecture.md's ancestry-anchoring scheme) so the
 //!   agent process (and anything it spawns) can keep making requests without
 //!   re-approval, until the configured vault timeout of no matching calls.
@@ -37,9 +37,9 @@ use tokio::sync::Mutex as AsyncMutex;
 /// Default lease idle timeout when no shared vault setting has been saved.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// Hard ceiling for an approved lease, even while actively used. A fresh
-/// human approval is required after this point so long-lived forwards and
-/// busy automation cannot keep credentials authorized indefinitely.
+/// Hard ceiling for an active lease, even while actively used. A fresh request
+/// (and human approval when policy requires it) is needed after this point so
+/// long-lived forwards and busy automation cannot retain authority forever.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// How often the background expiry sweep prunes leases and, when the last
@@ -191,6 +191,13 @@ struct ActiveLease {
     /// Escape-hatch token (`SLOOSH_LEASE=...`), shown once in `approve`'s
     /// confirmation output (docs/internals/architecture.md).
     token: String,
+    authorization: LeaseAuthorization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseAuthorization {
+    Human,
+    SystemAgent,
 }
 
 /// Opaque handle to the exact active lease that authorized one host.
@@ -202,6 +209,16 @@ struct ActiveLease {
 pub(crate) struct LeaseGrant {
     token: String,
     host: String,
+    authorization: LeaseAuthorization,
+}
+
+impl LeaseGrant {
+    /// Whether this grant came from automatic default-system-agent policy.
+    /// Connection setup carries this restriction to the exact auth snapshot
+    /// it uses so a concurrent host edit cannot broaden authority.
+    pub(crate) fn requires_system_agent(&self) -> bool {
+        self.authorization == LeaseAuthorization::SystemAgent
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +227,7 @@ impl LeaseGrant {
         Self {
             token: "test-invalid-grant".to_string(),
             host: host.to_string(),
+            authorization: LeaseAuthorization::Human,
         }
     }
 }
@@ -368,8 +386,14 @@ pub enum RequestOutcome {
     /// ancestry) already covers every requested host — docs/internals/architecture.md's
     /// idempotency guarantee. No human action needed.
     AlreadyAuthorized,
-    /// A new pending request was created; a human needs to `approve` it.
+    /// A new pending request was created; daemon policy or a human must resolve it.
     Pending(LeaseRequestSummary),
+}
+
+#[derive(Debug)]
+pub enum SystemAgentApprovalOutcome {
+    NotEligible,
+    Activated(LeaseActivatedInfo),
 }
 
 pub async fn request_lease(
@@ -564,6 +588,77 @@ pub async fn approve_lease_native(
         .await
 }
 
+/// Activate a pending request without human approval only when every host in
+/// its exact scope is restricted to the default system SSH agent. Automatic
+/// leases retain that restriction for their full lifetime; authorization is
+/// rechecked before every later host operation and forward grant use.
+pub async fn approve_lease_system_agent(
+    id: &str,
+    expected_hosts: Option<&[String]>,
+) -> Result<SystemAgentApprovalOutcome, LeaseError> {
+    let requested_hosts = {
+        let mut st = state().lock().await;
+        prune_expired(&mut st).await;
+        st.pending
+            .get(id)
+            .map(|pending| pending.hosts.clone())
+            .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?
+    };
+
+    // Until the encrypted vault is cached, absence of an entry cannot prove
+    // that an alias is config-backed. Native macOS preview unlocks it before
+    // retrying this policy check.
+    if vault::exists() && !vault::is_cached().await {
+        return Ok(SystemAgentApprovalOutcome::NotEligible);
+    }
+
+    let resolved_hosts = expand_approval_hosts(&requested_hosts).await?;
+    if let Some(expected_hosts) = expected_hosts {
+        if expected_hosts != resolved_hosts {
+            return Err(LeaseError::ApprovedHostsMismatch {
+                id: id.to_string(),
+                approved: format_host_list(expected_hosts),
+                resolved: format_host_list(&resolved_hosts),
+            });
+        }
+    }
+    if !ssh::scope_uses_system_agent(&resolved_hosts).await? {
+        return Ok(SystemAgentApprovalOutcome::NotEligible);
+    }
+
+    let mut st = state().lock().await;
+    prune_expired(&mut st).await;
+    let final_requested_hosts = st
+        .pending
+        .get(id)
+        .map(|pending| pending.hosts.clone())
+        .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?;
+    if final_requested_hosts != requested_hosts {
+        return Err(LeaseError::ApprovedHostsMismatch {
+            id: id.to_string(),
+            approved: format_host_list(&requested_hosts),
+            resolved: format_host_list(&final_requested_hosts),
+        });
+    }
+    let final_resolved_hosts = expand_approval_hosts(&final_requested_hosts).await?;
+    if final_resolved_hosts != resolved_hosts {
+        return Err(LeaseError::ApprovedHostsMismatch {
+            id: id.to_string(),
+            approved: format_host_list(&resolved_hosts),
+            resolved: format_host_list(&final_resolved_hosts),
+        });
+    }
+    if !ssh::scope_uses_system_agent(&final_resolved_hosts).await? {
+        return Ok(SystemAgentApprovalOutcome::NotEligible);
+    }
+    Ok(SystemAgentApprovalOutcome::Activated(activate_pending(
+        &mut st,
+        id,
+        final_resolved_hosts,
+        LeaseAuthorization::SystemAgent,
+    )))
+}
+
 /// Drop cache populated only for an unsuccessful native preview. Preserve it
 /// when another active lease still owns cache lifetime.
 pub async fn discard_native_preview() {
@@ -661,28 +756,40 @@ async fn approve_lease_for_chain_checked(
         }
     }
 
+    Ok(activate_pending(
+        &mut st,
+        id,
+        resolved_hosts,
+        LeaseAuthorization::Human,
+    ))
+}
+
+fn activate_pending(
+    st: &mut LeaseState,
+    id: &str,
+    resolved_hosts: Vec<String>,
+    authorization: LeaseAuthorization,
+) -> LeaseActivatedInfo {
     let pending = st
         .pending
         .remove(id)
-        .expect("still present: the state lock is held continuously since get_mut");
-
+        .expect("pending request was verified while the state lock was held");
     let token = generate_lease_token();
-    let hosts_set: HashSet<String> = resolved_hosts.iter().cloned().collect();
     st.active.push(ActiveLease {
         anchor: pending.anchor.clone(),
-        hosts: hosts_set,
+        hosts: resolved_hosts.iter().cloned().collect(),
         created_at: Instant::now(),
         last_used: Instant::now(),
         token: token.clone(),
+        authorization,
     });
-
-    Ok(LeaseActivatedInfo {
+    LeaseActivatedInfo {
         hosts: resolved_hosts,
         anchor_name: pending.anchor.name,
         anchor_pid: pending.anchor.pid,
         token,
         unverified_hosts: Vec::new(),
-    })
+    }
 }
 
 async fn expand_approval_hosts(hosts: &[String]) -> Result<Vec<String>, ssh::SshError> {
@@ -696,6 +803,16 @@ async fn expand_approval_hosts(hosts: &[String]) -> Result<Vec<String>, ssh::Ssh
     let config = ssh::SshConfig::load_default();
 
     ssh::expand_lease_hosts_with_config(&config, hosts).await
+}
+
+async fn host_scope_still_uses_system_agent(host: &str) -> bool {
+    let requested = [host.to_string()];
+    let Ok(expanded) = expand_approval_hosts(&requested).await else {
+        return false;
+    };
+    ssh::scope_uses_system_agent(&expanded)
+        .await
+        .unwrap_or(false)
 }
 
 fn format_host_list(hosts: &[String]) -> String {
@@ -789,36 +906,51 @@ async fn resolve_grant_for_chain(
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
 
-    if let Some(token) = lease_token {
-        if let Some(l) = st
-            .active
-            .iter_mut()
-            .find(|l| l.token == token && l.hosts.contains(host))
-        {
-            if touch {
-                l.last_used = Instant::now();
-            }
-            return Some(LeaseGrant {
-                token: l.token.clone(),
-                host: host.to_string(),
-            });
-        }
-    }
-
-    if let Some(l) = st
+    let matching = |lease: &&mut ActiveLease| {
+        lease.hosts.contains(host)
+            && (lease_token.is_some_and(|token| lease.token == token)
+                || chain_contains_anchor(&lease.anchor, chain))
+    };
+    let index = st
         .active
         .iter_mut()
-        .find(|l| l.hosts.contains(host) && chain_contains_anchor(&l.anchor, chain))
-    {
+        .enumerate()
+        .filter(|(_, lease)| matching(lease))
+        .min_by_key(|(_, lease)| lease.authorization != LeaseAuthorization::Human)
+        .map(|(index, _)| index)?;
+    let authorization = st.active[index].authorization;
+    let token = st.active[index].token.clone();
+    if authorization == LeaseAuthorization::Human {
         if touch {
-            l.last_used = Instant::now();
+            st.active[index].last_used = Instant::now();
         }
         return Some(LeaseGrant {
-            token: l.token.clone(),
+            token,
             host: host.to_string(),
+            authorization,
         });
     }
-    None
+    drop(st);
+
+    if !host_scope_still_uses_system_agent(host).await {
+        return None;
+    }
+
+    let mut st = state().lock().await;
+    prune_expired(&mut st).await;
+    let lease = st.active.iter_mut().find(|lease| {
+        lease.token == token
+            && lease.hosts.contains(host)
+            && lease.authorization == LeaseAuthorization::SystemAgent
+    })?;
+    if touch {
+        lease.last_used = Instant::now();
+    }
+    Some(LeaseGrant {
+        token,
+        host: host.to_string(),
+        authorization,
+    })
 }
 
 async fn grant_is_active(grant: &LeaseGrant, touch: bool) -> bool {
@@ -832,8 +964,29 @@ async fn grant_is_active(grant: &LeaseGrant, touch: bool) -> bool {
     else {
         return false;
     };
+    let authorization = l.authorization;
+    if authorization == LeaseAuthorization::Human {
+        if touch {
+            l.last_used = Instant::now();
+        }
+        return true;
+    }
+    drop(st);
+
+    if !host_scope_still_uses_system_agent(&grant.host).await {
+        return false;
+    }
+    let mut st = state().lock().await;
+    prune_expired(&mut st).await;
+    let Some(lease) = st.active.iter_mut().find(|lease| {
+        lease.token == grant.token
+            && lease.hosts.contains(&grant.host)
+            && lease.authorization == LeaseAuthorization::SystemAgent
+    }) else {
+        return false;
+    };
     if touch {
-        l.last_used = Instant::now();
+        lease.last_used = Instant::now();
     }
     true
 }
@@ -1005,6 +1158,48 @@ mod tests {
     /// `sloosh vault init` would.
     fn create_test_vault(password: &[u8]) {
         vault::create(&vault::VaultData::default(), password).expect("create test vault");
+    }
+
+    fn create_test_vault_with_auth(password: &[u8], auth: vault::AuthMethod) {
+        let mut data = vault::VaultData::default();
+        data.hosts.insert(
+            "web".to_string(),
+            vault::HostEntry {
+                hostname: "web.example.test".to_string(),
+                port: Some(22),
+                user: Some("deploy".to_string()),
+                auth,
+                route: crate::proto::HostRoute::Direct,
+            },
+        );
+        vault::create(&data, password).expect("create test vault with auth method");
+    }
+
+    fn create_test_vault_with_agent_jump(password: &[u8]) {
+        let mut data = vault::VaultData::default();
+        data.hosts.insert(
+            "web".to_string(),
+            vault::HostEntry {
+                hostname: "web.example.test".to_string(),
+                port: Some(22),
+                user: Some("deploy".to_string()),
+                auth: vault::AuthMethod::Agent,
+                route: crate::proto::HostRoute::ManagedHost {
+                    alias: "bastion".to_string(),
+                },
+            },
+        );
+        data.hosts.insert(
+            "bastion".to_string(),
+            vault::HostEntry {
+                hostname: "bastion.example.test".to_string(),
+                port: Some(22),
+                user: Some("deploy".to_string()),
+                auth: vault::AuthMethod::Agent,
+                route: crate::proto::HostRoute::Direct,
+            },
+        );
+        vault::create(&data, password).expect("create test vault with Agent jump");
     }
 
     fn test_vault_entry(jump: &str) -> vault::HostEntry {
@@ -1222,6 +1417,7 @@ mod tests {
         let wrong_host = LeaseGrant {
             token: grant.token.clone(),
             host: "db".to_string(),
+            authorization: grant.authorization,
         };
         assert!(!peek_grant(&wrong_host).await);
 
@@ -1262,6 +1458,10 @@ mod tests {
         let activated = approve_lease_for_chain(&approver_chain(), &info.id, b"pw")
             .await
             .unwrap();
+        assert!(
+            check_authorized_for_chain(&chain, "db", Some("wrong-token")).await,
+            "a bad optional token must not suppress matching ancestry authority"
+        );
 
         // A completely unrelated ancestry chain fails without the token...
         let unrelated_chain = vec![ancestor(300, 50, Some("something-else"))];
@@ -1810,6 +2010,173 @@ mod tests {
             .unwrap();
         assert_eq!(activated.hosts, preview);
         assert!(check_authorized_for_chain(&chain, "web", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn system_agent_scope_activates_without_human_approval() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(955, 110, Some("sloosh")),
+            ancestor(954, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+
+        let SystemAgentApprovalOutcome::Activated(activated) =
+            approve_lease_system_agent(&info.id, None).await.unwrap()
+        else {
+            panic!("default SSH_AUTH_SOCK scope should activate automatically");
+        };
+        assert_eq!(activated.hosts, vec!["web".to_string()]);
+        assert!(check_authorized_for_chain(&chain, "web", None).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn vault_agent_scope_auto_activates_but_auth_change_revokes_it() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(957, 110, Some("sloosh")),
+            ancestor(956, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_auth(b"correct", vault::AuthMethod::Agent);
+        let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+        let SystemAgentApprovalOutcome::Activated(_) =
+            approve_lease_system_agent(&info.id, Some(&preview))
+                .await
+                .unwrap()
+        else {
+            panic!("vault Agent scope should activate automatically");
+        };
+        assert!(check_authorized_for_chain(&chain, "web", None).await);
+        let grant = resolve_grant_for_chain(&chain, "web", None, true)
+            .await
+            .expect("automatic lease should create a stable grant");
+        assert!(grant.requires_system_agent());
+        assert!(check_grant(&grant).await);
+
+        vault::update_entry(
+            vault::HostUpdate {
+                alias: "web".to_string(),
+                hostname: "web.example.test".to_string(),
+                port: Some(22),
+                user: Some("deploy".to_string()),
+                route: crate::proto::HostRoute::Direct,
+            },
+            Some(vault::AuthMethod::KeyFile {
+                path: "~/.ssh/id_ed25519".to_string(),
+            }),
+            b"correct",
+        )
+        .await
+        .unwrap();
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!check_grant(&grant).await);
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn vault_password_scope_still_requires_human_approval() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(959, 110, Some("sloosh")),
+            ancestor(958, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_auth(
+            b"correct",
+            vault::AuthMethod::Password {
+                password: "ssh-secret".to_string(),
+            },
+        );
+        let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+        assert!(matches!(
+            approve_lease_system_agent(&info.id, Some(&preview))
+                .await
+                .unwrap(),
+            SystemAgentApprovalOutcome::NotEligible
+        ));
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(state().lock().await.pending.contains_key(&info.id));
+
+        reset_state().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_lease_revalidates_proxy_jump_authentication() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+
+        let chain = vec![
+            ancestor(961, 110, Some("sloosh")),
+            ancestor(960, 100, Some("claude")),
+        ];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending");
+        };
+        create_test_vault_with_agent_jump(b"correct");
+        let preview = preview_native_approval(&info.id, b"correct").await.unwrap();
+        assert_eq!(preview, vec!["web".to_string(), "bastion".to_string()]);
+        let SystemAgentApprovalOutcome::Activated(_) =
+            approve_lease_system_agent(&info.id, Some(&preview))
+                .await
+                .unwrap()
+        else {
+            panic!("all-Agent route should activate automatically");
+        };
+        let grant = resolve_grant_for_chain(&chain, "web", None, true)
+            .await
+            .expect("automatic target lease should resolve");
+
+        vault::update_entry(
+            vault::HostUpdate {
+                alias: "bastion".to_string(),
+                hostname: "bastion.example.test".to_string(),
+                port: Some(22),
+                user: Some("deploy".to_string()),
+                route: crate::proto::HostRoute::Direct,
+            },
+            Some(vault::AuthMethod::KeyFile {
+                path: "~/.ssh/id_ed25519".to_string(),
+            }),
+            b"correct",
+        )
+        .await
+        .unwrap();
+        assert!(!check_authorized_for_chain(&chain, "web", None).await);
+        assert!(!check_grant(&grant).await);
 
         reset_state().await;
     }

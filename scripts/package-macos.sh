@@ -120,6 +120,7 @@ contents="$app/Contents"
 installer="$tmp_dir/Install Sloosh.app"
 installer_contents="$installer/Contents"
 icon_source="$repo_root/packaging/macos/AppIcon.png"
+icon_validator_source="$repo_root/packaging/macos/validate-app-icon.swift"
 adaptive_icon_source="$repo_root/packaging/macos/Sloosh.icon"
 iconset="$tmp_dir/Sloosh.iconset"
 adaptive_icon_output="$tmp_dir/adaptive-icon"
@@ -153,6 +154,10 @@ icon_alpha="$(sips -g hasAlpha "$icon_source" | awk '$1 == "hasAlpha:" { print $
   echo "AppIcon.png must be a 1024x1024 PNG with alpha" >&2
   exit 1
 }
+xcrun swiftc -swift-version 5 -O "$icon_validator_source" \
+  -framework CoreGraphics -framework ImageIO \
+  -o "$tmp_dir/validate-app-icon"
+"$tmp_dir/validate-app-icon" "$icon_source"
 
 mkdir -p "$iconset"
 while read -r pixels filename; do

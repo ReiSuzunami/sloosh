@@ -463,7 +463,7 @@
       <section class="page-intro" aria-labelledby="approval-heading">
         <p class="section-kicker">Local verification</p>
         <h2 id="approval-heading">Approval methods</h2>
-        <p>Choose how Sloosh authenticates after showing the exact host scope.</p>
+        <p>Password, key-file, and custom-agent scopes show three direct approval buttons. System SSH-agent-only scopes authorize automatically.</p>
       </section>
 
       <section class="settings-list" aria-label="Approval methods">

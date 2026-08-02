@@ -5,7 +5,8 @@
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
-为 Coding Agent 提供持久 SSH 会话与带外人工批准；Agent 无需接触密码或私钥。
+为 Coding Agent 提供持久 SSH 会话；系统 SSH Agent 凭据可自动授权，密码、私钥文件与
+自定义 Agent 仍由人类带外批准。Agent 无需接触 secret。
 
 ## 安装
 
@@ -40,7 +41,8 @@ Homebrew、crates.io 与命令行压缩包提供 `sloosh` 和配套 `slooshd`，
    TTY、输入或读取 secret。如果我还安装了桌面 App，引导我亲自打开 Setup/Security
    完成原生解锁设置。
 3. 等我确认完成后，只读运行 `sloosh skill status --agent auto` 和 `sloosh status`，
-   报告结果。任何主机访问仍须带外人工批准。
+   报告结果。仅使用默认系统 SSH Agent 且无私钥文件 fallback 的完整主机范围会自动
+   获得限时 lease；其他主机访问仍须带外人工批准。未知或变化的 host key 始终由我确认。
 ```
 
 不使用 Agent 时，按[使用手册](./docs/manual.zh-CN.md)完成初始化与首次连接。

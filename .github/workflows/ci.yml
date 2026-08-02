@@ -126,6 +126,8 @@ jobs:
       - name: Check macOS packaging sources
         run: |
           bash -n scripts/package-macos.sh
+          xcrun swiftc -typecheck packaging/macos/validate-app-icon.swift \
+            -framework CoreGraphics -framework ImageIO
           xcrun swiftc -typecheck packaging/macos/install-sloosh.swift \
             -framework AppKit -framework Security
           xcrun swiftc -typecheck packaging/macos/native-approval.swift \

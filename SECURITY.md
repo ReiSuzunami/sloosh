@@ -30,8 +30,9 @@ Sloosh assumes:
 - the kernel correctly reports Unix socket peer credentials;
 - the OS user account, installed binary path, and human approval terminal are
   not already fully compromised;
-- the human checks the exact host list and verifies new host-key fingerprints
-  against an independent source when needed;
+- for scopes that require approval, the human checks the exact host list; the
+  human always verifies new host-key fingerprints against an independent
+  source when needed;
 - remote SSH servers and their filesystems may fail or behave maliciously, but
   cannot bypass local UDS permissions without a separate local compromise.
 
@@ -110,6 +111,19 @@ only when:
 
 and the lease includes the requested host alias.
 
+`RequestLease` may activate that same bounded lease without human approval
+only when every target and ProxyJump alias uses the default system
+`$SSH_AUTH_SOCK`, with no `IdentityFile` or custom `IdentityAgent` fallback.
+Vault profiles qualify only with explicit `Agent` authentication and only
+after the daemon can authoritatively inspect the unlocked vault. Automatic
+leases retain this authentication restriction: every host operation and
+stable forward-grant check revalidates it, so a changed method fails closed.
+SSH connection setup also carries the automatic-grant restriction to the exact
+credential snapshot it authenticates with; a concurrent host edit cannot swap
+in Password, Key File, `IdentityFile`, or custom `IdentityAgent` authority
+after lease validation.
+Unknown and changed host keys keep their separate human-confirmation boundary.
+
 Vault-backed ProxyJump aliases need their own host coverage. Lease approval
 compares the human CLI's expanded `approved_hosts` list with an independent
 daemon-side expansion after unlock. A missing, reordered, stale, or changed
@@ -122,12 +136,15 @@ The DMG-installed macOS path stores a copy of vault master password in local
 login Keychain. Bundled helper verifies its parent is the daemon helper or
 desktop executable,
 releases password only to that trusted parent over anonymous pipe so daemon can
-expand scope, then native UI confirms the exact list and asks the human to
-choose Touch ID, PIN, or Master Password. Only after that choice does helper
-run Touch ID and compare LocalAuthentication biometric domain state with
-enrollment, collect a 6-digit PIN, or collect the vault Master Password through
-a native secure field. Raw PIN never enters Svelte, the WebView, Tauri command
-arguments, logs, or the daemon wire protocol. Master Password never enters
+expand scope. A system-agent-only scope is activated automatically. Otherwise,
+native UI confirms every target and ProxyJump dependency in a bounded scroll
+view and presents direct Touch ID, PIN, and Master Password buttons. Clicking
+one starts that method without a list selection or generic confirmation step.
+Only after that choice does helper run Touch ID and compare LocalAuthentication
+biometric domain state with enrollment, collect a 6-digit PIN, or collect the
+vault Master Password through a native secure field. Raw PIN never enters
+Svelte, the WebView, Tauri command arguments, logs, or the daemon wire protocol.
+Master Password never enters
 Svelte, the WebView, Tauri command arguments, or logs; Rust verifies a selected
 Master Password by reopening the vault and repeats the exact-scope comparison
 before lease activation. The preceding Keychain-backed scope preview does not
@@ -139,8 +156,9 @@ unlock, the Tauri Rust process may retain one zeroizing `SecretString` for the
 configured desktop vault timeout; the WebView receives only method, lock state,
 and bounded countdowns. The session is dropped on manual lock, idle or 8-hour
 absolute expiry, app exit, macOS sleep, screen sleep, or user-session
-deactivation. It
-never satisfies or bypasses an Agent lease approval. SSH Password entered in the desktop Hosts form is
+deactivation. It does not approve password, key-file, or custom-agent lease
+requests; system-agent-only activation is daemon policy, not desktop-session
+authority. SSH Password entered in the desktop Hosts form is
 transient WebView state, crosses the local Tauri command boundary and verified
 owner-only Unix socket only as a redacted `SecretString`, and is cleared from
 the form after every submission attempt. It is never logged. Daemon
@@ -395,8 +413,9 @@ parent-directory sync failure is logged instead of falsely reporting an
 uncommitted operation.
 
 The desktop connection test does not bypass leases. It requests an ordinary
-exact-scope lease, runs `true` in a fresh reserved PTY session, and then kills
-that session. Success therefore covers TCP reachability, SSH handshake,
+exact-scope lease, which may activate automatically only under the
+system-agent-only policy, runs `true` in a fresh reserved PTY session, and then
+kills that session. Success therefore covers TCP reachability, SSH handshake,
 host-key verification, configured authentication, and a working remote shell.
 Pending approval, unknown keys, mismatches, ProxyJump lease coverage, and
 authentication errors remain fail closed.
@@ -410,7 +429,7 @@ additional authority after that gate.
 
 | Request or command | Required authority | Notes |
 |---|---|---|
-| `Run`, `Peek`, `Send`, `Interrupt` | active lease for host | PTY access |
+| `Run`, `Peek`, `Send`, `Interrupt` | active human-approved or system-agent-only lease for host | PTY access |
 | `Open`, `Kill` | active lease for host | create/reuse or terminate session |
 | `Put`, `Get` | negotiated connection plus active lease at start | after `TransferReady`, current stream completes under the start-time grant |
 | `Forward -L` | active lease for host | loopback listener only; stable grant retained |
@@ -420,7 +439,7 @@ additional authority after that gate.
 | `Ls`, `ForwardLs` | negotiated connection, no lease | read-only state disclosure to same UID |
 | `ForwardStop` | no lease | only reduces access |
 | `Shutdown` / `daemon stop` | no handshake or lease | operational control; same-UID DoS surface |
-| `RequestLease` | peer PID, no active lease | creates pending request and anchor; DMG macOS may complete it through Touch ID, PIN, or Master Password and return existing `Ok` |
+| `RequestLease` | peer PID, no active lease | creates pending request and anchor; exact system-agent-only scope activates automatically, otherwise DMG macOS may complete it through one direct Touch ID, PIN, or Master Password button and return existing `Ok` |
 | `DescribeLeaseRequest` | no active lease | exposes pending request details |
 | `ApproveLease` | master password, separate ancestry, exact host list | CLI requires TTY; daemon cannot prove TTY from raw protocol |
 | `VaultExists` | no lease | metadata only |
@@ -462,6 +481,7 @@ Gatekeeper limits are documented in installation guide.
 - Real accepted forward traffic revalidates and touches the lease.
 - Remote target connect timeout: 10 seconds.
 - Remote listener cancellation timeout: 2 seconds, followed by SSH teardown.
+- Native helper interaction timeout: 2 minutes; Touch ID evaluation: 60 seconds.
 - Session idle limit: 8 hours, checked every 5 minutes.
 
 Lease expiry does not terminate persistent PTY sessions or their remote
@@ -513,9 +533,12 @@ Client daemon verification compares eUID and the selected `slooshd` canonical
 path. It does not verify a code signature, binary hash, inode identity, launch
 service identity, or absence of runtime injection.
 
-Human approval grants host capability, not command intent. Once authorized, an
-agent can run arbitrary remote commands, transfer files, and create allowed
-local or remote forwards for that host. A remote forward may expose a server-
+Human approval and automatic system-agent policy both grant host capability,
+not command intent. Once authorized, an agent can run arbitrary remote
+commands, transfer files, and create allowed local or remote forwards for that
+host. Any same-UID process able to request a qualifying scope and use the
+system agent can therefore obtain this capability without a Sloosh approval
+prompt. A remote forward may expose a server-
 side listener according to sshd policy. Sloosh does not inspect shell commands
 for safety.
 

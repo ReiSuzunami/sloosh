@@ -979,6 +979,7 @@ mod tests {
             LeaseContext {
                 caller_pid: u32::MAX,
                 lease_token: None,
+                target_requires_system_agent: false,
             },
         )
         .await;

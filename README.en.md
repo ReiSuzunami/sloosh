@@ -5,8 +5,9 @@
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Persistent SSH sessions with out-of-band human approval for coding agents;
-agents never need passwords or private keys.
+Persistent SSH sessions for coding agents. System SSH-agent credentials can
+authorize automatically; passwords, key files, and custom agents still need
+out-of-band human approval. Agents never receive secrets.
 
 ## Install
 
@@ -46,8 +47,10 @@ You are my sloosh installation guide.
    If I also install the desktop app, guide me to complete native unlock setup
    myself in its Setup/Security screens.
 3. After I confirm completion, run only `sloosh skill status --agent auto` and
-   `sloosh status`, then report the results. Host access still requires
-   out-of-band human approval.
+   `sloosh status`, then report the results. A complete host scope that uses
+   only the default system SSH agent with no key-file fallback gets a bounded
+   lease automatically; other host access still needs out-of-band human
+   approval. I must always confirm unknown or changed host keys.
 ```
 
 Without an agent, follow the [manual](./docs/manual.md) for initialization and

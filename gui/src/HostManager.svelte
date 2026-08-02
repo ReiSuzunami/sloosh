@@ -688,6 +688,7 @@
       class="host-dialog"
       aria-modal="true"
       aria-labelledby="host-dialog-title"
+      onclose={closeDialog}
       in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
       out:fade={{ duration: exitDuration }}
     >
@@ -932,6 +933,7 @@
       class="host-dialog confirm-dialog"
       aria-modal="true"
       aria-labelledby="remove-host-title"
+      onclose={closeDialog}
       in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
       out:fade={{ duration: exitDuration }}
     >

@@ -1,6 +1,6 @@
 ---
 name: sloosh
-description: Use when a task needs to run commands on a remote server/VPS over SSH — deploying, checking logs, restarting services, editing files remotely — especially when the work spans multiple calls and needs a persistent shell (cwd/env/background jobs must survive between commands), or when the agent must never see SSH passwords/keys and instead needs a human to approve host access out of band.
+description: Use when a task needs to run commands on a remote server/VPS over SSH — deploying, checking logs, restarting services, editing files remotely — especially when the work spans multiple calls and needs a persistent shell (cwd/env/background jobs must survive between commands), or when the agent must never see SSH passwords/keys and credential access needs a bounded automatic system-agent lease or human approval.
 ---
 
 # sloosh
@@ -8,7 +8,8 @@ description: Use when a task needs to run commands on a remote server/VPS over S
 `sloosh` runs commands on remote hosts over SSH from a long-lived background
 daemon. It fixes two things plain `ssh`/subprocess calls don't: your shell
 state (cwd, env vars, background jobs) survives across calls, and you never
-touch a password or key — a human approves access to each host out of band.
+touch a password or key. Default system SSH-agent-only scopes authorize
+automatically; every other credential scope needs out-of-band human approval.
 
 ## Bootstrap
 
@@ -27,15 +28,20 @@ control plane and does not install the CLI. Do not use `curl | sh`, request
 credentials, bypass Gatekeeper/SmartScreen, or silently invoke a package
 manager.
 
-Once the CLI is available, explain the matching human-approval setup:
+Once the CLI is available, explain the matching authorization setup:
 
 - `sloosh init` is a human-only terminal flow and command-line-only installs
   use the separate-terminal approval fallback: the human runs the printed
   `sloosh approve <ID>` command in another terminal.
+- A complete target plus ProxyJump scope using only vault `agent` profiles or
+  default `$SSH_AUTH_SOCK`, with no `IdentityFile` or custom `IdentityAgent`,
+  receives a process-bound, time-limited lease automatically when the daemon
+  can inspect the exact scope. A CLI-only cold encrypted vault may still return
+  pending; treat that as human approval, never infer the hidden profile.
 - On macOS with the desktop app, the human uses its Setup and Security screens
   for login Keychain and the possible `Sloosh Approval` prompt. Native lease
-  approval lets the human choose Touch ID, PIN, or Master Password before the
-  secure authentication step.
+  approval presents direct Touch ID, PIN, and Master Password buttons for
+  scopes that are not system-agent-only.
   The CLI and app then share the app's private daemon. The user handles every
   native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
   grants one-time access.
@@ -51,15 +57,16 @@ secure prompts.
 
 A `sloosh` session is a persistent remote shell, not a one-shot command —
 `cd` and `export` in one call are still in effect on the next. Every
-host-touching command needs a **lease**: a human must approve access to that
-host before you can use it. When you're unsure what's going on (is there a
+host-touching command needs a **lease**. `sloosh request` creates it
+automatically for a system-agent-only scope; a human approves every other
+scope. When you're unsure what's going on (is there a
 session already? is a host authorized?), run `sloosh status` first instead
 of guessing.
 
 ## Key commands
 
 ```
-sloosh request myhost                       # ask a human to authorize myhost
+sloosh request myhost                       # auto-authorize system Agent, otherwise ask human
 sloosh host trust myhost                    # human-only: inspect/add/replace a host key
 sloosh run myhost "npm test"                 # run a command in myhost's default session
 sloosh peek myhost                           # incremental output since your last peek
@@ -73,11 +80,12 @@ sloosh status                                # daemon/lease/session overview —
 
 ## Fixed behavior rules
 
-- After `sloosh request <host>`, continue when it prints `authorized`. On a
+- After `sloosh request <host>`, continue when it prints `authorized`; this may
+  be daemon-issued system-agent authorization or human approval. On a
   pending fallback, show the printed approval command to your user and **stop
   and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
-  Touch ID, an approval PIN, or the Master Password may complete the request
-  without another terminal.
+  direct Touch ID, approval PIN, or Master Password buttons may complete the
+  request without another terminal.
 - If `request` reports an invalid ProxyJump cycle or depth, show that error to
   the user and stop. Never retry with a subset of hosts or bypass the route.
 - Active leases idle out according to the human's shared vault timeout
@@ -94,8 +102,9 @@ sloosh status                                # daemon/lease/session overview —
   ProxyJump routing. RSA and encrypted private keys must be loaded into
   ssh-agent.
 - `sloosh init`, `sloosh approve`, and every `sloosh host` command are human-only.
-  Never work around their TTY checks. The Agent Skill cannot approve leases,
-  initialize the vault, or grant itself new authority.
+  Never work around their TTY checks. The Agent Skill cannot approve a pending
+  lease, initialize the vault, or broaden authority. Only daemon policy may
+  auto-activate a system-agent-only request.
 - If an operation reports an unknown or changed host key, ask the user to open
   Hosts in the desktop app or run `sloosh host trust <alias>` themselves, then
   stop and wait. The user must compare the shown new fingerprint with an
