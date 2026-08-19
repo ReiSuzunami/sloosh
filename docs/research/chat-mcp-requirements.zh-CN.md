@@ -72,21 +72,34 @@ Chat  -- MCP + OAuth -->  中继  -- 已建立的出站隧道 -->  bridge
 
 ### 5.1 网络传输
 
-三跳三个合同，不要合成一句「MCP over WebSocket」。
+每一跳都不做 WebSocket。不实现 `ws://` / `wss://`。
 
-| 一跳 | 必须的传输 | 原因 |
+默认走 **Cloudflare 具名隧道（named tunnel）**，不是一次性 Quick Tunnel。
+
+| 一跳 | 传输 | 原因 |
 |---|---|---|
-| ChatGPT / Claude Chat → 中继 | MCP Streamable HTTP，`https://…/mcp`（POST/GET 内可选 SSE） | 官方远程传输。Chat Connector 认这个。WebSocket 不是标准 MCP 传输（[transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)；社区 SEP-1287 不是 Chat 已交付合同）。 |
-| 桥 → 中继（出站） | **允许 `wss://`**，作为私有回程通道 | 两端都是我们的。安装机出站、中继把 MCP 帧推回来，长连接 WebSocket 合适。这是我们的隧道，不是 Chat 要填的 MCP URL。明文 `ws://` 禁止。 |
-| 桥 → `slooshd` | 现有协议 3 Unix socket | 不是网络 API。不上 WebSocket，不上 HTTP。 |
+| ChatGPT / Claude Chat → 公网主机名 | MCP Streamable HTTP，`https://<稳定域名>/mcp` | 官方远程 MCP。Chat Connector 只认这个（[transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)）。 |
+| 安装机 → Cloudflare | `cloudflared` **具名**隧道（只出站到 Cloudflare 边缘） | 源站不开入站端口。主机名稳定。[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/) |
+| 本机 `cloudflared` → 桥 | loopback HTTP，打到 Streamable HTTP 监听 | 桥不绑公网地址。 |
+| 桥 → `slooshd` | 协议 3 Unix socket | 不变。 |
+
+具名 vs Quick：
+
+| | 具名隧道（交付这条） | Quick Tunnel（不交付） |
+|---|---|---|
+| 开通 | 一次：Cloudflare 账号、隧道 UUID/token、你控制的 zone 上的 DNS | 每次启动 `cloudflared` |
+| 主机名 | 稳定，例如 `chat.example.com` | 随机 `*.trycloudflare.com`，进程一换 URL 就变 |
+| 寿命 | 持久对象；connector 常驻，跨 Chat 会话 | 只活在那一个进程里 |
+| SSE / Streamable HTTP | 具名隧道支持 | Quick Tunnel **不支持 SSE**，还有并发上限（[TryCloudflare](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)） |
+| 用途 | 生产 Chat Connector | 仅本地调试，不得写成文档里的 Connector URL |
 
 规则：
 
-- 人往 Chat 里贴的永远是 Streamable HTTP URL。Connector 不能是 `ws://` / `wss://`。
-- 中继终止厂商打来的 Streamable HTTP，再把 JSON-RPC（或等价有界信封）经已有 `wss` 会话转给绑好的桥。
-- 厂商官方隧道（OpenAI Secure MCP Tunnel，以及若将来能当 Chat Connector 的 Anthropic 隧道）走它们自己的出站协议。只有自建汇聚（§11 B/C）上，桥才用 `wss`。
-- MCP 规范允许双方约定自定义传输并保持 JSON-RPC 生命周期。这条许可用在 **桥 ↔ 中继**，不用在 Chat。
-- `wss` 这一跳同样受有界帧、idle、秘密脱敏约束。`wss` 掉线等于「桥离线」，不暗示取消已经在跑的 daemon grant。
+- 贴进 Chat 的永远是具名隧道主机名上的 `https://…/mcp`。
+- `slooshd` 仍无公网监听。除普通 SSH 外，唯一出站网络客户端是 `cloudflared`。
+- 隧道掉线等于「桥离线」，不暗示取消已经在跑的 daemon grant。
+- Anthropic MCP Tunnels 也用 `cloudflared`，但不是 claude.ai Connector 路径，也不是本产品的传输。
+- OpenAI Secure MCP Tunnel 仍是可选的、仅 ChatGPT 的替代（§11 A）。它不是 Cloudflare Tunnel。
 
 ## 6. 一等目标
 
@@ -211,7 +224,7 @@ Chat OAuth 过期 ≠ 主机 grant 过期。两边都要活着。
 | 方案 | ChatGPT | Claude Chat | 说明 |
 |---|---|---|---|
 | A. OpenAI Secure MCP Tunnel | 官方出站 | 无 | 除非再补一条，否则只有 ChatGPT |
-| B. 自建出站汇聚，对外 `/mcp` | Connector URL（Streamable HTTP） | Connector URL（Streamable HTTP） | 两边都能用；汇聚点仍不持 vault。桥可用 `wss://` 挂上（§5.1）。 |
+| B. 具名 Cloudflare Tunnel 挡在 loopback Streamable HTTP 桥前面 | Connector URL | Connector URL | 两边 Chat 的默认路径。稳定主机名。边缘不持 vault。 |
 | C. A + B | 都有 | 都有 | 同一座桥，两个边缘 |
 
 在厂商把 Anthropic MCP Tunnels 开放给 Chat Connector 之前，不把它算进路径。
@@ -242,7 +255,7 @@ Chat OAuth 过期 ≠ 主机 grant 过期。两边都要活着。
 4. 密码、key-file、自定义 Agent、`IdentityFile`、未知 key 主机被 Chat 以类型化错误拒绝，不挂 pending approve。
 5. 主机改出 agent-only 或 host key 变更，立即取消 Chat 访问。
 6. `slooshd` 无公网监听。截获中继流量看不到 vault 材料和 lease token。
-6a. Chat Connector URL 只讲 Streamable HTTP。`wss://` / `ws://` 作为 Connector 一律拒绝。自建汇聚可以接受桥的出站 `wss://` 挂载。
+6a. Chat 走具名隧道 HTTPS 主机名上的 Streamable HTTP。交付路径拒绝 Quick Tunnel（`*.trycloudflare.com`）以及任何 `ws://` / `wss://` Connector URL。
 7. 协议 3 仍是 3；不匹配 / 升级测试仍成立。
 8. 桌面/CLI 的 key-file 与密码主机仍要今天的批准。
 9. 默认 YOLO 拒绝 `-R`。

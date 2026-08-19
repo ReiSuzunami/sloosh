@@ -90,21 +90,34 @@ Rules:
 
 ### 5.1 Network transports
 
-Three hops, three contracts. Do not collapse them into “MCP over WebSocket”.
+WebSocket is out of scope on every hop. Do not implement `ws://` or `wss://`.
 
-| Hop | Required transport | Why |
+Default path is a **named Cloudflare Tunnel**, not a one-shot Quick Tunnel.
+
+| Hop | Transport | Why |
 |---|---|---|
-| ChatGPT / Claude Chat → relay | MCP Streamable HTTP on `https://…/mcp` (optional SSE inside a POST/GET) | Official MCP remote transport. Chat connectors speak this. WebSocket is not a standard MCP transport ([transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports); community SEP-1287 is not a shipped Chat contract). |
-| Bridge → relay (outbound) | **`wss://` allowed** as a private reverse channel | We control both ends. A persistent outbound WebSocket is a good fit for “install machine dials out, relay pushes MCP frames back.” This is our tunnel, not the Chat MCP URL. Cleartext `ws://` is forbidden. |
-| Bridge → `slooshd` | Existing protocol 3 Unix socket | Not a network API. No WebSocket, no HTTP. |
+| ChatGPT / Claude Chat → public hostname | MCP Streamable HTTP on `https://<stable-host>/mcp` | Official remote MCP. Chat connectors speak only this ([transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)). |
+| Install machine → Cloudflare | `cloudflared` **named** tunnel (outbound-only to Cloudflare’s edge) | No inbound port on the origin. Hostname is stable. [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/) |
+| Local `cloudflared` → bridge | Loopback HTTP to the Streamable HTTP listener | Bridge never binds a public address. |
+| Bridge → `slooshd` | Protocol 3 Unix socket | Unchanged. |
+
+Named vs Quick:
+
+| | Named tunnel (ship this) | Quick Tunnel (do not ship) |
+|---|---|---|
+| Setup | Once: Cloudflare account, tunnel UUID/token, DNS on a zone you control | Each `cloudflared` start |
+| Hostname | Stable, e.g. `chat.example.com` | Random `*.trycloudflare.com`, new URL every process |
+| Lifetime | Persistent object; connector stays up across Chat sessions | Lives only while that process runs |
+| SSE / Streamable HTTP | Supported on named tunnels | Quick Tunnels **do not support SSE** and cap concurrent requests ([TryCloudflare](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)) |
+| Use | Production Chat connector | Local debug only, never as the documented connector URL |
 
 Rules:
 
-- The URL a human pastes into Chat is always Streamable HTTP. Never `ws://` or `wss://` as the connector URL.
-- The relay terminates Streamable HTTP from the vendor, then forwards JSON-RPC (or an equivalent bounded envelope) over the existing `wss` session to the bound bridge.
-- Official vendor tunnels (OpenAI Secure MCP Tunnel, and Anthropic tunnels if they ever become Chat connectors) keep their own outbound protocol. The bridge may speak `wss` only on the operator-owned hub path (§11 B/C).
-- MCP spec permits custom transports when both ends agree and JSON-RPC lifecycle is preserved. That permission applies to **bridge ↔ relay**, not to Chat.
-- Bound frames, idle timeouts, and secret-redaction apply on the `wss` hop the same as on HTTP. A dropped `wss` session is “bridge offline”, not an implicit cancel of an in-flight daemon grant.
+- The URL pasted into Chat is always `https://…/mcp` on the named-tunnel hostname.
+- `slooshd` still has no public listener. `cloudflared` is the only outbound network client besides ordinary SSH.
+- Dropping the tunnel is “bridge offline”, not an implicit cancel of an in-flight daemon grant.
+- Anthropic MCP Tunnels also use `cloudflared`, but they are not a claude.ai connector path and are not this product’s transport.
+- OpenAI Secure MCP Tunnel remains an optional ChatGPT-only alternative (§11 A). It is not Cloudflare Tunnel.
 
 ## 6. First-class targets
 
@@ -259,7 +272,7 @@ The local grant model is the same. Only how Chat finds the bridge differs.
 | Option | ChatGPT | Claude Chat | Notes |
 |---|---|---|---|
 | A. OpenAI Secure MCP Tunnel | Official outbound path | No | ChatGPT-only unless a second path exists |
-| B. Operator-owned outbound hub with public `/mcp` | Connector URL (Streamable HTTP) | Connector URL (Streamable HTTP) | Needed for both Chats; hub still holds no vault. Bridge may attach over `wss://` (§5.1). |
+| B. Named Cloudflare Tunnel in front of a loopback Streamable HTTP bridge | Connector URL | Connector URL | Default for both Chats. Stable hostname. Hub/edge holds no vault. |
 | C. A + B | Both | Both | Same bridge, two edges |
 
 Anthropic MCP Tunnels remain out of the Chat connector path until the vendor
@@ -304,9 +317,9 @@ Must pass:
    immediately.
 6. `slooshd` has no public listener. Capture of relay traffic shows no vault
     material and no lease token.
-6a. The Chat connector URL speaks Streamable HTTP only. A `wss://` or `ws://`
-    connector URL is rejected. Operator-owned hubs may accept an outbound
-    `wss://` attach from the bridge.
+6a. Chat uses Streamable HTTP on a named-tunnel HTTPS hostname. Quick Tunnel
+    (`*.trycloudflare.com`) and any `ws://` / `wss://` connector URL are
+    rejected in the shipped path.
 7. Protocol 3 remains 3; mismatch/upgrade tests still hold.
 8. Desktop/CLI key-file and password hosts still require today's approval.
 9. Default YOLO rejects `-R`.
