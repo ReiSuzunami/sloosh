@@ -88,6 +88,24 @@ Rules:
   download semantics.
 - `integration-test-hooks` stays test-only and never appears in CLI or MCP.
 
+### 5.1 Network transports
+
+Three hops, three contracts. Do not collapse them into “MCP over WebSocket”.
+
+| Hop | Required transport | Why |
+|---|---|---|
+| ChatGPT / Claude Chat → relay | MCP Streamable HTTP on `https://…/mcp` (optional SSE inside a POST/GET) | Official MCP remote transport. Chat connectors speak this. WebSocket is not a standard MCP transport ([transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports); community SEP-1287 is not a shipped Chat contract). |
+| Bridge → relay (outbound) | **`wss://` allowed** as a private reverse channel | We control both ends. A persistent outbound WebSocket is a good fit for “install machine dials out, relay pushes MCP frames back.” This is our tunnel, not the Chat MCP URL. Cleartext `ws://` is forbidden. |
+| Bridge → `slooshd` | Existing protocol 3 Unix socket | Not a network API. No WebSocket, no HTTP. |
+
+Rules:
+
+- The URL a human pastes into Chat is always Streamable HTTP. Never `ws://` or `wss://` as the connector URL.
+- The relay terminates Streamable HTTP from the vendor, then forwards JSON-RPC (or an equivalent bounded envelope) over the existing `wss` session to the bound bridge.
+- Official vendor tunnels (OpenAI Secure MCP Tunnel, and Anthropic tunnels if they ever become Chat connectors) keep their own outbound protocol. The bridge may speak `wss` only on the operator-owned hub path (§11 B/C).
+- MCP spec permits custom transports when both ends agree and JSON-RPC lifecycle is preserved. That permission applies to **bridge ↔ relay**, not to Chat.
+- Bound frames, idle timeouts, and secret-redaction apply on the `wss` hop the same as on HTTP. A dropped `wss` session is “bridge offline”, not an implicit cancel of an in-flight daemon grant.
+
 ## 6. First-class targets
 
 ### 6.1 `local` (first Chat use)
@@ -241,7 +259,7 @@ The local grant model is the same. Only how Chat finds the bridge differs.
 | Option | ChatGPT | Claude Chat | Notes |
 |---|---|---|---|
 | A. OpenAI Secure MCP Tunnel | Official outbound path | No | ChatGPT-only unless a second path exists |
-| B. Operator-owned outbound hub with public `/mcp` | Connector URL | Connector URL | Needed for both Chats; hub still holds no vault |
+| B. Operator-owned outbound hub with public `/mcp` | Connector URL (Streamable HTTP) | Connector URL (Streamable HTTP) | Needed for both Chats; hub still holds no vault. Bridge may attach over `wss://` (§5.1). |
 | C. A + B | Both | Both | Same bridge, two edges |
 
 Anthropic MCP Tunnels remain out of the Chat connector path until the vendor
@@ -285,7 +303,10 @@ Must pass:
 5. Changing a host off agent-only or changing its host key revokes Chat access
    immediately.
 6. `slooshd` has no public listener. Capture of relay traffic shows no vault
-   material and no lease token.
+    material and no lease token.
+6a. The Chat connector URL speaks Streamable HTTP only. A `wss://` or `ws://`
+    connector URL is rejected. Operator-owned hubs may accept an outbound
+    `wss://` attach from the bridge.
 7. Protocol 3 remains 3; mismatch/upgrade tests still hold.
 8. Desktop/CLI key-file and password hosts still require today's approval.
 9. Default YOLO rejects `-R`.
