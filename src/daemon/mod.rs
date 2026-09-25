@@ -67,6 +67,9 @@ fn no_lease_message(host: &str) -> String {
 /// caller's PID from `Channel::peer_pid` (looked up once per connection);
 /// `lease_token` is the request's own `SLOOSH_LEASE` escape-hatch field, if
 /// the caller's environment had one set.
+// Only Response::Error is returned here; keep the wire response inline rather
+// than add a heap allocation because unrelated response variants are larger.
+#[allow(clippy::result_large_err)]
 async fn require_lease(
     peer: Option<u32>,
     host: &str,
