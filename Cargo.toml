@@ -1,6 +1,6 @@
 [package]
 name = "sloosh"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.85"
 default-run = "sloosh"
@@ -41,6 +41,7 @@ argon2 = { version = "0.5.3", features = ["std", "zeroize"] }
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 clap = { version = "4.6.1", features = ["derive"] }
 data-encoding = "2.11.0"
+glob = "0.3.3"
 hmac = "0.13.0"
 libc = "0.2.186"
 rand = "0.9"

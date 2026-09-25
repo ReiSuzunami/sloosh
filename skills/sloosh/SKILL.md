@@ -11,6 +11,12 @@ state (cwd, env vars, background jobs) survives across calls, and you never
 touch a password or key. Default system SSH-agent-only scopes authorize
 automatically; every other credential scope needs out-of-band human approval.
 
+System SSH aliases support nested `Include` files and ordered globs, including
+Host-conditional includes. Included ProxyJump and credential settings count
+toward the complete approval scope. If include loading fails, fix the config
+or use a managed profile; never bypass approval or remove route settings to
+silence the error. Dynamic include path tokens and `Match` remain unsupported.
+
 ## Bootstrap
 
 Before the first SSH task, check whether the binary is available:

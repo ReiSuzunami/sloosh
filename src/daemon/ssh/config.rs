@@ -5,6 +5,7 @@
 //! network I/O, authentication, or lease checks.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::PathBuf;
 
 use tracing::warn;
@@ -25,6 +26,7 @@ pub enum IdentityAgentValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HostBlock {
     patterns: Vec<String>,
+    include_guards: Vec<Vec<String>>,
     hostname: Option<String>,
     port: Option<u16>,
     user: Option<String>,
@@ -55,6 +57,7 @@ enum SshConfigDiagnosticKind {
     UnsupportedDirective { directive: String },
     InvalidPort,
     ReadFailure,
+    IncludeFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -74,6 +77,10 @@ pub enum SshConfigError {
          ownership and permissions, or use a vault-managed profile."
     )]
     ReadFailure,
+    #[error(
+        "SSH config Include at line {line} could not be loaded safely (invalid path syntax, unreadable file, or include limit exceeded). Check included files; dynamic path tokens are not supported."
+    )]
+    IncludeFailure { line: usize },
 }
 
 impl SshConfigError {
@@ -82,12 +89,15 @@ impl SshConfigError {
             Self::InvalidPort { .. } => "port",
             Self::UnsupportedDirective { directive, .. } => directive,
             Self::ReadFailure => "config",
+            Self::IncludeFailure { .. } => "include",
         }
     }
 
     pub fn line(&self) -> usize {
         match self {
-            Self::InvalidPort { line } | Self::UnsupportedDirective { line, .. } => *line,
+            Self::InvalidPort { line }
+            | Self::UnsupportedDirective { line, .. }
+            | Self::IncludeFailure { line } => *line,
             Self::ReadFailure => 0,
         }
     }
@@ -99,12 +109,121 @@ impl SshConfigDiagnostic {
             SshConfigDiagnosticKind::UnsupportedDirective { directive } => directive,
             SshConfigDiagnosticKind::InvalidPort => "port",
             SshConfigDiagnosticKind::ReadFailure => "config",
+            SshConfigDiagnosticKind::IncludeFailure => "include",
         }
     }
 
     pub(super) fn line(&self) -> usize {
         self.line
     }
+}
+
+impl HostBlock {
+    fn matches(&self, alias: &str) -> bool {
+        host_patterns_match(&self.patterns, alias)
+            && self
+                .include_guards
+                .iter()
+                .all(|patterns| host_patterns_match(patterns, alias))
+    }
+}
+
+// Keep recursive local configuration loading bounded, including repeated files.
+const MAX_INCLUDE_DEPTH: usize = 16;
+const MAX_INCLUDE_FILES: usize = 128;
+const MAX_INCLUDE_BYTES: u64 = 256 * 1024;
+
+fn load_includes(
+    rest: &str,
+    base: &std::path::Path,
+    depth: usize,
+    files: &mut usize,
+) -> Result<Vec<HostBlock>, ()> {
+    if depth >= MAX_INCLUDE_DEPTH {
+        return Err(());
+    }
+    let mut blocks = Vec::new();
+    for token in include_paths(rest)? {
+        // Dynamic expansions need per-target OpenSSH evaluation. Never treat
+        // them as literal, potentially unmatched paths and silently skip them.
+        if token.contains('%')
+            || token.contains('$')
+            || token.contains("**")
+            || (token.starts_with('~') && token != "~" && !token.starts_with("~/"))
+        {
+            return Err(());
+        }
+        let path = expand_tilde(&token);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base.join(path)
+        };
+        let paths = glob::glob(path.to_str().ok_or(())?).map_err(|_| ())?;
+        // glob yields matches in lexical order, like OpenSSH.
+        for path in paths {
+            let path = path.map_err(|_| ())?;
+            *files += 1;
+            if *files > MAX_INCLUDE_FILES {
+                return Err(());
+            }
+            if !std::fs::metadata(&path).map_err(|_| ())?.is_file() {
+                return Err(());
+            }
+            let mut contents = String::new();
+            std::fs::File::open(path)
+                .map_err(|_| ())?
+                .take(MAX_INCLUDE_BYTES + 1)
+                .read_to_string(&mut contents)
+                .map_err(|_| ())?;
+            if contents.len() as u64 > MAX_INCLUDE_BYTES {
+                return Err(());
+            }
+            blocks.extend(
+                SshConfig::parse_with_includes(&contents, Some(base), depth + 1, files).blocks,
+            );
+        }
+    }
+    Ok(blocks)
+}
+
+fn include_paths(raw: &str) -> Result<Vec<String>, ()> {
+    let mut paths = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_some() {
+            token.push(ch);
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '#' && token.is_empty() {
+            break;
+        } else if ch.is_whitespace() {
+            if !token.is_empty() {
+                paths.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+    if quote.is_some() || escaped {
+        return Err(());
+    }
+    if !token.is_empty() {
+        paths.push(token);
+    }
+    if paths.is_empty() {
+        return Err(());
+    }
+    Ok(paths)
 }
 
 /// Resolved connection parameters after merging matching config blocks over
@@ -126,6 +245,15 @@ impl SshConfig {
     /// callers decide whether the selected host actually depends on this
     /// config before surfacing anything.
     pub fn parse(contents: &str) -> Self {
+        Self::parse_with_includes(contents, None, 0, &mut 0)
+    }
+
+    fn parse_with_includes(
+        contents: &str,
+        base: Option<&std::path::Path>,
+        depth: usize,
+        files: &mut usize,
+    ) -> Self {
         // OpenSSH permits defaults before the first Host block. Model those
         // as an initial `Host *` block so first-value-wins remains mechanical.
         let mut blocks = vec![HostBlock {
@@ -178,13 +306,45 @@ impl SshConfig {
                     });
                 }
                 _ if inside_unsupported_match => {}
+                "include" if base.is_some() => {
+                    let parent = current.take().unwrap_or_else(|| HostBlock {
+                        patterns: vec!["*".into()],
+                        ..Default::default()
+                    });
+                    let patterns = parent.patterns.clone();
+                    blocks.push(parent);
+                    match load_includes(rest, base.unwrap(), depth, files) {
+                        Ok(included) => {
+                            for mut block in included {
+                                block.include_guards.push(patterns.clone());
+                                blocks.push(block);
+                            }
+                        }
+                        Err(()) => {
+                            blocks
+                                .last_mut()
+                                .unwrap()
+                                .diagnostics
+                                .push(SshConfigDiagnostic {
+                                    line: line_number,
+                                    kind: SshConfigDiagnosticKind::IncludeFailure,
+                                })
+                        }
+                    }
+                    current = Some(HostBlock {
+                        patterns,
+                        ..Default::default()
+                    });
+                }
                 "hostname" => with_current_or_global(&mut current, &mut blocks[0], |block| {
-                    block.hostname = Some(rest.to_string());
+                    block.hostname.get_or_insert_with(|| rest.to_string());
                 }),
                 "port" => {
                     with_current_or_global(&mut current, &mut blocks[0], |block| {
                         match rest.parse::<u16>() {
-                            Ok(port) => block.port = Some(port),
+                            Ok(port) => {
+                                block.port.get_or_insert(port);
+                            }
                             Err(_) => block.diagnostics.push(SshConfigDiagnostic {
                                 line: line_number,
                                 kind: SshConfigDiagnosticKind::InvalidPort,
@@ -193,18 +353,18 @@ impl SshConfig {
                     });
                 }
                 "user" => with_current_or_global(&mut current, &mut blocks[0], |block| {
-                    block.user = Some(rest.to_string());
+                    block.user.get_or_insert_with(|| rest.to_string());
                 }),
                 "identityfile" => with_current_or_global(&mut current, &mut blocks[0], |block| {
                     block.identity_files.push(expand_tilde(rest));
                 }),
                 "proxyjump" => with_current_or_global(&mut current, &mut blocks[0], |block| {
-                    if !rest.eq_ignore_ascii_case("none") {
-                        block.proxy_jump = Some(rest.to_string());
-                    }
+                    block.proxy_jump.get_or_insert_with(|| rest.to_string());
                 }),
                 "identityagent" => with_current_or_global(&mut current, &mut blocks[0], |block| {
-                    block.identity_agent = Some(parse_identity_agent_value(rest));
+                    block
+                        .identity_agent
+                        .get_or_insert_with(|| parse_identity_agent_value(rest));
                 }),
                 other => {
                     with_current_or_global(&mut current, &mut blocks[0], |block| {
@@ -234,7 +394,7 @@ impl SshConfig {
             .map_or(alias, |(_, host)| host);
         self.blocks
             .iter()
-            .filter(|block| host_patterns_match(&block.patterns, host_key))
+            .filter(|block| block.matches(host_key))
             .flat_map(|block| block.diagnostics.iter())
             .collect()
     }
@@ -298,8 +458,12 @@ impl SshConfig {
     /// vault profile remains independent while a config-backed host fails.
     pub fn load_default() -> Self {
         let path = ssh_config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => Self::parse(&contents),
+        Self::load_path(&path)
+    }
+
+    fn load_path(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Self::parse_with_includes(&contents, path.parent(), 0, &mut 0),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(_) => Self {
                 blocks: vec![HostBlock {
@@ -338,7 +502,7 @@ impl SshConfig {
         let mut identity_agent_set = false;
 
         for block in &self.blocks {
-            if !host_patterns_match(&block.patterns, host_key) {
+            if !block.matches(host_key) {
                 continue;
             }
             if !hostname_set {
@@ -361,7 +525,9 @@ impl SshConfig {
             }
             if !proxy_jump_set {
                 if let Some(proxy_jump) = &block.proxy_jump {
-                    config.proxy_jump = Some(proxy_jump.clone());
+                    if !proxy_jump.eq_ignore_ascii_case("none") {
+                        config.proxy_jump = Some(proxy_jump.clone());
+                    }
                     proxy_jump_set = true;
                 }
             }
@@ -386,6 +552,9 @@ impl SshConfigDiagnostic {
                 Some(SshConfigError::InvalidPort { line: self.line })
             }
             SshConfigDiagnosticKind::ReadFailure => Some(SshConfigError::ReadFailure),
+            SshConfigDiagnosticKind::IncludeFailure => {
+                Some(SshConfigError::IncludeFailure { line: self.line })
+            }
             SshConfigDiagnosticKind::UnsupportedDirective { directive }
                 if is_connection_critical_directive(directive) =>
             {
@@ -451,10 +620,12 @@ fn with_current_or_global(
 
 fn split_directive(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
-    if let Some(index) = line.find(char::is_whitespace) {
-        Some((&line[..index], line[index..].trim_start()))
-    } else if let Some(index) = line.find('=') {
-        Some((&line[..index], line[index + 1..].trim_start()))
+    if let Some(index) = line.find(|ch: char| ch.is_whitespace() || ch == '=') {
+        let rest = line[index..].trim_start();
+        Some((
+            &line[..index],
+            rest.strip_prefix('=').unwrap_or(rest).trim_start(),
+        ))
     } else if line.is_empty() {
         None
     } else {
@@ -543,6 +714,138 @@ fn glob_match_inner(pattern: &[char], text: &[char]) -> bool {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    struct IncludeFixture(PathBuf);
+
+    impl IncludeFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "sloosh-config-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            let path = self.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+
+        fn load(&self) -> SshConfig {
+            SshConfig::load_path(&self.0.join("config"))
+        }
+    }
+
+    impl Drop for IncludeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn include_loads_complete_approval_route_and_credentials() {
+        let fixture = IncludeFixture::new();
+        fixture.write("config", "Include conf.d/*\n");
+        fixture.write("conf.d/10-hosts", "Host target\n HostName 10.0.0.2\n ProxyJump jump\n IdentityFile /test/key\n IdentityAgent /test/agent\nHost jump\n HostName 10.0.0.1\n");
+        let config = fixture.load();
+        let host = config.resolve_for_connection("target").unwrap();
+        assert_eq!(host.hostname, "10.0.0.2");
+        assert_eq!(host.identity_files, vec![PathBuf::from("/test/key")]);
+        assert_eq!(
+            host.identity_agent,
+            Some(IdentityAgentValue::Path("/test/agent".into()))
+        );
+        let plan =
+            super::super::host_key_confirmation_order_with_config(&config, &["target".into()])
+                .await
+                .unwrap();
+        assert_eq!(
+            plan.iter()
+                .map(|host| host.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["jump", "target"]
+        );
+    }
+
+    #[test]
+    fn includes_preserve_order_nested_base_and_parent_scope() {
+        let fixture = IncludeFixture::new();
+        fixture.write("config", "Host target\n User first\n Include = \"conf.d/*\" missing-* # optional\n Port 2200\n User last\nHost unrelated\n Include isolated\n");
+        fixture.write(
+            "conf.d/10-first",
+            "Include nested\nHost other\n Port 9999\n",
+        );
+        fixture.write("conf.d/20-second", "User later\n");
+        fixture.write("nested", "User nested\nHost target\n HostName selected\n");
+        fixture.write("isolated", "Host target\n ProxyJump forbidden\n");
+        let host = fixture.load().resolve_for_connection("target").unwrap();
+        assert_eq!(host.hostname, "selected");
+        assert_eq!(host.user, "first");
+        assert_eq!(host.port, 2200);
+        assert_eq!(host.proxy_jump, None);
+    }
+
+    #[test]
+    fn includes_sort_globs_and_support_multiple_quoted_absolute_paths() {
+        let fixture = IncludeFixture::new();
+        fixture.write(
+            "config",
+            &format!(
+                "Include '{}' conf.d/*\n",
+                fixture.0.join("with space").display()
+            ),
+        );
+        fixture.write("with space", "Host target\n ProxyJump none\n");
+        fixture.write(
+            "conf.d/20",
+            "Host target\n User later\n ProxyJump ignored\n",
+        );
+        fixture.write("conf.d/10", "Host target\n User first\n");
+        let host = fixture.load().resolve_for_connection("target").unwrap();
+        assert_eq!(host.user, "first");
+        assert_eq!(host.proxy_jump, None);
+    }
+
+    #[test]
+    fn include_failures_and_critical_children_fail_closed() {
+        let fixture = IncludeFixture::new();
+        for child in [
+            "Include child\n",
+            "Match all\n",
+            "ProxyCommand secret\n",
+            "Include ${SECRET}/config\n",
+            "Include \"unterminated\n",
+            "Include directory\n",
+        ] {
+            fixture.write(
+                "config",
+                "Host target\n Include child\nHost unrelated\n User safe\n",
+            );
+            fixture.write("child", child);
+            std::fs::create_dir_all(fixture.0.join("directory")).unwrap();
+            let config = fixture.load();
+            let error = config.resolve_for_connection("target").unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+            assert!(config.resolve_for_connection("unrelated").is_ok());
+        }
+    }
+
+    #[test]
+    fn include_resource_limits_fail_closed() {
+        let fixture = IncludeFixture::new();
+        fixture.write("config", "Include child\n");
+        fixture.write("child", &" ".repeat(MAX_INCLUDE_BYTES as usize + 1));
+        assert!(fixture.load().resolve_for_connection("target").is_err());
+        fixture.write("child", "User ok\n");
+        fixture.write(
+            "config",
+            &format!("Include {}\n", "child ".repeat(MAX_INCLUDE_FILES + 1)),
+        );
+        assert!(fixture.load().resolve_for_connection("target").is_err());
+    }
 
     #[test]
     fn diagnostics_only_include_global_and_matching_host_blocks() {

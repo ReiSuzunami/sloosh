@@ -73,9 +73,14 @@ Aliases are stable identities and cannot be renamed. Run
 Hosts not stored in the vault fall back to OpenSSH configuration. Sloosh
 understands `Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`,
 and `IdentityAgent`, including global defaults before the first `Host`.
+`Include` supports nested files, multiple quoted paths, `~/` expansion, and
+lexically ordered globs. Relative paths use `~/.ssh`, including nested files;
+unmatched patterns are ignored. Conditional `Host` includes retain their scope.
+Unreadable files, include limits, dynamic `%`/`$` paths, `~user`, and recursive
+`**` patterns fail closed rather than silently dropping connection settings.
 Unsupported directives in unrelated `Host` blocks stay silent. A selected
 host gets one concise diagnostic for lower-impact ignored options. Directives
-known to change its endpoint, route, or host-key identity (`Include`,
+known to change its endpoint, route, or host-key identity (
 `ProxyCommand`, `ProxyUseFdpass`, `HostKeyAlias`, and hostname
 canonicalization) fail instead of falling back to guessed settings. Because
 Sloosh does not evaluate `Match` predicates, any `Match` section is a

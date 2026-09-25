@@ -124,6 +124,15 @@ in Password, Key File, `IdentityFile`, or custom `IdentityAgent` authority
 after lease validation.
 Unknown and changed host keys keep their separate human-confirmation boundary.
 
+System SSH configuration includes are loaded before scope and authentication
+classification. Include loading preserves conditional Host guards and
+first-value-wins order, with at most 16 nested levels, 128 included file reads,
+and 256 KiB per included file. Unmatched paths are optional; read failures,
+invalid syntax, exceeded limits, dynamic `%`/`$` paths, `~user`, and recursive
+`**` globs fail closed for affected hosts. Included `Match` remains unsupported
+and fails closed within the enclosing include scope. Diagnostics omit path and
+directive values. Sloosh does not execute OpenSSH commands to expand config.
+
 Vault-backed ProxyJump aliases need their own host coverage. Lease approval
 compares the human CLI's expanded `approved_hosts` list with an independent
 daemon-side expansion after unlock. A missing, reordered, stale, or changed

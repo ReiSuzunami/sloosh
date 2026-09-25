@@ -63,9 +63,13 @@ alias 是稳定身份，不能改名。所有选项见 `sloosh host add --help` 
 
 未存入 vault 的主机会回退到 OpenSSH 配置。Sloosh 支持 `Host`、`HostName`、
 `Port`、`User`、`IdentityFile`、`ProxyJump` 与 `IdentityAgent`，也支持首个
-`Host` 前的全局默认值。其他 `Host` 块中的不支持指令保持静默；命中目标的低影响
+`Host` 前的全局默认值。`Include` 支持嵌套文件、多个带引号路径、`~/` 展开与按
+字典序加载的通配符；嵌套文件中的相对路径也以 `~/.ssh` 为基准。未匹配的路径
+忽略，`Host` 条件作用域保持隔离。文件不可读、超出包含限制、动态 `%`/`$` 路径、
+`~user` 与递归 `**` 通配符仍会拒绝解析，不会静默丢失连接设置。
+其他 `Host` 块中的不支持指令保持静默；命中目标的低影响
 未实现选项只生成一条精简诊断。已知会改变 endpoint、路由或 host-key 身份的
-`Include`、`ProxyCommand`、`ProxyUseFdpass`、`HostKeyAlias` 与 hostname
+`ProxyCommand`、`ProxyUseFdpass`、`HostKeyAlias` 与 hostname
 canonicalization 会直接失败，不会猜测默认设置。Sloosh 不解析 `Match` 条件，
 所以任何 `Match` 区段都会让 SSH-config-backed 主机 fail closed。直连 vault
 profile 不读取无关 SSH 配置。

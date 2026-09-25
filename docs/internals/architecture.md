@@ -209,8 +209,14 @@ value-free diagnostics to global or `Host` scopes, then surfaces only those
 selected after vault precedence and host-pattern matching. Direct vault
 profiles therefore ignore unrelated OpenSSH configuration. Unsupported
 directives known to change a selected stanza's route or host-key identity and
-invalid selected ports return typed errors. `Include` is also fail-closed
-because ignored files could replace endpoint, route, or trust settings.
+invalid selected ports return typed errors. File-backed loading expands `Include`
+in lexical order, with nested paths rooted at `~/.ssh`, caller Host guards,
+and restored caller scope after each included file. Included route and credential
+settings participate in the same resolution used by approval and connections.
+Pure in-memory `parse` performs no filesystem I/O and still rejects Include.
+Unreadable or unsupported include paths and resource-limit violations become
+scoped, value-free errors; no partial route is accepted. See SECURITY.md for
+include bounds and unsupported path expansions.
 `Match` begins an independent conditional section; because Sloosh does not
 evaluate its predicates, any `Match` is a global fail-closed barrier for
 SSH-config-backed hosts. Lower-impact ignored options emit one stable-code
