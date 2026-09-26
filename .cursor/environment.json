@@ -1,0 +1,4 @@
+{
+  "name": "sloosh",
+  "install": "bash .cursor/install.sh"
+}
