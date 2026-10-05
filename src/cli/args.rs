@@ -183,7 +183,7 @@ pub struct AddArgs {
     /// Authentication method for this profile.
     #[arg(long, value_enum, default_value_t = HostAuthArg::Password)]
     pub auth: HostAuthArg,
-    /// Unencrypted Ed25519/ECDSA key path. Encrypted or RSA keys must use ssh-agent.
+    /// Key path. RSA and encrypted OpenSSH keys require that exact key loaded in SSH Agent.
     #[arg(long, required_if_eq("auth", "key-file"))]
     pub key_file: Option<String>,
     /// Route through another managed host profile.
@@ -278,7 +278,7 @@ pub struct HostEditArgs {
     /// Replace the authentication method.
     #[arg(long, value_enum)]
     pub auth: Option<HostAuthArg>,
-    /// Unencrypted Ed25519/ECDSA key path. Encrypted or RSA keys must use ssh-agent.
+    /// Key path. RSA and encrypted OpenSSH keys require that exact key loaded in SSH Agent.
     #[arg(long, required_if_eq("auth", "key-file"))]
     pub key_file: Option<String>,
     /// Route through another managed host profile.

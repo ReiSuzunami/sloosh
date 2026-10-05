@@ -366,10 +366,16 @@ checks, and zeroization guarantees belong to `SECURITY.md`.
 
 Vault format 2 stores an explicit authentication method and route per host.
 Authentication is exactly one of SSH agent, encrypted password, or an
-unencrypted Ed25519/ECDSA private-key path; vault profiles do not silently fall
-back to a different method. RSA and encrypted private keys stay usable through
-ssh-agent, but local RSA signing is rejected because the available
-implementation has a timing side channel. Routing is exactly direct, through
+private-key path; vault profiles do not silently fall back to a different
+method. Unencrypted Ed25519/ECDSA KeyFile profiles sign directly. RSA and
+encrypted OpenSSH KeyFile profiles select only their corresponding public
+identity from the daemon's ssh-agent and delegate signing, without changing
+their lease classification or importing keys. Missing identities, agent
+failures, and server rejection have distinct errors. Encrypted formats without
+OpenSSH public metadata fail explicitly. Local RSA signing stays rejected
+because the available implementation has a timing side channel. Config-backed
+hosts retain their existing agent-first order without a second agent attempt
+for individual IdentityFile paths. Routing is exactly direct, through
 another managed profile, or an advanced OpenSSH ProxyJump expression.
 Version-1 entries are accepted:
 missing `jump` becomes direct and a legacy string becomes advanced ProxyJump;

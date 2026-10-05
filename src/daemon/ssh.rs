@@ -9,9 +9,9 @@
 //! target. What lives here is purely mechanical: resolve connection
 //! parameters (vault entries take precedence over `~/.ssh/config` for a
 //! given alias — docs/internals/architecture.md), verify the host key, and authenticate
-//! (ssh-agent, then unencrypted `IdentityFile` keys, then — only while the
-//! vault's derived key is cached, i.e. at least one lease is active — the
-//! vault's stored password).
+//! (the vault profile's selected method, or ssh-agent followed by unencrypted
+//! `IdentityFile` keys for SSH-config hosts). Vault KeyFile profiles delegate
+//! RSA and encrypted OpenSSH signing to their exact identity in ssh-agent.
 //!
 //! **ProxyJump chains** (docs/internals/architecture.md): a `ProxyJump` spec may name
 //! several comma-separated hops, and any hop may itself have its own
@@ -26,6 +26,7 @@
 //! today.
 
 use std::collections::HashSet;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,7 +36,7 @@ use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicK
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::daemon::lease;
 use crate::daemon::vault;
@@ -63,6 +64,7 @@ use route::{ForwardTargetConnectError, pump_forwarded_tcpip, race_forward_target
 /// misconfigured loop, not a real topology.
 const MAX_PROXY_JUMP_HOPS: usize = 8;
 const FORWARD_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_VAULT_KEY_FILE_BYTES: u64 = 256 * 1024;
 
 /// Everything that can go wrong establishing an SSH connection. Variants
 /// carry self-teaching messages (docs/internals/architecture.md): the human reading a CLI
@@ -191,6 +193,30 @@ pub enum SshError {
          (`ssh-add {path}`), or use an Ed25519/ECDSA key file."
     )]
     UnsafeRsaIdentity { path: PathBuf },
+
+    #[error("could not load key file {path} — check its format and read permissions. ({source})")]
+    KeyFileLoad {
+        path: PathBuf,
+        #[source]
+        source: russh::keys::Error,
+    },
+
+    #[error("key file {path} exceeds the 256 KiB safety limit")]
+    KeyFileTooLarge { path: PathBuf },
+
+    #[error(
+        "encrypted key file {path} has no readable OpenSSH public identity; sloosh cannot \
+         select its exact key in ssh-agent. Use an OpenSSH-format key file; sloosh will not \
+         decrypt or convert this file."
+    )]
+    KeyFilePublicIdentityUnavailable { path: PathBuf },
+
+    #[error("key file {path}: {reason}. {advice}")]
+    KeyFileAgent {
+        path: PathBuf,
+        reason: AgentAuthFailure,
+        advice: String,
+    },
 
     #[error(
         "no working authentication method for {host}. A vault-managed profile uses only its \
@@ -1056,14 +1082,14 @@ pub async fn scope_uses_system_agent(hosts: &[String]) -> Result<bool, SshError>
     let config = SshConfig::load_default();
     for host in hosts {
         if let Some(entry) = vault::get_entry(host).await {
-            if !matches!(entry.auth, vault::AuthMethod::Agent) {
+            if !auth_matches_system_agent_policy(Some(&entry.auth), None) {
                 return Ok(false);
             }
             continue;
         }
 
         let host_config = config.resolve_for_connection(host)?;
-        if !config_uses_system_agent_only(&host_config) {
+        if !auth_matches_system_agent_policy(None, Some(&host_config)) {
             return Ok(false);
         }
     }
@@ -1294,9 +1320,8 @@ where
     Ok(handle)
 }
 
-/// Auth order: ssh-agent identities first, then unencrypted `IdentityFile`
-/// keys, then a vault-stored password (only
-/// available while the vault is unlocked, i.e. while a lease is active).
+/// Vault profiles use their selected method exclusively. Config hosts try
+/// ssh-agent, then supported unencrypted IdentityFile keys.
 async fn authenticate(
     handle: &mut russh::client::Handle<Handler>,
     host_cfg: &HostConfig,
@@ -1316,7 +1341,7 @@ async fn authenticate(
     if require_system_agent
         && !auth_matches_system_agent_policy(
             vault_entry.as_ref().map(|entry| &entry.auth),
-            host_cfg,
+            Some(host_cfg),
         )
     {
         return Err(SshError::SystemAgentAuthRequired {
@@ -1329,7 +1354,10 @@ async fn authenticate(
     if let Some(entry) = vault_entry {
         return match entry.auth {
             vault::AuthMethod::Agent => {
-                if try_agent_auth(handle, host_cfg, hash_alg).await? {
+                if try_agent_auth(handle, host_cfg, hash_alg, None)
+                    .await
+                    .is_ok()
+                {
                     Ok(())
                 } else {
                     Err(SshError::AuthFailed {
@@ -1357,19 +1385,14 @@ async fn authenticate(
             }
             vault::AuthMethod::KeyFile { path } => {
                 let path = expand_tilde(&path);
-                let key = match russh::keys::load_secret_key(&path, None) {
-                    Ok(key) => key,
-                    Err(russh::keys::Error::KeyIsEncrypted) => {
-                        return Err(SshError::EncryptedIdentity { path });
-                    }
-                    Err(error) => {
-                        debug!(path = %path.display(), %error, "could not load vault key file");
-                        return Err(SshError::AuthFailed {
-                            host: host_cfg.alias.clone(),
-                        });
-                    }
-                };
-                reject_unsafe_local_rsa(&key, &path)?;
+                let key = load_vault_key_file(&path)?;
+                if key.is_encrypted() || matches!(key.algorithm(), Algorithm::Rsa { .. }) {
+                    let public_key = key.public_key().clone();
+                    drop(key);
+                    return try_agent_auth(handle, host_cfg, hash_alg, Some(&public_key))
+                        .await
+                        .map_err(|reason| key_file_agent_error(path, host_cfg, reason));
+                }
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
                 match handle.authenticate_publickey(&host_cfg.user, key).await {
                     Ok(result) if result.success() => Ok(()),
@@ -1387,7 +1410,10 @@ async fn authenticate(
         };
     }
 
-    if try_agent_auth(handle, host_cfg, hash_alg).await? {
+    if try_agent_auth(handle, host_cfg, hash_alg, None)
+        .await
+        .is_ok()
+    {
         return Ok(());
     }
 
@@ -1435,12 +1461,12 @@ async fn authenticate(
 
 fn auth_matches_system_agent_policy(
     vault_auth: Option<&vault::AuthMethod>,
-    host_cfg: &HostConfig,
+    host_cfg: Option<&HostConfig>,
 ) -> bool {
     match vault_auth {
         Some(vault::AuthMethod::Agent) => true,
         Some(vault::AuthMethod::Password { .. } | vault::AuthMethod::KeyFile { .. }) => false,
-        None => config_uses_system_agent_only(host_cfg),
+        None => host_cfg.is_some_and(config_uses_system_agent_only),
     }
 }
 
@@ -1457,49 +1483,173 @@ fn reject_unsafe_local_rsa_algorithm(algorithm: Algorithm, path: &Path) -> Resul
     Ok(())
 }
 
-/// Try every identity ssh-agent offers. Returns `Ok(true)` on success,
-/// `Ok(false)` if the agent is unreachable/empty or rejected everything
-/// (not a hard error — docs/internals/architecture.md says agent auth is tried first, not
-/// that it's required), and `Err` only for a genuine signing failure that
-/// should stop the auth attempt. Connects to the host's `IdentityAgent`
-/// socket if configured (`none` disables agent auth for the host entirely),
-/// otherwise falls back to the default `$SSH_AUTH_SOCK` agent.
-async fn try_agent_auth(
-    handle: &mut russh::client::Handle<Handler>,
+fn load_vault_key_file(path: &Path) -> Result<PrivateKey, SshError> {
+    let load_error = |source| SshError::KeyFileLoad {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file =
+        std::fs::File::open(path).map_err(|error| load_error(russh::keys::Error::IO(error)))?;
+    let mut contents = Zeroizing::new(String::new());
+    file.take(MAX_VAULT_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| load_error(russh::keys::Error::IO(error)))?;
+    if contents.len() as u64 > MAX_VAULT_KEY_FILE_BYTES {
+        return Err(SshError::KeyFileTooLarge {
+            path: path.to_path_buf(),
+        });
+    }
+    // PKCS#8 encryption encloses the public identity too; do not feed it to
+    // a decoder with no passphrase and report a misleading parse error.
+    if contents
+        .trim_start()
+        .starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+    {
+        return Err(SshError::KeyFilePublicIdentityUnavailable {
+            path: path.to_path_buf(),
+        });
+    }
+    match russh::keys::decode_secret_key(&contents, None) {
+        Ok(key) => Ok(key),
+        Err(russh::keys::Error::KeyIsEncrypted) => {
+            // OpenSSH keeps public identity outside the encrypted payload.
+            // Parsing it does not decrypt the private key or perform signing.
+            PrivateKey::from_openssh(contents.as_bytes()).map_err(|_| {
+                SshError::KeyFilePublicIdentityUnavailable {
+                    path: path.to_path_buf(),
+                }
+            })
+        }
+        Err(error) => Err(load_error(error)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AgentAuthFailure {
+    #[error("SSH Agent is disabled for this host")]
+    Disabled,
+    #[error("SSH Agent is unreachable")]
+    Unavailable,
+    #[error("SSH Agent identity query failed")]
+    QueryFailed,
+    #[error("SSH Agent has no matching public-key identity")]
+    NoMatchingIdentity,
+    #[error("the server rejected the SSH Agent identity")]
+    Rejected,
+    #[error("SSH Agent signing or authentication failed")]
+    SigningFailed,
+}
+
+fn key_file_agent_error(
+    path: PathBuf,
+    host_cfg: &HostConfig,
+    reason: AgentAuthFailure,
+) -> SshError {
+    let socket = match &host_cfg.identity_agent {
+        Some(IdentityAgentValue::Path(path)) => Some(path.clone()),
+        Some(IdentityAgentValue::Disabled) => None,
+        None => std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+    };
+    let quote = |value: &Path| format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"));
+    let advice = match reason {
+        AgentAuthFailure::NoMatchingIdentity => match socket {
+            Some(socket) => format!(
+                "Ask your user to load this key into the daemon's agent: SSH_AUTH_SOCK={} ssh-add {}. \
+                 Sloosh does not load keys or change the KeyFile profile's approval policy.",
+                quote(&socket),
+                quote(&path),
+            ),
+            None => {
+                "The daemon has no SSH_AUTH_SOCK; start it from the intended agent environment. \
+                     Restarting terminates sessions and forwards."
+                    .to_string()
+            }
+        },
+        AgentAuthFailure::Unavailable | AgentAuthFailure::QueryFailed => match socket {
+            Some(socket) => format!(
+                "Check the daemon's agent socket {}. Restart only if its agent environment must \
+                 change; restarting terminates sessions and forwards.",
+                quote(&socket),
+            ),
+            None => {
+                "The daemon has no SSH_AUTH_SOCK; start it from the intended agent environment. \
+                     Restarting terminates sessions and forwards."
+                    .to_string()
+            }
+        },
+        AgentAuthFailure::Rejected => {
+            "Check that the selected key is authorized for this remote user; loading other keys \
+             will not change this KeyFile profile's identity."
+                .to_string()
+        }
+        AgentAuthFailure::SigningFailed => {
+            "Check the SSH Agent's unlock or confirmation prompt and retry; Sloosh never signs \
+             RSA locally or asks for the key passphrase."
+                .to_string()
+        }
+        AgentAuthFailure::Disabled => "Enable the intended SSH Agent for this host.".to_string(),
+    };
+    SshError::KeyFileAgent {
+        path,
+        reason,
+        advice,
+    }
+}
+
+fn agent_identity_matches(key: &PublicKey, only: Option<&PublicKey>) -> bool {
+    // Agent comments are independent from key-file comments, not identity.
+    only.is_none_or(|expected| key.key_data() == expected.key_data())
+}
+
+/// Use configured IdentityAgent or the daemon's SSH_AUTH_SOCK. General Agent
+/// authentication tries each plain identity and preserves config-file fallback
+/// after errors. An exact KeyFile identity is attempted at most once.
+async fn try_agent_auth<H: russh::client::Handler>(
+    handle: &mut russh::client::Handle<H>,
     host_cfg: &HostConfig,
     hash_alg: Option<HashAlg>,
-) -> Result<bool, SshError> {
+    only: Option<&PublicKey>,
+) -> Result<(), AgentAuthFailure> {
     let mut agent = match &host_cfg.identity_agent {
-        Some(IdentityAgentValue::Disabled) => return Ok(false),
+        Some(IdentityAgentValue::Disabled) => return Err(AgentAuthFailure::Disabled),
         Some(IdentityAgentValue::Path(path)) => {
             match russh::keys::agent::client::AgentClient::connect_uds(path).await {
                 Ok(agent) => agent,
-                Err(_) => return Ok(false),
+                Err(_) => return Err(AgentAuthFailure::Unavailable),
             }
         }
         None => match russh::keys::agent::client::AgentClient::connect_env().await {
             Ok(agent) => agent,
-            Err(_) => return Ok(false),
+            Err(_) => return Err(AgentAuthFailure::Unavailable),
         },
     };
     let Ok(identities) = agent.request_identities().await else {
-        return Ok(false);
+        return Err(AgentAuthFailure::QueryFailed);
     };
+    let mut failure = AgentAuthFailure::NoMatchingIdentity;
     for identity in identities {
-        let russh::keys::agent::AgentIdentity::PublicKey { key, comment } = identity else {
+        let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
             // Certificate identities aren't wired up in this milestone.
             continue;
         };
-        match handle
+        if !agent_identity_matches(&key, only) {
+            continue;
+        }
+        let result = match handle
             .authenticate_publickey_with(&host_cfg.user, key, hash_alg, &mut agent)
             .await
         {
-            Ok(res) if res.success() => return Ok(true),
-            Ok(_) => debug!(comment, "ssh-agent identity rejected by server"),
-            Err(e) => debug!(comment, error = ?e, "ssh-agent signing error"),
+            Ok(res) if res.success() => return Ok(()),
+            Ok(_) => AgentAuthFailure::Rejected,
+            Err(_) => AgentAuthFailure::SigningFailed,
+        };
+        if only.is_some() {
+            return Err(result);
         }
+        debug!(reason = %result, "ssh-agent identity did not authenticate");
+        failure = result;
     }
-    Ok(false)
+    Err(failure)
 }
 
 /// Terminal modes requested for every session PTY: echo off (docs/internals/architecture.md
@@ -1516,6 +1666,9 @@ pub type ChannelReadHalf = russh::ChannelReadHalf;
 pub type ChannelWriteHalf = russh::ChannelWriteHalf<russh::client::Msg>;
 
 pub use russh::ChannelMsg as SessionChannelMsg;
+
+#[cfg(test)]
+mod auth_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2178,28 +2331,28 @@ Host myhost
     fn system_agent_scope_rejects_custom_agent_and_identity_file_fallbacks() {
         let default_agent = SshConfig::default().resolve("web");
         assert!(config_uses_system_agent_only(&default_agent));
-        assert!(auth_matches_system_agent_policy(None, &default_agent));
+        assert!(auth_matches_system_agent_policy(None, Some(&default_agent)));
         assert!(auth_matches_system_agent_policy(
             Some(&vault::AuthMethod::Agent),
-            &default_agent,
+            Some(&default_agent),
         ));
         assert!(!auth_matches_system_agent_policy(
             Some(&vault::AuthMethod::Password {
                 password: "test-secret".to_string(),
             }),
-            &default_agent,
+            Some(&default_agent),
         ));
         assert!(!auth_matches_system_agent_policy(
             Some(&vault::AuthMethod::KeyFile {
                 path: "~/.ssh/id_ed25519".to_string(),
             }),
-            &default_agent,
+            Some(&default_agent),
         ));
 
         let custom_agent =
             SshConfig::parse("Host web\n  IdentityAgent ~/.1password/agent.sock\n").resolve("web");
         assert!(!config_uses_system_agent_only(&custom_agent));
-        assert!(!auth_matches_system_agent_policy(None, &custom_agent));
+        assert!(!auth_matches_system_agent_policy(None, Some(&custom_agent)));
 
         let disabled_agent = SshConfig::parse("Host web\n  IdentityAgent none\n").resolve("web");
         assert!(!config_uses_system_agent_only(&disabled_agent));
@@ -2207,7 +2360,10 @@ Host myhost
         let identity_file =
             SshConfig::parse("Host web\n  IdentityFile ~/.ssh/id_ed25519\n").resolve("web");
         assert!(!config_uses_system_agent_only(&identity_file));
-        assert!(!auth_matches_system_agent_policy(None, &identity_file));
+        assert!(!auth_matches_system_agent_policy(
+            None,
+            Some(&identity_file)
+        ));
     }
 
     #[test]

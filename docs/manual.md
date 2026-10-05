@@ -86,9 +86,20 @@ sloosh host trust myhost
 sloosh host rm myhost
 ```
 
-Authentication choices are SSH agent, a vault-backed password, or an
-unencrypted Ed25519/ECDSA key path. RSA and encrypted private keys must be
-loaded into ssh-agent.
+Authentication choices are SSH agent, a vault-backed password, or a key-file
+path. Unencrypted Ed25519/ECDSA key files sign directly. For RSA or encrypted
+OpenSSH key files, keep the KeyFile profile and load that same key into the
+daemon's SSH Agent. Sloosh selects only its corresponding public identity;
+it does not decrypt, load, or sign RSA keys locally. Encrypted formats without
+readable OpenSSH public metadata are unsupported.
+
+If the identity is missing, the error gives a shell-quoted command targeting
+the daemon's actual agent socket. Run that command yourself and retry; any key
+passphrase belongs in the system tool's human prompt. A server-rejected key
+instead requires checking the remote user's authorized keys. Loading other
+keys does not change this profile's selected identity. KeyFile lease approval
+requirements are unchanged, and Sloosh does not configure automatic loading
+after an agent restart. SSH-config hosts keep their existing agent-first order.
 
 A vault profile configured with `--auth agent` uses the default system
 `$SSH_AUTH_SOCK` and can skip human lease approval once the daemon can inspect

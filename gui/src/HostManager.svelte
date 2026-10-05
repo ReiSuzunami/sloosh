@@ -755,7 +755,7 @@
                 <label class:chosen={form.auth === 'key_file'}>
                   <input bind:group={form.auth} type="radio" value="key_file" />
                   <FileKey2 size={18} />
-                  <span><strong>Key file</strong><small>References an unencrypted Ed25519/ECDSA key. Load RSA or encrypted keys into SSH Agent.</small></span>
+                  <span><strong>Key file</strong><small>Uses this exact key. RSA and encrypted OpenSSH keys must also be loaded in SSH Agent.</small></span>
                 </label>
               </div>
               {#if form.auth === 'agent'}
@@ -775,7 +775,7 @@
                       <FolderOpen size={15} /> Choose…
                     </button>
                   </div>
-                  <small>Type a full path when Finder hides <code>.ssh</code>, or choose a file. For encrypted keys, use SSH agent.</small>
+                  <small>Type a full path when Finder hides <code>.ssh</code>, or choose a file. For RSA or encrypted OpenSSH keys, load this same key into the daemon's SSH Agent; keep Key file selected.</small>
                 </label>
               {/if}
             {/if}

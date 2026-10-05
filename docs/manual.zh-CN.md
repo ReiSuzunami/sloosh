@@ -76,8 +76,16 @@ sloosh host trust myhost
 sloosh host rm myhost
 ```
 
-认证方式包括 SSH agent、vault 加密密码，或未加密 Ed25519/ECDSA 私钥路径。RSA 与
-加密私钥必须先载入 ssh-agent。
+认证方式包括 SSH agent、vault 加密密码，或私钥文件路径。未加密 Ed25519/ECDSA
+直接签名；RSA 或加密 OpenSSH 私钥保留 KeyFile profile，同时由人类把同一把钥匙
+载入 daemon 使用的 SSH Agent。Sloosh 只选择对应公钥身份，不解密、不自动加载钥匙，
+也不在本地进行 RSA 签名。没有可读 OpenSSH 公钥元数据的加密格式不受支持。
+
+Agent 缺少该身份时，错误会给出经过 shell 引号转义、指向 daemon 实际 Agent socket
+的命令。请自行执行后重试；私钥口令只输入系统工具的人类提示中。服务器拒绝钥匙时，
+应检查远端用户的 authorized_keys；加载其他钥匙不会改变此 profile 选中的身份。
+KeyFile 的 lease 审批要求不变，Sloosh 不配置 Agent 重启后的自动加载。
+SSH 配置主机保持现有 Agent 优先的认证顺序。
 
 使用 `--auth agent` 的 vault profile 只使用默认系统 `$SSH_AUTH_SOCK`；daemon 能检查
 已解锁 vault 后可跳过人工 lease 批准。DMG Keychain 预览可无审批弹窗提供该状态；仅 CLI

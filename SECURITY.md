@@ -414,11 +414,21 @@ fail-closed request errors are still returned to every caller. Desktop command
 adapters never render an unexpected wire response through `Debug`.
 
 Sloosh retains RSA public-key interoperability for host keys and ssh-agent
-identities, but refuses RSA private-key files before authentication. RSA
-signing remains in the external ssh-agent, avoiding the known timing side
-channel in the local Rust RSA implementation. Direct key-file authentication
-accepts unencrypted Ed25519/ECDSA keys; encrypted and RSA keys must use
-ssh-agent.
+identities, but never signs RSA locally. Vault KeyFile profiles use unencrypted
+Ed25519/ECDSA keys directly. RSA and encrypted OpenSSH key files instead supply
+their public identity: Sloosh asks the external ssh-agent to authenticate with
+that exact public key at most once, never another identity. OpenSSH's public
+identity is readable without decrypting its private payload. Encrypted formats
+without readable OpenSSH public metadata are rejected. Vault key-file reads
+are bounded to 256 KiB and the input buffer is zeroizing.
+
+KeyFile remains KeyFile authority and does not qualify for system-agent-only
+automatic leases just because signing is delegated. Sloosh never loads keys
+into the agent, changes its persistence or configuration, decrypts these keys,
+or generates public-key sidecars. The human must load the key into the same
+agent socket used by the daemon. Agent key comments are not logged.
+SSH-config hosts retain their existing agent-first, then unencrypted
+IdentityFile authentication order, including rejection of local RSA signing.
 
 Audit writes are best-effort. Audit is operational evidence, not an
 append-only, remote, signed, or tamper-resistant security control.

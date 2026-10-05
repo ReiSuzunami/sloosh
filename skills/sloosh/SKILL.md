@@ -119,9 +119,14 @@ sloosh status                                # daemon/lease/session overview —
   (`sloosh host add/edit/trust/rm/list/show`) is something the user does themselves, interactively, in
   their own terminal. If a host isn't set up yet, tell them to run
   `sloosh host add` and wait. Humans may choose SSH agent, password, or an
-  unencrypted Ed25519/ECDSA key-file profile plus direct, managed-host, or
-  ProxyJump routing. RSA and encrypted private keys must be loaded into
-  ssh-agent.
+  key-file profile plus direct, managed-host, or ProxyJump routing. Unencrypted
+  Ed25519/ECDSA keys sign directly. RSA and encrypted OpenSSH KeyFile profiles
+  delegate signing only to their exact public identity already loaded in the
+  daemon's SSH Agent; keep the KeyFile profile and its approval policy.
+  When that identity is missing, show the human the error's socket-specific
+  ssh-add command and wait. Never load keys yourself or switch the profile to
+  broad Agent authentication. Sloosh does not decrypt keys or persist Agent
+  loading; encrypted formats without OpenSSH public metadata are unsupported.
 - `sloosh init`, `sloosh approve`, and every `sloosh host` command are human-only.
   Never work around their TTY checks. The Agent Skill cannot approve a pending
   lease, initialize the vault, or broaden authority. Only daemon policy may
