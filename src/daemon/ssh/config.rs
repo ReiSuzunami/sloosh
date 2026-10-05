@@ -747,6 +747,9 @@ mod diagnostic_tests {
 
     #[tokio::test]
     async fn include_loads_complete_approval_route_and_credentials() {
+        let _guard = crate::daemon::vault::cache_test_lock().lock().await;
+        crate::daemon::vault::clear_cache().await;
+        let _ = std::fs::remove_file(crate::daemon::vault::vault_path());
         let fixture = IncludeFixture::new();
         fixture.write("config", "Include conf.d/*\n");
         fixture.write("conf.d/10-hosts", "Host target\n HostName 10.0.0.2\n ProxyJump jump\n IdentityFile /test/key\n IdentityAgent /test/agent\nHost jump\n HostName 10.0.0.1\n");
