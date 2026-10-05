@@ -69,6 +69,21 @@ scope. When you're unsure what's going on (is there a
 session already? is a host authorized?), run `sloosh status` first instead
 of guessing.
 
+## Explicit Dangerous Bypass Mode
+
+Only when the user explicitly chooses this mode, they can start the selected
+local `slooshd --dangerous-bypass-mode` after stopping the existing daemon
+(stopping loses sessions and forwards). Do not enable it merely to fix pending
+approval or unknown-host errors. With that daemon running, `sloosh request`
+automatically grants bounded exact scope without approve; unknown target and
+jump-host keys are trusted and saved on connection. Changed keys still fail.
+SSH credentials and vault unlock remain required. Startup and bypass grants
+appear in `sloosh log`. The user can also explicitly save `dangerous_bypass_mode`
+in protected `vault-settings.json`, or confirm it in desktop Security. GUI saves
+startup policy only; CLI/desktop auto-spawn honor it on the next start. Do not
+change this setting without explicit user direction. To disable, clear the saved
+setting and restart without the flag; saved trust remains. Default is off.
+
 ## Key commands
 
 ```

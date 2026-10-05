@@ -22,6 +22,82 @@ fn dedicated_daemon_has_its_own_minimal_cli_surface() {
         .output()
         .expect("run legacy daemon command");
     assert!(!legacy.status.success());
+    let help = Command::new(daemon).arg("--help").output().unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--dangerous-bypass-mode"));
+}
+
+#[tokio::test]
+async fn dangerous_bypass_is_explicit_daemon_startup_policy() {
+    use std::os::unix::fs::PermissionsExt;
+    for (flag, configured) in [
+        (false, None),
+        (true, None),
+        (false, Some(true)),
+        (false, Some(false)),
+        (true, Some(false)),
+    ] {
+        let enabled = flag || configured.unwrap_or(false);
+        let root = std::env::temp_dir().join(format!(
+            "sloosh-b-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u32,
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Some(configured) = configured {
+            let settings = root.join("vault-settings.json");
+            std::fs::write(&settings, format!(r#"{{"version":1,"idle_timeout_minutes":15,"dangerous_bypass_mode":{configured}}}"#)).unwrap();
+            std::fs::set_permissions(settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // A locked vault makes normal automatic system-agent approval ineligible.
+        std::fs::write(root.join("vault"), b"locked test fixture").unwrap();
+        let socket = root.join("s");
+        let daemon = std::path::PathBuf::from(env!("CARGO_BIN_EXE_slooshd"));
+        let mut command = tokio::process::Command::new(&daemon);
+        if flag {
+            command.arg("--dangerous-bypass-mode");
+        }
+        let mut child = command
+            .env("SLOOSH_HOME", &root)
+            .env("SLOOSH_SOCKET", &socket)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(socket, daemon);
+        let response = client
+            .request(&Request::RequestLease {
+                hosts: vec!["bypass-test.invalid".to_string()],
+            })
+            .await
+            .unwrap();
+        if enabled {
+            assert_eq!(response, Response::Ok);
+        } else {
+            assert!(matches!(response, Response::LeaseRequestPending(_)));
+        }
+        assert_eq!(
+            client.request(&Request::Shutdown).await.unwrap(),
+            Response::Ok
+        );
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
+        assert_eq!(audit.contains("lease_approved_dangerous_bypass"), enabled);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test]

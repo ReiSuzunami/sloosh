@@ -253,6 +253,29 @@ fn sloosh_known_hosts_path() -> PathBuf {
     sloosh_home().join("known_hosts")
 }
 
+/// Dangerous mode is trust-on-first-use, never a changed-key override.
+fn verify_server_key_with_policy_at_paths(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    openssh_path: &Path,
+    sloosh_path: &Path,
+    dangerous_bypass: bool,
+) -> Result<bool, SshError> {
+    match verify_server_key_at_paths(host, port, key, openssh_path, sloosh_path) {
+        Err(SshError::UnknownHostKey { .. }) if dangerous_bypass => {
+            known_hosts::commit_at_path(sloosh_path, host, port, key, KnownHostMutation::Add)?;
+            tracing::warn!(
+                host,
+                port,
+                "DANGEROUS BYPASS MODE: trusted unknown SSH host key"
+            );
+            Ok(true)
+        }
+        result => result,
+    }
+}
+
 /// Verify a presented server key against the two trust stores in strict
 /// precedence order. Explicit paths keep this fail-closed policy testable
 /// without mutating process-global HOME or touching a developer's real keys.
@@ -343,12 +366,13 @@ impl russh::client::Handler for Handler {
     /// either file is a hard refusal — never silently fall through to the
     /// other file once a *different* key has been recorded for this host.
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
-        verify_server_key_at_paths(
+        verify_server_key_with_policy_at_paths(
             &self.host,
             self.port,
             server_public_key,
             &ssh_known_hosts_path(),
             &sloosh_known_hosts_path(),
+            super::dangerous_bypass_enabled(),
         )
     }
 
@@ -1623,6 +1647,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, SshError::UnknownHostKey { .. }));
+    }
+
+    #[test]
+    fn dangerous_bypass_trusts_unknown_key_but_rejects_changes() {
+        let fixture = KnownHostsFixture::new("dangerous-bypass");
+        let key = test_public_key(TEST_KEY_A);
+        assert!(matches!(
+            verify_server_key_with_policy_at_paths(
+                "example.com",
+                22,
+                &key,
+                &fixture.openssh,
+                &fixture.sloosh,
+                false,
+            ),
+            Err(SshError::UnknownHostKey { .. })
+        ));
+        assert!(
+            verify_server_key_with_policy_at_paths(
+                "example.com",
+                22,
+                &key,
+                &fixture.openssh,
+                &fixture.sloosh,
+                true,
+            )
+            .unwrap()
+        );
+        // Persisted trust remains usable after dangerous mode is disabled.
+        assert!(
+            verify_server_key_at_paths("example.com", 22, &key, &fixture.openssh, &fixture.sloosh,)
+                .unwrap()
+        );
+        assert!(matches!(
+            verify_server_key_with_policy_at_paths(
+                "example.com",
+                22,
+                &test_public_key(TEST_KEY_B),
+                &fixture.openssh,
+                &fixture.sloosh,
+                true,
+            ),
+            Err(SshError::HostKeyMismatch { .. })
+        ));
+        fixture.write(Some(TEST_KEY_B), Some(TEST_KEY_A));
+        assert!(matches!(
+            verify_server_key_with_policy_at_paths(
+                "example.com",
+                22,
+                &key,
+                &fixture.openssh,
+                &fixture.sloosh,
+                true,
+            ),
+            Err(SshError::HostKeyMismatch { .. })
+        ));
     }
 
     #[test]

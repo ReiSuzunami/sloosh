@@ -1,5 +1,41 @@
 # Sloosh 使用手册
 
+## Dangerous Bypass Mode
+
+仅在接受同用户进程免审批访问主机、首次连接可能信任攻击者的风险时开启。
+使用 CLI 实际选择的 `slooshd`：命令行安装通常选同目录 helper，macOS 已安装 App
+时可能优先选 App 内 helper。先停现有 daemon（会终止会话与转发），另开终端启动：
+
+```sh
+sloosh daemon stop
+/path/to/selected/slooshd --dangerous-bypass-mode
+```
+
+保持运行。工作终端执行 `sloosh request myhost`，再正常使用 `run`、`put`、`get`
+或 `forward`。无需 approve 弹窗或终端确认；未知目标与跳板主机密钥自动保存，
+已知密钥变更仍拒绝。SSH 登录凭据与加密 vault 解锁仍必需。
+启动和每次 bypass 授权可通过 `sloosh log` 查看；首次信任会在 daemon 输出警告。
+它不是单次调用参数。
+
+持久开启：桌面端 **Security → Dangerous Bypass Mode → Enable on next start**，
+确认风险后保存。GUI 不会中断当前 daemon；准备好后停止并重新启动 daemon。
+停止会丢失会话、转发和 lease。之后 CLI 与桌面自动启动均读取已保存策略。
+
+共享配置为 `~/.sloosh/vault-settings.json`（设置 `SLOOSH_HOME` 时位于该目录）。
+保留原有超时值，加入配置：
+
+```json
+{"version":1,"idle_timeout_minutes":15,"dangerous_bypass_mode":true}
+```
+
+文件必须仅当前用户可读写（`0600`）。文件或字段缺失默认关闭；配置损坏或权限
+不安全会拒绝启动。参数会覆盖配置中的 false 而开启，但不会修改持久配置。
+
+关闭：GUI 选择 **Disable on next start**（或将配置字段改为 false），停止 daemon，
+不带参数重新启动。
+此前自动保存的主机信任仍保留；关闭模式不会撤销已保存的信任。
+
+
 [English](manual.md) | 简体中文
 
 本手册面向人类用户，介绍初始化与日常 CLI、桌面端操作。Agent 应遵循内嵌的

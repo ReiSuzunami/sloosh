@@ -1,5 +1,11 @@
 # sloosh
 
+Dangerous Bypass Mode supports a startup argument and persistent configuration,
+with explicit opt-in in GUI Security (applied on restart; default off). It skips approval
+and trusts unknown host keys automatically. Known-key changes still fail.
+See [usage and risks](docs/manual.md#dangerous-bypass-mode).
+
+
 [简体中文](./README.md) | English
 
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)

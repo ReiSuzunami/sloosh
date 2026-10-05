@@ -22,6 +22,7 @@ export type AppSnapshot = {
   };
   vaultUnlock: VaultUnlockSnapshot;
   vaultTimeoutMinutes: 1 | 5 | 15 | 30;
+  dangerousBypassMode: boolean | null;
   daemonPath: string;
 };
 

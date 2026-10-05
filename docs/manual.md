@@ -1,5 +1,47 @@
 # Sloosh manual
 
+## Dangerous Bypass Mode
+
+Opt in only when you accept unrestricted same-user lease approval and the
+risk of trusting a first-connection attacker. Use the exact `slooshd` selected
+by your CLI (its sibling for command-line installs; on macOS the installed app's
+private helper may take precedence). Stop an existing daemon first; stopping
+terminates sessions and forwards. Then start that helper in a separate terminal:
+
+```sh
+sloosh daemon stop
+/path/to/selected/slooshd --dangerous-bypass-mode
+```
+
+Keep it running. In your working terminal, use `sloosh request myhost`, then
+normal `run`, `put`, `get`, or `forward` commands. No approve popup/terminal
+confirmation is needed. Unknown target and jump-host keys are saved automatically;
+known-key changes still fail. SSH authentication and encrypted-vault unlock
+remain required. Startup and each bypass grant are visible in `sloosh log`;
+first-use trust is warned in daemon output. This is not a per-call flag.
+
+For persistent opt-in, open desktop **Security → Dangerous Bypass Mode →
+Enable on next start** and accept the risk confirmation. The GUI saves the
+startup policy; it does not interrupt the running daemon. Stop and start the
+daemon when ready (all sessions, forwards, and leases are lost on stop).
+CLI and desktop auto-spawn honor the saved setting on subsequent starts.
+
+The shared protected configuration is `~/.sloosh/vault-settings.json` (or
+`$SLOOSH_HOME/vault-settings.json`). Preserve its timeout and set:
+
+```json
+{"version":1,"idle_timeout_minutes":15,"dangerous_bypass_mode":true}
+```
+
+Keep the file owner-only (`0600`). Missing file/field defaults off; corrupt or
+unsafe settings prevent startup. The flag enables bypass even when the saved
+setting is false; it does not change the saved configuration.
+
+To disable, use **Disable on next start** (or set the config field false), then
+stop and restart without the flag. Keys already added remain trusted; disabling
+is not trust rollback.
+
+
 English | [简体中文](manual.zh-CN.md)
 
 This manual covers human setup and everyday CLI and desktop use. Agents should

@@ -1,5 +1,10 @@
 # sloosh
 
+Dangerous Bypass Mode 支持启动参数与持久配置，GUI Security 可显式开启（重启生效）：
+本地 daemon 跳过审批，自动信任未知主机。默认关闭。
+已知密钥变更仍拒绝。见[用法与风险](docs/manual.zh-CN.md#dangerous-bypass-mode)。
+
+
 简体中文 | [English](./README.en.md)
 
 [![CI](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml/badge.svg)](https://github.com/ReiSuzunami/sloosh/actions/workflows/ci.yml)

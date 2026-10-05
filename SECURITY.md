@@ -1,5 +1,36 @@
 # Security
 
+## Dangerous Bypass Mode (explicit exception)
+
+Default behavior below assumes this mode is disabled. Starting the selected
+local daemon with `slooshd --dangerous-bypass-mode`, or explicitly enabling
+`dangerous_bypass_mode` in protected local settings, disables human
+lease approval for every same-user client of that daemon. `RequestLease`
+automatically activates an exact expanded host scope, retaining PID/start-time
+anchoring, expiry, revocation, stable forward grants, and resource limits.
+Bypass grants are not restricted to system-agent authentication. SSH login
+credentials are still required; encrypted vaults still require unlock.
+
+Unknown SSH host keys, including ProxyJump hops, are automatically persisted
+in Sloosh's protected known_hosts store on first connection. This forfeits
+independent fingerprint verification and permits a first-connection MITM.
+Existing key mismatches and trust-store write failures still fail closed.
+Automatically added keys remain trusted after disabling this mode.
+
+The mode is daemon startup policy, never a caller-supplied IPC flag. It defaults
+off. CLI/desktop auto-spawn honors `dangerous_bypass_mode` in
+`~/.sloosh/vault-settings.json` (under `SLOOSH_HOME` when set). Missing fields
+default false; the startup flag ORs with the saved setting. Settings retain
+owner-only permissions, bounded reads, symlink refusal, and atomic writes;
+corrupt or unsafe settings prevent daemon startup, even with the flag.
+The GUI Security page saves this setting only after explicit risk confirmation;
+it does not restart or change the running daemon. Startup emits a prominent warning
+and `dangerous_bypass_enabled` audit event; each automatic bypass lease emits
+`lease_approved_dangerous_bypass`. First-use trust emits a daemon warning.
+Disable the saved setting and restart without the flag to disable the mode.
+Stopping loses active sessions, forwards, and leases. There is no remote control API.
+
+
 This document defines the current threat model and capability boundaries. It
 describes implemented controls, not a claim that a same-user daemon can isolate
 hostile code running under that user account.

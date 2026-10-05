@@ -198,6 +198,7 @@ struct ActiveLease {
 enum LeaseAuthorization {
     Human,
     SystemAgent,
+    DangerousBypass,
 }
 
 /// Opaque handle to the exact active lease that authorized one host.
@@ -659,6 +660,26 @@ pub async fn approve_lease_system_agent(
     )))
 }
 
+/// Startup bypass policy still grants only a bounded, process-anchored scope.
+pub(crate) async fn approve_lease_dangerous_bypass(
+    id: &str,
+) -> Result<LeaseActivatedInfo, LeaseError> {
+    let mut st = state().lock().await;
+    prune_expired(&mut st).await;
+    let hosts = st
+        .pending
+        .get(id)
+        .map(|pending| pending.hosts.clone())
+        .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?;
+    let resolved_hosts = expand_approval_hosts(&hosts).await?;
+    Ok(activate_pending(
+        &mut st,
+        id,
+        resolved_hosts,
+        LeaseAuthorization::DangerousBypass,
+    ))
+}
+
 /// Drop cache populated only for an unsuccessful native preview. Preserve it
 /// when another active lease still owns cache lifetime.
 pub async fn discard_native_preview() {
@@ -920,7 +941,7 @@ async fn resolve_grant_for_chain(
         .map(|(index, _)| index)?;
     let authorization = st.active[index].authorization;
     let token = st.active[index].token.clone();
-    if authorization == LeaseAuthorization::Human {
+    if authorization != LeaseAuthorization::SystemAgent {
         if touch {
             st.active[index].last_used = Instant::now();
         }
@@ -965,7 +986,7 @@ async fn grant_is_active(grant: &LeaseGrant, touch: bool) -> bool {
         return false;
     };
     let authorization = l.authorization;
-    if authorization == LeaseAuthorization::Human {
+    if authorization != LeaseAuthorization::SystemAgent {
         if touch {
             l.last_used = Instant::now();
         }
@@ -1308,6 +1329,39 @@ mod tests {
         let mut st = state().lock().await;
         st.pending.clear();
         st.active.clear();
+    }
+
+    #[tokio::test]
+    async fn dangerous_bypass_preserves_scope_identity_and_expiry() {
+        let _guard = test_lock().lock().await;
+        reset_state().await;
+        let chain = vec![ancestor(99, 100, Some("agent"))];
+        let RequestOutcome::Pending(info) =
+            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
+                .await
+                .unwrap()
+        else {
+            panic!("expected pending request");
+        };
+        approve_lease_dangerous_bypass(&info.id).await.unwrap();
+        let grant = resolve_grant_for_chain(&chain, "web", None, true)
+            .await
+            .unwrap();
+        assert!(!grant.requires_system_agent());
+        assert!(check_grant(&grant).await);
+        assert!(
+            resolve_grant_for_chain(&chain, "other", None, true)
+                .await
+                .is_none()
+        );
+        let reused_pid = vec![ancestor(99, 101, Some("agent"))];
+        assert!(
+            resolve_grant_for_chain(&reused_pid, "web", None, true)
+                .await
+                .is_none()
+        );
+        state().lock().await.active[0].created_at = Instant::now() - MAX_LIFETIME;
+        assert!(!check_grant(&grant).await);
     }
 
     #[tokio::test]

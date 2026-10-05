@@ -52,6 +52,7 @@ struct AppSnapshot {
     pin: PinSnapshot,
     vault_unlock: VaultUnlockSnapshot,
     vault_timeout_minutes: u16,
+    dangerous_bypass_mode: Option<bool>,
     daemon_path: String,
 }
 
@@ -160,6 +161,9 @@ impl Controller {
             pin: PinStore::current_user().status().into(),
             vault_unlock: self.unlock_snapshot(),
             vault_timeout_minutes: configured_vault_timeout().minutes(),
+            dangerous_bypass_mode: VaultSettingsStore::current_user()
+                .dangerous_bypass_mode()
+                .ok(),
             daemon_path: self.daemon_executable.display().to_string(),
         }
     }
@@ -426,6 +430,17 @@ async fn set_vault_timeout(
 }
 
 #[tauri::command]
+async fn set_dangerous_bypass_mode(
+    controller: tauri::State<'_, Controller>,
+    enabled: bool,
+) -> Result<AppSnapshot, String> {
+    VaultSettingsStore::current_user()
+        .save_dangerous_bypass_mode(enabled)
+        .map_err(|error| error.to_string())?;
+    Ok(controller.snapshot().await)
+}
+
+#[tauri::command]
 async fn get_app_snapshot(controller: tauri::State<'_, Controller>) -> Result<AppSnapshot, String> {
     let controller = controller.inner().clone();
     Ok(controller.snapshot().await)
@@ -494,6 +509,7 @@ fn main() {
             get_vault_unlock_status,
             touch_vault_session,
             set_vault_timeout,
+            set_dangerous_bypass_mode,
             list_hosts,
             add_host,
             update_host,

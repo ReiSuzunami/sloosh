@@ -1,5 +1,12 @@
 # Local Wire Protocol
 
+Dangerous Bypass Mode is explicit daemon startup policy (argument or protected
+local configuration), not a wire field. GUI saves config locally, not over IPC.
+It retains protocol 3 framing and negotiation. With the mode enabled,
+`RequestLease` returns existing `Ok` after activating a bounded exact-scope
+lease without human approval; default authorization behavior is unchanged.
+
+
 This document specifies the current local client-to-daemon wire contract used
 by both `sloosh` and the desktop app. The exact
 version constant is `WIRE_PROTOCOL_VERSION = 3` in `src/proto.rs`.

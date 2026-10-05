@@ -61,6 +61,8 @@ pub enum VaultSettingsError {
 struct SettingsFile {
     version: u32,
     idle_timeout_minutes: u16,
+    #[serde(default)]
+    dangerous_bypass_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,15 @@ impl VaultSettingsStore {
     }
 
     pub fn load(&self) -> Result<VaultTimeout, VaultSettingsError> {
+        let file = self.load_settings()?;
+        VaultTimeout::try_from(file.idle_timeout_minutes).map_err(|_| VaultSettingsError::Corrupt)
+    }
+
+    pub fn dangerous_bypass_mode(&self) -> Result<bool, VaultSettingsError> {
+        Ok(self.load_settings()?.dangerous_bypass_mode)
+    }
+
+    fn load_settings(&self) -> Result<SettingsFile, VaultSettingsError> {
         self.refuse_unsafe_target()?;
         let input = match std::fs::OpenOptions::new()
             .read(true)
@@ -89,7 +100,11 @@ impl VaultSettingsStore {
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(VaultTimeout::default());
+                return Ok(SettingsFile {
+                    version: SETTINGS_VERSION,
+                    idle_timeout_minutes: VaultTimeout::default().minutes(),
+                    dangerous_bypass_mode: false,
+                });
             }
             Err(error) => return Err(error.into()),
         };
@@ -113,10 +128,24 @@ impl VaultSettingsStore {
         if file.version != SETTINGS_VERSION {
             return Err(VaultSettingsError::Corrupt);
         }
-        VaultTimeout::try_from(file.idle_timeout_minutes).map_err(|_| VaultSettingsError::Corrupt)
+        VaultTimeout::try_from(file.idle_timeout_minutes)
+            .map_err(|_| VaultSettingsError::Corrupt)?;
+        Ok(file)
     }
 
     pub fn save(&self, timeout: VaultTimeout) -> Result<(), VaultSettingsError> {
+        let mut file = self.load_settings()?;
+        file.idle_timeout_minutes = timeout.minutes();
+        self.save_settings(&file)
+    }
+
+    pub fn save_dangerous_bypass_mode(&self, enabled: bool) -> Result<(), VaultSettingsError> {
+        let mut file = self.load_settings()?;
+        file.dangerous_bypass_mode = enabled;
+        self.save_settings(&file)
+    }
+
+    fn save_settings(&self, file: &SettingsFile) -> Result<(), VaultSettingsError> {
         self.refuse_unsafe_target()?;
         if let Some(parent) = self.path.parent() {
             if parent == sloosh_home() {
@@ -125,11 +154,7 @@ impl VaultSettingsStore {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let file = SettingsFile {
-            version: SETTINGS_VERSION,
-            idle_timeout_minutes: timeout.minutes(),
-        };
-        let encoded = serde_json::to_vec_pretty(&file).map_err(|_| VaultSettingsError::Corrupt)?;
+        let encoded = serde_json::to_vec_pretty(file).map_err(|_| VaultSettingsError::Corrupt)?;
         let mut random = [0_u8; 8];
         rand::rng().fill_bytes(&mut random);
         let suffix = random
@@ -215,6 +240,52 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bypass_defaults_off_and_setting_updates_preserve_each_other() {
+        let path = temporary_path("bypass");
+        let store = VaultSettingsStore::for_test(path.clone());
+        assert!(!store.dangerous_bypass_mode().unwrap());
+        std::fs::write(&path, br#"{"version":1,"idle_timeout_minutes":5}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!store.dangerous_bypass_mode().unwrap());
+        store.save_dangerous_bypass_mode(true).unwrap();
+        assert_eq!(store.load().unwrap().minutes(), 5);
+        store.save(VaultTimeout::try_from(30).unwrap()).unwrap();
+        assert!(store.dangerous_bypass_mode().unwrap());
+        store.save_dangerous_bypass_mode(false).unwrap();
+        assert!(!store.dangerous_bypass_mode().unwrap());
+        assert_eq!(store.load().unwrap().minutes(), 30);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bypass_rejects_corrupt_or_non_private_settings() {
+        let path = temporary_path("bypass-unsafe");
+        let store = VaultSettingsStore::for_test(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"version":1,"idle_timeout_minutes":15,"dangerous_bypass_mode":"true"}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            store.dangerous_bypass_mode(),
+            Err(VaultSettingsError::Corrupt)
+        ));
+        assert!(store.save_dangerous_bypass_mode(true).is_err());
+        std::fs::write(
+            &path,
+            br#"{"version":1,"idle_timeout_minutes":15,"dangerous_bypass_mode":true}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.dangerous_bypass_mode(),
+            Err(VaultSettingsError::UnsafeFile)
+        ));
         std::fs::remove_file(path).unwrap();
     }
 

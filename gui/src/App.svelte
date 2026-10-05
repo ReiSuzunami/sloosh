@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { confirm } from '@tauri-apps/plugin-dialog';
   import { onMount } from 'svelte';
   import { fade, scale } from 'svelte/transition';
   import {
@@ -214,6 +215,29 @@
       void refresh();
     } else if (readiness.action === 'setup') {
       view = 'setup';
+    }
+  }
+
+  async function setDangerousBypassMode() {
+    if (activeAction !== null || snapshot?.dangerousBypassMode == null) return;
+    const enabled = !snapshot.dangerousBypassMode;
+    activeAction = 'set_dangerous_bypass_mode';
+    error = null;
+    success = null;
+    try {
+      const accepted = await confirm(
+        enabled
+          ? 'On the next daemon start, every same-user client can obtain SSH leases without human approval. Unknown host keys will be trusted automatically, allowing a first-connection attacker. SSH credentials and vault unlock remain required. This stays enabled across restarts until you disable it. Save this dangerous setting?'
+          : 'Disable bypass on the next daemon start? Current daemon policy stays unchanged until restarted. Previously trusted host keys remain trusted.',
+        { title: 'Dangerous Bypass Mode', kind: 'warning', okLabel: enabled ? 'Enable on next start' : 'Disable on next start', cancelLabel: 'Cancel' },
+      );
+      if (!accepted) return;
+      snapshot = await invoke<AppSnapshot>('set_dangerous_bypass_mode', { enabled });
+      success = 'Startup policy saved. Run sloosh daemon stop, then sloosh daemon start to apply. Stopping terminates sessions, forwards, and leases.';
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      activeAction = null;
     }
   }
 
@@ -550,6 +574,19 @@
             </label>
           </div>
         </div>
+      </section>
+
+      <section class="danger-zone" aria-labelledby="bypass-heading">
+        <div>
+          <h2 id="bypass-heading">Dangerous Bypass Mode</h2>
+          <p>Skips human approval and trusts unknown SSH host keys for all same-user clients. Known-key changes still fail.</p>
+          <p>Saved startup policy: {snapshot?.dangerousBypassMode == null ? 'Unavailable' : snapshot.dangerousBypassMode ? 'Enabled' : 'Disabled'}. Current daemon is unchanged. Restart to apply; stopping ends sessions, forwards, and leases.</p>
+        </div>
+        <button
+          class="secondary-button danger-button"
+          disabled={snapshot?.dangerousBypassMode == null || activeAction !== null}
+          onclick={setDangerousBypassMode}
+        >{activeAction === 'set_dangerous_bypass_mode' ? 'Saving...' : snapshot?.dangerousBypassMode ? 'Disable on next start' : 'Enable on next start'}</button>
       </section>
 
       <section class="section-block" aria-labelledby="recovery-heading">

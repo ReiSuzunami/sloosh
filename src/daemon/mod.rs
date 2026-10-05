@@ -47,11 +47,19 @@ use crate::proto::{self, Request, Response};
 use crate::transport::unix;
 use crate::transport::{BindOutcome, Channel, MAX_RAW_FRAME_BYTES};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
+
+// Startup policy of the single daemon owning this process. Never caller-controlled IPC.
+static DANGEROUS_BYPASS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn dangerous_bypass_enabled() -> bool {
+    DANGEROUS_BYPASS.load(Ordering::Relaxed)
+}
 
 /// Self-teaching error for a host-touching request with no matching lease
 /// (docs/internals/architecture.md).
@@ -99,9 +107,20 @@ async fn require_lease(
 /// winner serve — callers retry `connect`, they don't need this process to
 /// succeed.
 pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
+    run_with_dangerous_bypass(socket_path, false).await
+}
+
+/// Startup opt-in via flag or protected local settings; disabled by default.
+pub async fn run_with_dangerous_bypass(
+    socket_path: PathBuf,
+    dangerous_bypass: bool,
+) -> anyhow::Result<()> {
     let start = Instant::now();
     let pid = std::process::id();
     unix::ensure_private_dir(&unix::sloosh_home())?;
+    let configured_bypass =
+        crate::vault_settings::VaultSettingsStore::current_user().dangerous_bypass_mode()?;
+    let dangerous_bypass = dangerous_bypass || configured_bypass;
 
     let listener = match unix::bind(&socket_path)? {
         BindOutcome::Bound(listener) => listener,
@@ -114,6 +133,13 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
+    DANGEROUS_BYPASS.store(dangerous_bypass, Ordering::Relaxed);
+    if dangerous_bypass {
+        warn!(
+            "DANGEROUS BYPASS MODE: human approval disabled; unknown host keys trusted automatically"
+        );
+        audit::record("dangerous_bypass_enabled", serde_json::json!({"pid": pid}));
+    }
     info!(pid, path = %socket_path.display(), version = env!("CARGO_PKG_VERSION"), "sloosh daemon listening");
     // Cleared only after winning the bind: this daemon starts with no
     // sessions (a no-op in a real daemon process; see `reset_registry`).
@@ -634,6 +660,23 @@ async fn handle_connection(
                         );
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
+                            lease::RequestOutcome::Pending(info) if dangerous_bypass_enabled() => {
+                                match lease::approve_lease_dangerous_bypass(&info.id).await {
+                                    Ok(activated) => {
+                                        audit::record(
+                                            "lease_approved_dangerous_bypass",
+                                            serde_json::json!({
+                                                "hosts": activated.hosts,
+                                                "anchor_pid": activated.anchor_pid,
+                                            }),
+                                        );
+                                        Response::Ok
+                                    }
+                                    Err(error) => Response::Error {
+                                        message: error.to_string(),
+                                    },
+                                }
+                            }
                             lease::RequestOutcome::Pending(info) => {
                                 match lease::approve_lease_system_agent(&info.id, None).await {
                                     Ok(lease::SystemAgentApprovalOutcome::Activated(activated)) => {

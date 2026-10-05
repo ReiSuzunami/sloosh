@@ -1,5 +1,25 @@
 # Architecture
 
+## Dangerous Bypass Mode
+
+The dedicated daemon accepts `--dangerous-bypass-mode`; daemon startup ORs it
+with `dangerous_bypass_mode` from the protected `vault-settings.json` store.
+Missing file/field defaults off; invalid settings fail startup. CLI/desktop
+auto-spawn honor this persistent opt-in. The GUI explicitly confirms and saves
+the setting, without restarting or mutating the running daemon.
+The socket-owning daemon latches the
+startup policy before serving clients. Wire request shapes and protocol 3
+negotiation remain unchanged. `RequestLease` activates a distinct
+`DangerousBypass` grant without native or terminal approval, retaining expanded
+ProxyJump coverage, process identity, host scope, and lease lifecycle.
+These grants allow all configured authentication methods but cannot decrypt
+a locked vault. Actual SSH connections automatically persist unknown keys
+through the existing protected known_hosts writer; changed keys still fail.
+Startup and bypass lease activation have explicit audit events; first-use trust
+has a daemon warning. Disable the saved setting and restart without the flag
+to restore normal approval policy. Restart loses sessions, forwards, and leases.
+
+
 This document owns component boundaries, data ownership, and runtime behavior.
 See [`../../SECURITY.md`](../../SECURITY.md) for guarantees, limits, and the
 threat model. See [`protocol.md`](protocol.md) for exact wire messages, framing,
