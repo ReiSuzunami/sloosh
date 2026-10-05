@@ -1,5 +1,34 @@
 # Security
 
+## v0.2.8 credential and lease invariants
+
+In bypass mode only, successful Master Password verification by InitVault,
+AddCred, UpdateHost, RmCred or ListHosts publishes a daemon-owned unlock cache.
+Desktop Hosts unlock already uses ListHosts. This proves possession of the
+Master Password, not continuous human presence. No master password is stored
+in the daemon; decrypted data and the derived key remain zeroizing in memory.
+The cache has the shared idle timeout and an eight-hour absolute lifetime.
+Reads and new leases cannot reset its absolute lifetime. The existing reaper
+and access checks expire it even without active leases. Normal mode remains
+lease-owned; dropping the last lease clears only lease-owned cache.
+
+A locked vault is not an absent profile. Target and jump resolution fail with
+VaultLocked before network access, including SSH-config-only hosts while a
+vault exists but is locked. Verified absence, or no vault, permits normal
+config/literal fallback. No plaintext alias index is stored.
+
+Each connection resolves endpoint, user, route and authentication in one
+immutable snapshot; every jump follows the same rule. Editing/removing a
+profile cannot switch credentials during that handshake. Auth material is
+zeroized when the operation ends, not retained in Connection.resolved.
+
+Lease anchors never use PID 1. CLI wrappers inherit a meaningful non-shell
+parent; GUI/SDK callers anchor themselves. No safe parent means NoAnchor,
+not a shared-root fallback. PID plus start-time and token checks remain.
+Desktop locking affects its management session, not daemon leases or cache;
+stop the daemon for immediate shutdown of all its authority.
+
+
 ## Dangerous Bypass Mode (explicit exception)
 
 Default behavior below assumes this mode is disabled. Starting the selected
@@ -395,7 +424,7 @@ read-modify-write and cache publication. Unlock reads one `VaultFile` envelope,
 derives the key from that envelope's KDF parameters, decrypts that same
 envelope's nonce/ciphertext, then publishes the cache as one unit. This prevents
 mixed disk snapshots and an older unlock/cache refresh overwriting a newer
-mutation. The daemon cache is cleared and zeroized after the last active lease
+mutation. In normal mode the daemon cache is cleared and zeroized after the last active lease
 expires. Approval creates a separate temporary cache in the human CLI, which is
 cleared after preview and host-key confirmation. Native approval previews in
 the daemon use one explicit post-preview cleanup boundary: every error path

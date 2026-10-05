@@ -110,6 +110,101 @@ struct TestServer {
     offered: Arc<Mutex<Vec<PublicKey>>>,
     accept: bool,
 }
+
+struct PasswordServer {
+    seen: Arc<Mutex<Option<String>>>,
+}
+impl russh::server::Handler for PasswordServer {
+    type Error = russh::Error;
+    async fn auth_password(
+        &mut self,
+        _: &str,
+        password: &str,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        *self.seen.lock().unwrap() = Some(password.to_string());
+        Ok(russh::server::Auth::Accept)
+    }
+}
+
+#[tokio::test]
+async fn connection_auth_uses_the_resolved_snapshot_after_host_edit() {
+    let _guard = vault::cache_test_lock().lock().await;
+    vault::clear_cache().await;
+    let path = vault::vault_path();
+    let _ = std::fs::remove_file(&path);
+    vault::add_entry(
+        "snapshot",
+        vault::HostEntry {
+            hostname: "endpoint-a.invalid".into(),
+            port: Some(22),
+            user: Some("user-a".into()),
+            route: crate::proto::HostRoute::Direct,
+            auth: vault::AuthMethod::Password {
+                password: "fixture-old".into(),
+            },
+        },
+        b"fixture",
+        false,
+    )
+    .await
+    .unwrap();
+    // Cold vault must fail, never reinterpret a vault alias as DNS/config.
+    assert!(matches!(
+        resolve_host_config(&SshConfig::default(), "snapshot").await,
+        Err(SshError::VaultLocked)
+    ));
+    vault::unlock_for_lease(b"fixture").await.unwrap();
+    let resolved = resolve_host_config(&SshConfig::default(), "snapshot")
+        .await
+        .unwrap();
+    vault::update_entry(
+        vault::HostUpdate {
+            alias: "snapshot".into(),
+            hostname: "endpoint-b.invalid".into(),
+            port: Some(22),
+            user: Some("user-b".into()),
+            route: crate::proto::HostRoute::Direct,
+        },
+        Some(vault::AuthMethod::Password {
+            password: "fixture-new".into(),
+        }),
+        b"fixture",
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved.hostname, "endpoint-a.invalid");
+    let seen = Arc::new(Mutex::new(None));
+    let capture = seen.clone();
+    let (client_stream, server_stream) = tokio::io::duplex(65536);
+    let config = russh::server::Config {
+        keys: vec![ed25519_key()],
+        auth_rejection_time: Duration::ZERO,
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        russh::server::run_stream(
+            Arc::new(config),
+            server_stream,
+            PasswordServer { seen: capture },
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    });
+    let mut handle = russh::client::connect_stream(
+        Arc::new(russh::client::Config::default()),
+        client_stream,
+        TestClient,
+    )
+    .await
+    .unwrap();
+    authenticate(&mut handle, &resolved, false).await.unwrap();
+    assert_eq!(seen.lock().unwrap().as_deref(), Some("fixture-old"));
+    server.abort();
+    vault::clear_cache().await;
+    let _ = std::fs::remove_file(path);
+}
 impl russh::server::Handler for TestServer {
     type Error = russh::Error;
     async fn auth_publickey_offered(

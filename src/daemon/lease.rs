@@ -275,8 +275,9 @@ async fn prune_expired_at(st: &mut LeaseState, now: Instant, idle_timeout: Durat
         );
     }
     if had_active && st.active.is_empty() {
-        vault::clear_cache().await;
+        vault::clear_lease_cache().await;
     }
+    vault::expire_bypass_cache().await;
 }
 
 /// Test-only seam used by the live SFTP suite to cross the real absolute
@@ -318,35 +319,27 @@ fn is_skippable(name: Option<&str>) -> bool {
     }
 }
 
-/// Pick the anchor from a caller's ancestry chain (`chain[0]` is the caller
-/// itself, i.e. the connecting `sloosh` CLI process; `chain[1..]` are its
-/// parent, grandparent, etc., per `procs::ancestry_chain`).
-///
-/// `chain[0]` is unconditionally skipped regardless of whether its name
-/// resolves (defense in depth: it is *always* the `sloosh` binary by
-/// construction, so treating an unresolved name as fair game would be
-/// wrong). From index 1 onward, shells and `sloosh` itself (in case of
-/// nested invocations) are skipped by name; an unresolved name at these
-/// positions is treated as *not* skippable, since we have no evidence it's
-/// safe to skip and anchoring on an ambiguous process is safer than
-/// anchoring on none.
-///
-/// If the entire remaining chain is skippable (e.g. a human running
-/// `sloosh` directly from an interactive shell, with nothing above it worth
-/// naming), falls back to the topmost skippable entry rather than returning
-/// no anchor at all — some identity is more useful than the feature failing
-/// outright for that common case.
+/// Kernel-derived CLI callers inherit a meaningful parent. GUI/SDK callers
+/// bind themselves. Never fall back to shared PID 1 or an unowned shell tree.
 fn select_anchor(chain: &[AncestorInfo]) -> Option<Anchor> {
     let (first, rest) = chain.split_first()?;
-    if rest.is_empty() {
+    if first.pid <= 1 {
+        return None;
+    }
+    if first
+        .exe_path_basename
+        .as_deref()
+        .or(first.exe_basename.as_deref())
+        != Some(SLOOSH_BASENAME)
+    {
         return Some(Anchor::from_ancestor(first));
     }
     for a in rest {
-        if !is_skippable(a.exe_basename.as_deref()) {
+        if a.pid > 1 && !is_skippable(a.exe_basename.as_deref()) {
             return Some(Anchor::from_ancestor(a));
         }
     }
-    rest.last().map(Anchor::from_ancestor)
+    None
 }
 
 fn chain_contains_anchor(anchor: &Anchor, chain: &[AncestorInfo]) -> bool {
@@ -1042,7 +1035,7 @@ pub async fn list_summaries() -> Vec<LeaseSummary> {
 }
 
 #[cfg(not(test))]
-fn configured_idle_timeout() -> Duration {
+pub(crate) fn configured_idle_timeout() -> Duration {
     VaultSettingsStore::current_user()
         .load()
         .unwrap_or_else(|_| VaultTimeout::minimum())
@@ -1050,7 +1043,7 @@ fn configured_idle_timeout() -> Duration {
 }
 
 #[cfg(test)]
-fn configured_idle_timeout() -> Duration {
+pub(crate) fn configured_idle_timeout() -> Duration {
     DEFAULT_IDLE_TIMEOUT
 }
 
@@ -1076,34 +1069,32 @@ mod tests {
         let chain = vec![
             ancestor(3, 110, Some("sloosh")),
             ancestor(2, 105, Some("zsh")),
-            ancestor(1, 100, Some("claude")),
+            ancestor(10, 100, Some("claude")),
         ];
         let anchor = select_anchor(&chain).expect("should find an anchor");
-        assert_eq!(anchor.pid, 1);
+        assert_eq!(anchor.pid, 10);
         assert_eq!(anchor.name.as_deref(), Some("claude"));
     }
 
     #[test]
-    fn falls_back_to_topmost_shell_when_nothing_else_available() {
+    fn refuses_shared_root_or_shell_only_cli_ancestry() {
         // A human running `sloosh` directly from an interactive shell: the
         // whole remaining chain above the caller is just the shell.
         let chain = vec![
             ancestor(2, 105, Some("sloosh")),
             ancestor(1, 100, Some("zsh")),
         ];
-        let anchor = select_anchor(&chain).expect("should still find an anchor");
-        assert_eq!(anchor.pid, 1);
-        assert_eq!(anchor.name.as_deref(), Some("zsh"));
+        assert!(select_anchor(&chain).is_none());
     }
 
     #[test]
-    fn caller_itself_is_always_skipped_even_with_unresolved_name() {
+    fn unknown_sdk_caller_binds_itself_not_shared_parent() {
         // chain[0]'s name failed to resolve (None) -- must still be skipped
         // unconditionally, not treated as a valid anchor just because the
         // name-based filter can't positively identify it as sloosh/a shell.
         let chain = vec![ancestor(2, 105, None), ancestor(1, 100, Some("claude"))];
         let anchor = select_anchor(&chain).expect("should find an anchor");
-        assert_eq!(anchor.pid, 1);
+        assert_eq!(anchor.pid, 2);
     }
 
     #[test]
@@ -1121,10 +1112,25 @@ mod tests {
     }
 
     #[test]
-    fn only_caller_in_chain_anchors_to_itself() {
-        let chain = vec![ancestor(1, 100, Some("sloosh"))];
-        let anchor = select_anchor(&chain).expect("should anchor to the lone entry");
-        assert_eq!(anchor.pid, 1);
+    fn detached_cli_cannot_anchor_to_init() {
+        let chain = vec![
+            ancestor(9, 100, Some("sloosh")),
+            ancestor(1, 1, Some("launchd")),
+        ];
+        assert!(select_anchor(&chain).is_none());
+        let gui = vec![
+            ancestor(9, 100, Some("Sloosh")),
+            ancestor(1, 1, Some("launchd")),
+        ];
+        let anchor = select_anchor(&gui).unwrap();
+        assert_eq!(anchor.pid, 9);
+        assert!(!chain_contains_anchor(
+            &anchor,
+            &[
+                ancestor(12, 120, Some("agent")),
+                ancestor(1, 1, Some("launchd"))
+            ]
+        ));
     }
 
     #[test]

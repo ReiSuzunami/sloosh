@@ -1,5 +1,25 @@
 # Architecture
 
+## Credential publication and connection snapshots
+
+Bypass uses a bounded BypassUnlock cache owner independent of lease count.
+Existing verified human CRUD/inventory/initialization requests publish one
+coherent data/KDF/key snapshot; no new RPC or plaintext persistence is added.
+Mutation and lifecycle locks serialize inventory publication with writers.
+Saves return their verified key material directly rather than rereading disk
+and deriving it again. Idle expiry uses the vault timeout; absolute expiry is
+eight hours from cache creation and ordinary refresh does not reset it.
+
+Locked/Absent/Entry lookup prevents locked vaults from becoming config hosts.
+Request-time normal-mode expansion may defer locked resolution until approval;
+bypass activation uses strict expansion. Config fallback requires known absence.
+ResolvedHost carries endpoint, user, route and auth through handshake, including
+jump hops. Only HostConfig metadata survives in long-lived connections; auth
+snapshots zeroize on drop. No second cache lookup is used for authentication.
+CLI anchors use meaningful parents, never PID 1; GUI/SDK anchor their own process.
+Normal cache remains lease-owned, and desktop management lock remains separate.
+
+
 ## Dangerous Bypass Mode
 
 The dedicated daemon accepts `--dangerous-bypass-mode`; daemon startup ORs it
@@ -169,7 +189,7 @@ trees.
 
 An active lease grants a set of host aliases. API entry points prune expired
 state before use; background reapers clean otherwise-idle state and clear the
-vault cache after the last lease ends. The idle limit is the shared 1/5/15/30
+lease-owned vault cache after the last lease ends. The idle limit is the shared 1/5/15/30
 minute vault timeout; the daemon reads it independently and retains its separate
 8-hour hard lifetime cap. Exact lifetimes and reaper intervals belong to
 `SECURITY.md`.
@@ -360,7 +380,7 @@ overwriting newer state.
 
 Unlock reads one vault envelope, derives key from that envelope's KDF data,
 decrypts its ciphertext, then publishes cache material together. Saves use
-fresh cryptographic material and atomic temp-file rename. Daemon cache is
+fresh cryptographic material and atomic temp-file rename. Normal-mode daemon cache is
 cleared after last lease expires. Exact cryptography, permissions, symlink/ACL
 checks, and zeroization guarantees belong to `SECURITY.md`.
 

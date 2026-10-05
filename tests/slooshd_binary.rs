@@ -82,7 +82,9 @@ async fn dangerous_bypass_is_explicit_daemon_startup_policy() {
             .await
             .unwrap();
         if enabled {
-            assert_eq!(response, Response::Ok);
+            assert!(
+                matches!(response,Response::Error { message } if message.contains("vault is locked"))
+            );
         } else {
             assert!(matches!(response, Response::LeaseRequestPending(_)));
         }
@@ -95,7 +97,7 @@ async fn dangerous_bypass_is_explicit_daemon_startup_policy() {
             .unwrap()
             .unwrap();
         let audit = std::fs::read_to_string(root.join("audit.jsonl")).unwrap();
-        assert_eq!(audit.contains("lease_approved_dangerous_bypass"), enabled);
+        assert!(!audit.contains("lease_approved_dangerous_bypass"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

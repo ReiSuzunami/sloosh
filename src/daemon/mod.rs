@@ -838,15 +838,15 @@ async fn handle_connection(
             Request::InitVault { master_password } => {
                 // `vault::create` refuses to overwrite an existing vault, so
                 // this can't be used to reset someone else's master password.
-                let resp = match vault::create(
-                    &vault::VaultData::default(),
-                    master_password.expose_secret().as_bytes(),
-                ) {
-                    Ok(()) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
-                };
+                let resp =
+                    match vault::initialize_verified(master_password.expose_secret().as_bytes())
+                        .await
+                    {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    };
                 chan.send(&resp).await?;
             }
             Request::AddCred {
@@ -889,12 +889,10 @@ async fn handle_connection(
                 chan.send(&resp).await?;
             }
             Request::ListHosts { master_password } => {
-                let inventory = tokio::task::spawn_blocking(move || {
-                    vault::list_entries(master_password.expose_secret().as_bytes())
-                })
-                .await;
+                let inventory =
+                    vault::list_verified(master_password.expose_secret().as_bytes()).await;
                 let resp = match inventory {
-                    Ok(Ok(hosts)) => Response::Hosts {
+                    Ok(hosts) => Response::Hosts {
                         hosts: hosts
                             .into_iter()
                             .map(|host| proto::HostSummary {
@@ -907,11 +905,8 @@ async fn handle_connection(
                             })
                             .collect(),
                     },
-                    Ok(Err(e)) => Response::Error {
-                        message: e.to_string(),
-                    },
                     Err(e) => Response::Error {
-                        message: format!("host inventory worker failed: {e}"),
+                        message: e.to_string(),
                     },
                 };
                 chan.send(&resp).await?;

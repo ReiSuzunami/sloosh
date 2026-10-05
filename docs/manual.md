@@ -2,6 +2,27 @@
 
 ## Dangerous Bypass Mode
 
+### Credential unlock in bypass mode
+
+After a daemon restart or credential-cache expiry, unlock the desktop Hosts
+page or run `sloosh host list` yourself. Successful host add/edit/remove/list
+and vault initialization also publish verified credentials to the bypass daemon.
+Adding a host works before any lease exists; no second approve/trust is needed.
+The idle limit follows the timeout setting; the hard limit is eight hours.
+Normal reads and lease renewal do not reset that hard limit. Master Password
+is not saved by the daemon. Wrong-password operations never unlock it.
+
+A locked vault cannot tell whether an alias exists: connection and jump
+resolution report VaultLocked rather than trying another destination. This
+also applies to config-only hosts while an encrypted vault is locked. After
+unlock, truly absent profiles still follow SSH config/system Agent normally.
+Existing SSH connections keep their original connection; edits affect new
+connections, which use coherent address/user/route/auth snapshots.
+Locking the desktop management page does not revoke daemon leases or its
+bypass cache; stop the daemon if immediate shutdown is required.
+
+
+
 Opt in only when you accept unrestricted same-user lease approval and the
 risk of trusting a first-connection attacker. Use the exact `slooshd` selected
 by your CLI (its sibling for command-line installs; on macOS the installed app's

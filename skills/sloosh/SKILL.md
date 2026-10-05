@@ -84,6 +84,17 @@ startup policy only; CLI/desktop auto-spawn honor it on the next start. Do not
 change this setting without explicit user direction. To disable, clear the saved
 setting and restart without the flag; saved trust remains. Default is off.
 
+## Locked credentials and process ownership
+
+In bypass mode, VaultLocked means the human must unlock the desktop Hosts page
+or run `sloosh host list`; do not ask them to approve a bypass lease, infer a
+hidden alias, dial its literal name, or work around credential locks. Successful
+human host CRUD/list and initialization populate a bounded daemon cache.
+Expiry/restart requires unlock again; bypass does not save the master password.
+Only verified absence permits SSH-config fallback. GUI/SDK leases bind that
+client process; CLI leases use a safe parent and never PID 1. Desktop management
+lock does not revoke leases; stopping daemon terminates its authority.
+
 ## Key commands
 
 ```

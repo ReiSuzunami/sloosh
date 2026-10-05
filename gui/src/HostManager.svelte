@@ -246,7 +246,7 @@
       const nextHosts = await invoke<HostSummary[]>('list_hosts');
       if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
         hosts = nextHosts;
-        success = 'Credential vault unlocked.';
+        success = 'Management vault unlocked. In active bypass mode, daemon credentials are now available until its cache expires. Locking this page does not revoke SSH leases.';
       }
     } catch (cause) {
       error = errorMessage(cause);

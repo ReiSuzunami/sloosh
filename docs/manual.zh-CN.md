@@ -2,6 +2,22 @@
 
 ## Dangerous Bypass Mode
 
+### bypass 模式下解锁凭据
+
+重启 daemon 或凭据缓存过期后，请在桌面 Hosts 页面解锁，或自行运行
+`sloosh host list`。成功的新增、编辑、删除、列举与 vault 初始化，也会向
+bypass daemon 发布已验证凭据。首次新增可以早于任何 lease，无需再次 approve/trust。
+空闲时限复用超时设置，绝对上限为缓存创建后 8 小时；普通读取与新租约不重置绝对上限。
+daemon 不保存主密码；错误密码不会解锁缓存。
+
+vault 锁定时无法判断别名是否存在，目标与跳板会明确报 VaultLocked，不尝试其他地址。
+即使主机只存在 SSH 配置，也须先解锁已有 vault；确认不存在的条目仍正常透传 SSH
+配置／系统 Agent。已建立的 SSH 会话保持原连接；编辑影响新连接，新连接始终使用
+同一份地址、用户名、路由和认证快照。
+桌面管理页锁定不撤销 daemon 的租约或 bypass 缓存；需要立即终止时停止 daemon。
+
+
+
 仅在接受同用户进程免审批访问主机、首次连接可能信任攻击者的风险时开启。
 使用 CLI 实际选择的 `slooshd`：命令行安装通常选同目录 helper，macOS 已安装 App
 时可能优先选 App 内 helper。先停现有 daemon（会终止会话与转发），另开终端启动：

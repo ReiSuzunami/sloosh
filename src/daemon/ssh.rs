@@ -71,6 +71,10 @@ const MAX_VAULT_KEY_FILE_BYTES: u64 = 256 * 1024;
 /// error should know what to do next without consulting docs.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
+    #[error(
+        "credential vault is locked — unlock the desktop Hosts page or ask your user to run `sloosh host list`; bypass skips host approval, not vault decryption"
+    )]
+    VaultLocked,
     #[error(transparent)]
     Config(#[from] SshConfigError),
 
@@ -576,8 +580,32 @@ pub(crate) struct HostKeyProbeResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostKeyProbeRoute {
-    hops: Vec<HostConfig>,
-    target: HostConfig,
+    hops: Vec<ResolvedHost>,
+    target: ResolvedHost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedHost {
+    config: HostConfig,
+    auth: Option<vault::AuthMethod>,
+}
+impl std::ops::Deref for ResolvedHost {
+    type Target = HostConfig;
+    fn deref(&self) -> &HostConfig {
+        &self.config
+    }
+}
+impl std::ops::DerefMut for ResolvedHost {
+    fn deref_mut(&mut self) -> &mut HostConfig {
+        &mut self.config
+    }
+}
+impl Drop for ResolvedHost {
+    fn drop(&mut self) {
+        if let Some(auth) = &mut self.auth {
+            auth.zeroize_secrets();
+        }
+    }
 }
 
 /// Whether *any* key is already recorded for `hostname:port` in either
@@ -709,8 +737,8 @@ async fn resolve_host_key_probe_route(
 }
 
 async fn capture_host_key_via_hops(
-    hops: &[HostConfig],
-    target: &HostConfig,
+    hops: &[ResolvedHost],
+    target: &ResolvedHost,
 ) -> Result<PublicKey, SshError> {
     let mut handles: Vec<russh::client::Handle<Handler>> = Vec::with_capacity(hops.len());
     for (index, hop) in hops.iter().enumerate() {
@@ -789,7 +817,7 @@ pub(crate) fn replace_sloosh_known_host(
 pub async fn resolve_endpoint(alias: &str) -> Result<(String, u16), SshError> {
     let config = SshConfig::load_default();
     let host_cfg = resolve_host_config(&config, alias).await?;
-    Ok((host_cfg.hostname, host_cfg.port))
+    Ok((host_cfg.hostname.clone(), host_cfg.port))
 }
 
 /// Connect to `alias`, resolving it through `~/.ssh/config`, dialing the full
@@ -818,35 +846,40 @@ pub(crate) async fn connect_with_route(
     connect_resolved(&config, host_cfg, lease_ctx, route).await
 }
 
-/// Resolve `alias`, preferring a vault entry over `~/.ssh/config`. Only ever
-/// finds a vault
-/// entry while the vault's derived key is cached (i.e. at least one lease is
-/// active) — `vault::get_entry` returns `None` otherwise, so this quietly
-/// falls back to the plain config-file resolution, exactly like an alias
-/// that was never in the vault at all.
-async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<HostConfig, SshError> {
-    if let Some(entry) = vault::get_entry(alias).await {
-        let proxy_jump = match &entry.route {
-            crate::proto::HostRoute::Direct => None,
-            crate::proto::HostRoute::ManagedHost { alias } => Some(alias.clone()),
-            crate::proto::HostRoute::ProxyJump { spec } => Some(spec.clone()),
-        };
-        return Ok(HostConfig {
-            alias: alias.to_string(),
-            hostname: entry.hostname,
-            port: entry.port.unwrap_or(22),
-            user: entry.user.unwrap_or_else(current_user),
-            identity_files: Vec::new(),
-            proxy_jump,
-            identity_agent: None,
-        });
+/// Capture endpoint and auth together. A locked vault is not an absent alias;
+/// config fallback is allowed only when absence is actually known.
+async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<ResolvedHost, SshError> {
+    match vault::lookup_entry(alias).await {
+        vault::EntryLookup::Locked => Err(SshError::VaultLocked),
+        vault::EntryLookup::Absent => Ok(ResolvedHost {
+            config: config.resolve_for_connection(alias)?,
+            auth: None,
+        }),
+        vault::EntryLookup::Entry(entry) => {
+            let proxy_jump = match &entry.route {
+                crate::proto::HostRoute::Direct => None,
+                crate::proto::HostRoute::ManagedHost { alias } => Some(alias.clone()),
+                crate::proto::HostRoute::ProxyJump { spec } => Some(spec.clone()),
+            };
+            Ok(ResolvedHost {
+                config: HostConfig {
+                    alias: alias.to_string(),
+                    hostname: entry.hostname,
+                    port: entry.port.unwrap_or(22),
+                    user: entry.user.unwrap_or_else(current_user),
+                    identity_files: Vec::new(),
+                    proxy_jump,
+                    identity_agent: None,
+                },
+                auth: Some(entry.auth),
+            })
+        }
     }
-    Ok(config.resolve_for_connection(alias)?)
 }
 
 async fn connect_resolved(
     config: &SshConfig,
-    host_cfg: HostConfig,
+    host_cfg: ResolvedHost,
     lease_ctx: &LeaseContext,
     route: Option<ForwardRoute>,
 ) -> Result<Connection, SshError> {
@@ -864,7 +897,7 @@ async fn connect_resolved(
     .await?;
     Ok(Connection {
         handle,
-        resolved: host_cfg,
+        resolved: host_cfg.config.clone(),
         _jumps: Vec::new(),
     })
 }
@@ -879,7 +912,7 @@ async fn connect_resolved(
 async fn connect_via_proxy_jump(
     config: &SshConfig,
     jump_spec: &str,
-    target_cfg: HostConfig,
+    target_cfg: ResolvedHost,
     lease_ctx: &LeaseContext,
     route: Option<ForwardRoute>,
 ) -> Result<Connection, SshError> {
@@ -902,7 +935,7 @@ async fn connect_via_proxy_jump(
         .await?;
         return Ok(Connection {
             handle,
-            resolved: target_cfg,
+            resolved: target_cfg.config.clone(),
             _jumps: Vec::new(),
         });
     }
@@ -968,7 +1001,7 @@ async fn connect_via_proxy_jump(
 
     Ok(Connection {
         handle,
-        resolved: target_cfg,
+        resolved: target_cfg.config.clone(),
         _jumps: handles,
     })
 }
@@ -984,7 +1017,7 @@ async fn connect_via_proxy_jump(
 async fn expand_proxy_jump_spec(
     config: &SshConfig,
     spec: &str,
-    chain: &mut Vec<HostConfig>,
+    chain: &mut Vec<ResolvedHost>,
     seen: &mut HashSet<String>,
 ) -> Result<(), SshError> {
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1021,11 +1054,11 @@ async fn expand_proxy_jump_spec(
 /// resolved purely from `~/.ssh/config` uses ambient user credentials and
 /// needs no lease.
 async fn ensure_hop_leased(
-    hop_cfg: &HostConfig,
+    hop_cfg: &ResolvedHost,
     target: &str,
     lease_ctx: &LeaseContext,
 ) -> Result<bool, SshError> {
-    if vault::get_entry(&hop_cfg.alias).await.is_none() {
+    if hop_cfg.auth.is_none() {
         return Ok(false);
     }
     let grant = lease::resolve_grant(
@@ -1106,7 +1139,7 @@ async fn expand_lease_hosts_for_request_with_config(
 ) -> Result<Vec<String>, SshError> {
     match expand_lease_hosts_with_config(config, hosts).await {
         Ok(expanded) => Ok(expanded),
-        Err(SshError::Config(_)) => Ok(hosts.to_vec()),
+        Err(SshError::Config(_) | SshError::VaultLocked) => Ok(hosts.to_vec()),
         Err(error) => Err(error),
     }
 }
@@ -1206,14 +1239,14 @@ fn dependency_first_aliases(groups: &[(String, Vec<String>)]) -> Vec<String> {
 /// connect-time dialing agree on exactly what "the chain" means.
 async fn jump_chain_aliases(config: &SshConfig, alias: &str) -> Result<Vec<String>, SshError> {
     let host_cfg = resolve_host_config(config, alias).await?;
-    let Some(jump_spec) = host_cfg.proxy_jump else {
+    let Some(jump_spec) = host_cfg.proxy_jump.as_ref() else {
         return Ok(Vec::new());
     };
     let mut seen = HashSet::new();
     seen.insert(alias.to_string());
     let mut chain = Vec::new();
-    expand_proxy_jump_spec(config, &jump_spec, &mut chain, &mut seen).await?;
-    Ok(chain.into_iter().map(|c| c.alias).collect())
+    expand_proxy_jump_spec(config, jump_spec, &mut chain, &mut seen).await?;
+    Ok(chain.into_iter().map(|c| c.alias.clone()).collect())
 }
 
 /// `user@host:port` (all but the host part optional) as accepted by
@@ -1300,7 +1333,7 @@ fn add_handshake_context(err: SshError, host: &str, port: u16) -> SshError {
 
 async fn connect_over_stream<S>(
     stream: S,
-    host_cfg: &HostConfig,
+    host_cfg: &ResolvedHost,
     route: Option<ForwardRoute>,
     require_system_agent: bool,
 ) -> Result<russh::client::Handle<Handler>, SshError>
@@ -1322,9 +1355,9 @@ where
 
 /// Vault profiles use their selected method exclusively. Config hosts try
 /// ssh-agent, then supported unencrypted IdentityFile keys.
-async fn authenticate(
-    handle: &mut russh::client::Handle<Handler>,
-    host_cfg: &HostConfig,
+async fn authenticate<H: russh::client::Handler>(
+    handle: &mut russh::client::Handle<H>,
+    host_cfg: &ResolvedHost,
     require_system_agent: bool,
 ) -> Result<(), SshError> {
     let hash_alg = handle
@@ -1334,16 +1367,10 @@ async fn authenticate(
         .flatten()
         .flatten();
 
-    // Resolve the vault credential once, then both validate and consume this
-    // exact snapshot. A concurrent host edit cannot swap Password/Key File in
-    // after an automatic system-agent lease was checked.
-    let vault_entry = vault::get_entry(&host_cfg.alias).await;
-    if require_system_agent
-        && !auth_matches_system_agent_policy(
-            vault_entry.as_ref().map(|entry| &entry.auth),
-            Some(host_cfg),
-        )
-    {
+    // Validate and consume the credential captured with this endpoint, never
+    // re-read a potentially edited/expired cache after the handshake.
+    let vault_auth = host_cfg.auth.as_ref();
+    if require_system_agent && !auth_matches_system_agent_policy(vault_auth, Some(host_cfg)) {
         return Err(SshError::SystemAgentAuthRequired {
             host: host_cfg.alias.clone(),
         });
@@ -1351,8 +1378,8 @@ async fn authenticate(
 
     // Vault profiles are explicit: use exactly the method the human chose.
     // This avoids surprising fallback from Password/Key File to ssh-agent.
-    if let Some(entry) = vault_entry {
-        return match entry.auth {
+    if let Some(auth) = vault_auth {
+        return match auth.clone() {
             vault::AuthMethod::Agent => {
                 if try_agent_auth(handle, host_cfg, hash_alg, None)
                     .await
@@ -1673,6 +1700,12 @@ mod auth_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn clean_config_fixture() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = vault::cache_test_lock().lock().await;
+        vault::clear_cache().await;
+        let _ = std::fs::remove_file(vault::vault_path());
+        guard
+    }
 
     const TEST_KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     const TEST_KEY_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
@@ -2093,6 +2126,7 @@ Host inner
 
     #[tokio::test]
     async fn expand_proxy_jump_spec_splits_comma_chain_in_order() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::default();
         let mut chain = Vec::new();
         let mut seen = HashSet::new();
@@ -2106,6 +2140,7 @@ Host inner
 
     #[tokio::test]
     async fn expand_proxy_jump_spec_recurses_into_nested_jump_before_the_hop() {
+        let _guard = clean_config_fixture().await;
         let contents = "\
 Host hop2
     ProxyJump hop1
@@ -2142,6 +2177,7 @@ Host hop2
 
     #[tokio::test]
     async fn host_key_confirmation_plan_uses_nested_proxy_route_without_network() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::parse(
             "\
 Host sloosh-probe-target
@@ -2184,6 +2220,7 @@ Host sloosh-probe-other
 
     #[tokio::test]
     async fn host_key_confirmation_never_falls_back_to_direct_on_bad_route() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::parse(
             "\
 Host sloosh-probe-cycle-a
@@ -2203,6 +2240,7 @@ Host sloosh-probe-cycle-b
 
     #[tokio::test]
     async fn expand_proxy_jump_spec_rejects_chains_deeper_than_the_cap() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::default();
         let long_spec: Vec<String> = (0..MAX_PROXY_JUMP_HOPS + 1)
             .map(|i| format!("hop{i}"))
@@ -2221,6 +2259,7 @@ Host sloosh-probe-cycle-b
 
     #[tokio::test]
     async fn request_scope_keeps_original_hosts_when_locked_config_cannot_be_resolved_safely() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::parse("Match all\n    ProxyCommand helper\n");
         let requested = vec!["sloosh-locked-vault-host".to_string()];
 
@@ -2232,6 +2271,7 @@ Host sloosh-probe-cycle-b
 
     #[tokio::test]
     async fn expand_proxy_jump_spec_detects_direct_cycle() {
+        let _guard = clean_config_fixture().await;
         let contents = "\
 Host hopA
     ProxyJump hopB
@@ -2250,6 +2290,7 @@ Host hopB
 
     #[tokio::test]
     async fn expand_proxy_jump_spec_detects_cycle_back_to_target() {
+        let _guard = clean_config_fixture().await;
         let contents = "\
 Host bastion
     ProxyJump target
@@ -2266,6 +2307,7 @@ Host bastion
 
     #[tokio::test]
     async fn lease_scope_rejects_a_proxy_jump_cycle() {
+        let _guard = clean_config_fixture().await;
         let config = SshConfig::parse(
             "\
 Host target
@@ -2282,6 +2324,7 @@ Host bastion
 
     #[tokio::test]
     async fn lease_scope_rejects_a_nested_proxy_jump_chain_deeper_than_the_cap() {
+        let _guard = clean_config_fixture().await;
         let mut contents = String::from("Host target\n    ProxyJump hop0\n");
         for index in 0..=MAX_PROXY_JUMP_HOPS {
             contents.push_str(&format!("Host hop{index}\n"));

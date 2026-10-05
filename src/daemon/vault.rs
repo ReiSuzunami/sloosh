@@ -23,12 +23,9 @@
 //! manual `Debug` impls below. Master password buffers, derived keys, and
 //! decrypted plaintext are zeroized wherever feasible.
 //!
-//! This module also owns the in-memory "unlocked vault" cache: while at
-//! least one lease is active (see `daemon/lease.rs`), the derived key (and
-//! decrypted entries) are kept around so authenticated SSH connections can
-//! be established without re-prompting for the master password on every
-//! call. The cache is cleared the moment the last lease expires
-//! (`clear_cache`, called from `daemon/lease.rs`).
+//! Normal cache is lease-owned and clears after the last lease. Bypass uses
+//! a verified unlock owner with independent idle/eight-hour expiry, including
+//! when no lease exists. Neither owner saves the master password.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -37,6 +34,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
 use chacha20poly1305::aead::Aead;
@@ -67,6 +65,21 @@ const LEGACY_VAULT_VERSION: u32 = 1;
 
 /// Standard vault location: `~/.sloosh/vault`.
 pub fn vault_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+        TEST_HOME
+            .get_or_init(|| {
+                use std::os::unix::fs::PermissionsExt;
+                let path =
+                    std::env::temp_dir().join(format!("sloosh-vault-unit-{}", std::process::id()));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            })
+            .join("vault")
+    }
+    #[cfg(not(test))]
     sloosh_home().join("vault")
 }
 
@@ -219,7 +232,7 @@ pub struct HostUpdate {
 }
 
 impl HostEntry {
-    fn zeroize_secrets(&mut self) {
+    pub(crate) fn zeroize_secrets(&mut self) {
         self.auth.zeroize_secrets();
     }
 }
@@ -236,7 +249,7 @@ impl fmt::Debug for HostEntry {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {
     Password { password: String },
@@ -255,7 +268,7 @@ impl AuthMethod {
 }
 
 impl AuthMethod {
-    fn zeroize_secrets(&mut self) {
+    pub(crate) fn zeroize_secrets(&mut self) {
         match self {
             AuthMethod::Password { password } => password.zeroize(),
             AuthMethod::Agent | AuthMethod::KeyFile { .. } => {}
@@ -282,6 +295,8 @@ impl fmt::Debug for AuthMethod {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
+    #[error("credential inventory worker failed: {0}")]
+    InventoryWorker(#[from] tokio::task::JoinError),
     #[error(
         "no vault at {path} yet — this is a brand-new sloosh install; a human needs to run \
          `sloosh vault init` (or `sloosh host add <alias> --hostname <host>`) in a real terminal \
@@ -535,7 +550,11 @@ fn write_vault_file_atomic(path: &Path, file: &VaultFile) -> Result<(), VaultErr
 
 /// Encrypt `data` under `password` using fresh KDF params (new salt) and
 /// write it to `path`, replacing anything already there.
-fn save_new_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), VaultError> {
+fn save_new_at(
+    path: &Path,
+    data: &VaultData,
+    password: &[u8],
+) -> Result<(KdfParamsFile, Zeroizing<[u8; 32]>), VaultError> {
     let mut salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
     let kdf = KdfParamsFile {
@@ -548,11 +567,12 @@ fn save_new_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), Vau
     let (ciphertext, nonce) = encrypt_data(data, &key)?;
     let file = VaultFile {
         version: VAULT_VERSION,
-        kdf,
+        kdf: kdf.clone(),
         nonce: hex_encode(&nonce),
         ciphertext: hex_encode(&ciphertext),
     };
-    write_vault_file_atomic(path, &file)
+    write_vault_file_atomic(path, &file)?;
+    Ok((kdf, key))
 }
 
 /// Open the vault at `path` with `password`, verifying the password by
@@ -589,7 +609,7 @@ fn create_at(path: &Path, data: &VaultData, password: &[u8]) -> Result<(), Vault
     if path.exists() {
         return Err(VaultError::AlreadyExists(path.to_path_buf()));
     }
-    save_new_at(path, data, password)
+    save_new_at(path, data, password).map(|_| ())
 }
 
 fn validate_host_field(
@@ -698,7 +718,7 @@ async fn add_entry_at(
     })?;
     validate_auth(&entry.auth)?;
     let _mutation = vault_mutation_lock().lock().await;
-    let data = {
+    let (data, kdf, key) = {
         let _writer = vault_writer_guard();
         let mut data = if path.exists() {
             unlock_at(path, password)?
@@ -710,16 +730,16 @@ async fn add_entry_at(
         }
         validate_managed_route(&data, alias, &entry.route)?;
         data.hosts.insert(alias.to_string(), entry);
-        save_new_at(path, &data, password)?;
-        data
+        let (kdf, key) = save_new_at(path, &data, password)?;
+        (data, kdf, key)
     };
-    refresh_cache_if_present(path, &data, password).await;
+    publish_verified(data, kdf, key, crate::daemon::dangerous_bypass_enabled()).await;
     Ok(())
 }
 
 async fn rm_entry_at(path: &Path, alias: &str, password: &[u8]) -> Result<(), VaultError> {
     let _mutation = vault_mutation_lock().lock().await;
-    let data = {
+    let (data, kdf, key) = {
         let _writer = vault_writer_guard();
         let mut data = unlock_at(path, password)?;
         let mut dependents = data
@@ -742,16 +762,20 @@ async fn rm_entry_at(path: &Path, alias: &str, password: &[u8]) -> Result<(), Va
         if data.hosts.remove(alias).is_none() {
             return Err(VaultError::NoSuchHost(alias.to_string()));
         }
-        save_new_at(path, &data, password)?;
-        data
+        let (kdf, key) = save_new_at(path, &data, password)?;
+        (data, kdf, key)
     };
-    refresh_cache_if_present(path, &data, password).await;
+    publish_verified(data, kdf, key, crate::daemon::dangerous_bypass_enabled()).await;
     Ok(())
 }
 
 fn list_entries_at(path: &Path, password: &[u8]) -> Result<Vec<HostMetadata>, VaultError> {
     let _writer = vault_writer_guard();
     let data = unlock_at(path, password)?;
+    Ok(host_metadata(&data))
+}
+
+fn host_metadata(data: &VaultData) -> Vec<HostMetadata> {
     let mut hosts = data
         .hosts
         .iter()
@@ -765,7 +789,7 @@ fn list_entries_at(path: &Path, password: &[u8]) -> Result<Vec<HostMetadata>, Va
         })
         .collect::<Vec<_>>();
     hosts.sort_unstable_by(|left, right| left.alias.cmp(&right.alias));
-    Ok(hosts)
+    hosts
 }
 
 async fn update_entry_at(
@@ -779,7 +803,7 @@ async fn update_entry_at(
         validate_auth(auth)?;
     }
     let _mutation = vault_mutation_lock().lock().await;
-    let data = {
+    let (data, kdf, key) = {
         let _writer = vault_writer_guard();
         let mut data = unlock_at(path, password)?;
         let HostUpdate {
@@ -802,10 +826,10 @@ async fn update_entry_at(
             entry.auth.zeroize_secrets();
             entry.auth = new_auth;
         }
-        save_new_at(path, &data, password)?;
-        data
+        let (kdf, key) = save_new_at(path, &data, password)?;
+        (data, kdf, key)
     };
-    refresh_cache_if_present(path, &data, password).await;
+    publish_verified(data, kdf, key, crate::daemon::dangerous_bypass_enabled()).await;
     Ok(())
 }
 
@@ -836,10 +860,9 @@ pub fn unlock(password: &[u8]) -> Result<VaultData, VaultError> {
 /// Add (or replace, if `replace` is true) a host entry, re-encrypting and
 /// saving the whole vault. Creates the vault if it doesn't exist yet.
 /// Always operates against a fresh disk-based unlock rather than mutating
-/// any in-memory cache directly; if a cache entry already exists it is
-/// best-effort refreshed in place afterwards, but this function never
-/// creates a cache entry that wasn't already there (the cache's lifetime is
-/// owned by `daemon/lease.rs`, tied to active lease count).
+/// any in-memory cache directly. Verified writes publish the saved material:
+/// normal mode refreshes an existing owner, bypass also creates a bounded
+/// unlock owner before any lease exists.
 pub async fn add_entry(
     alias: &str,
     entry: HostEntry,
@@ -892,6 +915,10 @@ pub async fn update_entry(
 enum CacheOwner {
     Lease,
     Temporary(u64),
+    BypassUnlock {
+        created_at: Instant,
+        last_used: Instant,
+    },
 }
 
 struct UnlockedVault {
@@ -948,6 +975,68 @@ async fn populate_cache_at(
 pub async fn clear_cache() {
     let _lifecycle = cache_lifecycle_lock().lock().await;
     clear_cache_under_lifecycle().await;
+}
+
+pub(crate) async fn clear_lease_cache() {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    let mut guard = cache().lock().await;
+    if guard.as_ref().is_some_and(|v| v.owner == CacheOwner::Lease) {
+        *guard = None;
+    }
+}
+
+fn expire_bypass_at(guard: &mut Option<UnlockedVault>, now: Instant) {
+    if guard.as_ref().is_some_and(|v| match v.owner {
+        CacheOwner::BypassUnlock {
+            created_at,
+            last_used,
+        } => {
+            now.duration_since(created_at) >= crate::daemon::lease::MAX_LIFETIME
+                || now.duration_since(last_used) >= crate::daemon::lease::configured_idle_timeout()
+        }
+        _ => false,
+    }) {
+        *guard = None;
+    }
+}
+
+pub(crate) async fn expire_bypass_cache() {
+    expire_bypass_at(&mut *cache().lock().await, Instant::now());
+}
+
+/// Existing human RPCs provide verified decryption, never host approval.
+pub(crate) async fn initialize_verified(password: &[u8]) -> Result<(), VaultError> {
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    let _mutation = vault_mutation_lock().lock().await;
+    let path = vault_path();
+    let data = VaultData::default();
+    let (kdf, key) = {
+        let _writer = vault_writer_guard();
+        if path.exists() {
+            return Err(VaultError::AlreadyExists(path));
+        }
+        save_new_at(&path, &data, password)?
+    };
+    publish_verified(data, kdf, key, crate::daemon::dangerous_bypass_enabled()).await;
+    Ok(())
+}
+
+pub(crate) async fn list_verified(password: &[u8]) -> Result<Vec<HostMetadata>, VaultError> {
+    if !crate::daemon::dangerous_bypass_enabled() {
+        let password = Zeroizing::new(password.to_vec());
+        return tokio::task::spawn_blocking(move || list_entries(&password)).await?;
+    }
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    let _mutation = vault_mutation_lock().lock().await;
+    let password = Zeroizing::new(password.to_vec());
+    let (data, kdf, key) = tokio::task::spawn_blocking(move || {
+        let _writer = vault_writer_guard();
+        unlock_material_at(&vault_path(), &password)
+    })
+    .await??;
+    let hosts = host_metadata(&data);
+    publish_verified(data, kdf, key, true).await;
+    Ok(hosts)
 }
 
 async fn clear_cache_under_lifecycle() {
@@ -1048,20 +1137,51 @@ where
 /// Whether the vault is currently cached in memory (i.e. at least one
 /// lease is believed to be active).
 pub async fn is_cached() -> bool {
-    cache().lock().await.is_some()
+    let mut guard = cache().lock().await;
+    expire_bypass_at(&mut guard, Instant::now());
+    guard.is_some()
+}
+
+pub enum EntryLookup {
+    Locked,
+    Absent,
+    Entry(HostEntry),
+}
+
+pub async fn lookup_entry(alias: &str) -> EntryLookup {
+    let mut guard = cache().lock().await;
+    let now = Instant::now();
+    expire_bypass_at(&mut guard, now);
+    let Some(cached) = guard.as_mut() else {
+        return if exists() {
+            EntryLookup::Locked
+        } else {
+            EntryLookup::Absent
+        };
+    };
+    let entry = cached.data.hosts.get(alias).cloned();
+    if entry.is_some() {
+        if let CacheOwner::BypassUnlock { last_used, .. } = &mut cached.owner {
+            *last_used = now;
+        }
+    }
+    entry.map_or(EntryLookup::Absent, EntryLookup::Entry)
 }
 
 /// Look up a host entry from the cache. Returns `None` if the vault isn't
-/// currently unlocked, or if there's no entry for `alias` — both cases mean
-/// "fall back to `~/.ssh/config` for this host" to the caller.
+/// currently unlocked or absent. Routing must use lookup_entry to distinguish
+/// Locked from verified absence, never infer config fallback.
 pub async fn get_entry(alias: &str) -> Option<HostEntry> {
-    let guard = cache().lock().await;
-    guard.as_ref()?.data.hosts.get(alias).cloned()
+    match lookup_entry(alias).await {
+        EntryLookup::Entry(entry) => Some(entry),
+        _ => None,
+    }
 }
 
 /// Whether the vault (cache) currently has an entry for `alias`.
 pub async fn has_entry(alias: &str) -> bool {
-    let guard = cache().lock().await;
+    let mut guard = cache().lock().await;
+    expire_bypass_at(&mut guard, Instant::now());
     guard
         .as_ref()
         .is_some_and(|v| v.data.hosts.contains_key(alias))
@@ -1075,7 +1195,8 @@ pub async fn has_entry(alias: &str) -> bool {
 /// memory compare isn't in the threat model docs/internals/architecture.md is written
 /// against (a remote attacker can't reach this code path at all).
 pub async fn verify_password(password: &[u8]) -> Result<bool, VaultError> {
-    let guard = cache().lock().await;
+    let mut guard = cache().lock().await;
+    expire_bypass_at(&mut guard, Instant::now());
     let Some(cached) = guard.as_ref() else {
         return Ok(false);
     };
@@ -1083,31 +1204,35 @@ pub async fn verify_password(password: &[u8]) -> Result<bool, VaultError> {
     Ok(key.as_slice() == cached.key.as_slice())
 }
 
-async fn refresh_cache_if_present(path: &Path, data: &VaultData, password: &[u8]) {
+async fn publish_verified(
+    data: VaultData,
+    kdf: KdfParamsFile,
+    key: Zeroizing<[u8; 32]>,
+    bypass: bool,
+) {
     let mut guard = cache().lock().await;
-    if guard.is_some() {
-        // Best effort: if this fails (e.g. we lost a race with a concurrent
-        // password change) just drop the stale cache entirely rather than
-        // leave something inconsistent cached; the next `approve` will
-        // re-populate it correctly.
-        match read_vault_file(path).and_then(|f| derive_key(password, &f.kdf).map(|k| (f, k))) {
-            Ok((file, key)) => {
-                let owner = guard
-                    .as_ref()
-                    .map(|cached| cached.owner)
-                    .expect("cache presence checked above");
-                *guard = Some(UnlockedVault {
-                    data: data.clone(),
-                    kdf: file.kdf,
-                    key,
-                    owner,
-                });
-            }
-            Err(_) => {
-                *guard = None;
-            }
+    let now = Instant::now();
+    expire_bypass_at(&mut guard, now);
+    let owner = if bypass {
+        let created_at = match guard.as_ref().map(|v| v.owner) {
+            Some(CacheOwner::BypassUnlock { created_at, .. }) => created_at,
+            _ => now,
+        };
+        CacheOwner::BypassUnlock {
+            created_at,
+            last_used: now,
         }
-    }
+    } else if let Some(v) = guard.as_ref() {
+        v.owner
+    } else {
+        return;
+    };
+    *guard = Some(UnlockedVault {
+        data,
+        kdf,
+        key,
+        owner,
+    });
 }
 
 /// Serializes tests that read/write the process-global vault cache
@@ -1127,6 +1252,55 @@ pub(crate) fn cache_test_lock() -> &'static AsyncMutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bypass_cache_has_independent_bounded_ownership() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = temp_vault_path("bypass-owner");
+        let mut data = VaultData::default();
+        data.hosts.insert("web".into(), sample_entry());
+        create_at(&path, &data, b"fixture").unwrap();
+        let (data, kdf, key) = unlock_material_at(&path, b"fixture").unwrap();
+        publish_verified(data, kdf, key, true).await;
+        assert!(get_entry("web").await.is_some());
+        clear_lease_cache().await;
+        assert!(
+            is_cached().await,
+            "no leases must not discard a bypass unlock"
+        );
+        let born = match cache().lock().await.as_ref().unwrap().owner {
+            CacheOwner::BypassUnlock { created_at, .. } => created_at,
+            _ => panic!("bypass owner"),
+        };
+        let (data, kdf, key) = unlock_material_at(&path, b"fixture").unwrap();
+        publish_verified(data, kdf, key, true).await;
+        assert!(matches!(cache().lock().await.as_ref().unwrap().owner,
+            CacheOwner::BypassUnlock {created_at,..} if created_at==born));
+        cache().lock().await.as_mut().unwrap().owner = CacheOwner::BypassUnlock {
+            created_at: Instant::now() - crate::daemon::lease::MAX_LIFETIME,
+            last_used: Instant::now(),
+        };
+        assert!(
+            !is_cached().await,
+            "active use cannot extend the hard ceiling"
+        );
+        let (data, kdf, key) = unlock_material_at(&path, b"fixture").unwrap();
+        publish_verified(data, kdf, key, true).await;
+        cache().lock().await.as_mut().unwrap().owner = CacheOwner::BypassUnlock {
+            created_at: Instant::now(),
+            last_used: Instant::now() - crate::daemon::lease::DEFAULT_IDLE_TIMEOUT,
+        };
+        expire_bypass_cache().await;
+        assert!(!is_cached().await);
+        let (data, kdf, key) = unlock_material_at(&path, b"fixture").unwrap();
+        publish_verified(data, kdf, key, false).await;
+        assert!(
+            !is_cached().await,
+            "normal cold operations never create cache"
+        );
+        let _ = std::fs::remove_file(path);
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_vault_path(tag: &str) -> PathBuf {

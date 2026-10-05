@@ -1,5 +1,13 @@
 # Local Wire Protocol
 
+The v0.2.8 repair retains protocol 3 and adds no request types. In bypass mode,
+existing InitVault/AddCred/UpdateHost/RmCred/ListHosts operations with verified
+Master Password publish a bounded credential unlock. A cold vault produces an
+Error with unlock guidance, not an approval popup or an incomplete bypass grant.
+Normal approval sequencing is unchanged. Anchoring and per-connection snapshots
+are daemon-side authority checks, not caller-supplied identity fields.
+
+
 Dangerous Bypass Mode is explicit daemon startup policy (argument or protected
 local configuration), not a wire field. GUI saves config locally, not over IPC.
 It retains protocol 3 framing and negotiation. With the mode enabled,

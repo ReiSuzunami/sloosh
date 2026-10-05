@@ -580,7 +580,7 @@
         <div>
           <h2 id="bypass-heading">Dangerous Bypass Mode</h2>
           <p>Skips human approval and trusts unknown SSH host keys for all same-user clients. Known-key changes still fail.</p>
-          <p>Saved startup policy: {snapshot?.dangerousBypassMode == null ? 'Unavailable' : snapshot.dangerousBypassMode ? 'Enabled' : 'Disabled'}. Current daemon is unchanged. Restart to apply; stopping ends sessions, forwards, and leases.</p>
+          <p>Saved startup policy: {snapshot?.dangerousBypassMode == null ? 'Unavailable' : snapshot.dangerousBypassMode ? 'Enabled' : 'Disabled'}. Current daemon is unchanged. Restart to apply; stopping ends sessions, forwards, and leases. In bypass mode, unlock Hosts once to make stored credentials available; its daemon cache has an idle timeout and an eight-hour limit.</p>
         </div>
         <button
           class="secondary-button danger-button"
