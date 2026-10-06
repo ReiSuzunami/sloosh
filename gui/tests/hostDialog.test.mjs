@@ -44,3 +44,13 @@ test('host dialogs clear component state after native Escape closes them', () =>
     assert.equal(handler.expression.name, 'closeDialog');
   }
 });
+
+test('host-key actions do not promise a connection retry', () => {
+  const trustDialog = source.slice(
+    source.indexOf('{#if keyPreview}'),
+    source.indexOf("{#if mode === 'delete'"),
+  );
+  assert.match(trustDialog, /'Trust host key'/);
+  assert.match(trustDialog, /'Replace host key'/);
+  assert.doesNotMatch(trustDialog, /(?:Trust|Replace)[^\n]*retry/i);
+});

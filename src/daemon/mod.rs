@@ -71,7 +71,7 @@ fn no_lease_message(host: &str) -> String {
     )
 }
 
-/// Gate a host-touching request behind an active lease. `peer` is the
+/// Gate a host-touching request behind a lease or startup bypass policy. `peer` is the
 /// caller's PID from `Channel::peer_pid` (looked up once per connection);
 /// `lease_token` is the request's own `SLOOSH_LEASE` escape-hatch field, if
 /// the caller's environment had one set.
@@ -136,7 +136,7 @@ pub async fn run_with_dangerous_bypass(
     DANGEROUS_BYPASS.store(dangerous_bypass, Ordering::Relaxed);
     if dangerous_bypass {
         warn!(
-            "DANGEROUS BYPASS MODE: human approval disabled; unknown host keys trusted automatically"
+            "DANGEROUS BYPASS MODE: lease authorization disabled; all same-user clients have access; unknown host keys trusted automatically"
         );
         audit::record("dangerous_bypass_enabled", serde_json::json!({"pid": pid}));
     }
@@ -642,7 +642,11 @@ async fn handle_connection(
                 // docs/internals/architecture.md: expand every requested host's ProxyJump
                 // chain so the human approving this request sees (and
                 // grants) coverage for the whole path, not just the target.
-                let expanded_hosts = match ssh::expand_lease_hosts_for_request(&hosts).await {
+                let expanded_hosts = match if dangerous_bypass_enabled() {
+                    ssh::expand_lease_hosts(&hosts).await
+                } else {
+                    ssh::expand_lease_hosts_for_request(&hosts).await
+                } {
                     Ok(hosts) => hosts,
                     Err(error) => {
                         chan.send(&Response::Error {
@@ -660,23 +664,6 @@ async fn handle_connection(
                         );
                         match outcome {
                             lease::RequestOutcome::AlreadyAuthorized => Response::Ok,
-                            lease::RequestOutcome::Pending(info) if dangerous_bypass_enabled() => {
-                                match lease::approve_lease_dangerous_bypass(&info.id).await {
-                                    Ok(activated) => {
-                                        audit::record(
-                                            "lease_approved_dangerous_bypass",
-                                            serde_json::json!({
-                                                "hosts": activated.hosts,
-                                                "anchor_pid": activated.anchor_pid,
-                                            }),
-                                        );
-                                        Response::Ok
-                                    }
-                                    Err(error) => Response::Error {
-                                        message: error.to_string(),
-                                    },
-                                }
-                            }
                             lease::RequestOutcome::Pending(info) => {
                                 match lease::approve_lease_system_agent(&info.id, None).await {
                                     Ok(lease::SystemAgentApprovalOutcome::Activated(activated)) => {

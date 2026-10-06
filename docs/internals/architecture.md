@@ -12,11 +12,11 @@ eight hours from cache creation and ordinary refresh does not reset it.
 
 Locked/Absent/Entry lookup prevents locked vaults from becoming config hosts.
 Request-time normal-mode expansion may defer locked resolution until approval;
-bypass activation uses strict expansion. Config fallback requires known absence.
+bypass compatibility requests use strict expansion. Config fallback requires known absence.
 ResolvedHost carries endpoint, user, route and auth through handshake, including
 jump hops. Only HostConfig metadata survives in long-lived connections; auth
 snapshots zeroize on drop. No second cache lookup is used for authentication.
-CLI anchors use meaningful parents, never PID 1; GUI/SDK anchor their own process.
+Normal-mode CLI anchors use meaningful parents, never PID 1; GUI/SDK anchor their own process.
 Normal cache remains lease-owned, and desktop management lock remains separate.
 
 
@@ -29,13 +29,17 @@ auto-spawn honor this persistent opt-in. The GUI explicitly confirms and saves
 the setting, without restarting or mutating the running daemon.
 The socket-owning daemon latches the
 startup policy before serving clients. Wire request shapes and protocol 3
-negotiation remain unchanged. `RequestLease` activates a distinct
-`DangerousBypass` grant without native or terminal approval, retaining expanded
-ProxyJump coverage, process identity, host scope, and lease lifecycle.
-These grants allow all configured authentication methods but cannot decrypt
-a locked vault. Actual SSH connections automatically persist unknown keys
+negotiation remain unchanged. Host operations skip lease authorization entirely:
+no request, host scope, anchor, token, or lease expiry is required. `RequestLease`
+is an optional strict route/vault-readiness check returning `Ok` without creating
+lease state. `DangerousBypass` handles carry no bearer token and remain valid
+while the socket-owning daemon's startup policy is enabled; forwards therefore
+do not expire with leases. Route closure, explicit stops, and resource bounds remain.
+This policy allows all configured authentication methods but cannot decrypt
+a locked vault or extend its bounded credential cache. Actual SSH connections automatically persist unknown keys
 through the existing protected known_hosts writer; changed keys still fail.
-Startup and bypass lease activation have explicit audit events; first-use trust
+Startup has an explicit audit event; compatibility requests retain the existing
+`lease_requested` event without a lease activation event. First-use trust
 has a daemon warning. Disable the saved setting and restart without the flag
 to restore normal approval policy. Restart loses sessions, forwards, and leases.
 
@@ -180,6 +184,9 @@ behavior.
 
 ### Process ancestry lease
 
+This section describes normal mode. Startup bypass authorizes same-user host
+operations without a process-ancestry lease.
+
 `src/daemon/lease.rs` anchors a request to a process instance identified by PID
 plus kernel start time. Linux clock-tick and macOS microsecond precision are
 retained so PID reuse within one second does not identify the same process.
@@ -203,15 +210,19 @@ stable forward grant is used. Human-approved leases are not method-restricted.
 
 ### Stable `LeaseGrant`
 
-A short-lived CLI PID cannot own a background forward. At creation,
+A short-lived CLI PID cannot own a background forward. In normal mode, at creation,
 `lease::resolve_grant` converts caller ancestry/token authorization into an
 opaque `LeaseGrant` scoped to one host and active lease. The forward stores this
 grant rather than creator PID.
 
+In bypass mode the same opaque handle identifies startup policy, not a live
+lease; its host is an operation label, not an authorization scope. `check_grant`
+and `peek_grant` accept it only while that daemon policy is enabled.
+
 Accepted traffic calls `check_grant`, revalidating the lease and refreshing its
 idle clock. Reapers use `peek_grant`, which checks without refreshing.
 
-Lease expiry has three intentional outcomes:
+In normal mode, lease expiry has three intentional outcomes:
 
 - PTY session stays alive but becomes inaccessible until re-approved.
 - Forward and existing tunnels close because they are live network access.

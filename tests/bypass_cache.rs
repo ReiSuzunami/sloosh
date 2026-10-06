@@ -88,6 +88,18 @@ async fn bypass_human_operations_unlock_new_and_existing_credentials_without_app
         client.request(&add("existing.invalid")).await.unwrap(),
         Response::Ok
     );
+    let run = |host: &str| Request::Run {
+        host: host.into(),
+        command: "true".into(),
+        session: None,
+        timeout_secs: 1,
+        raw: false,
+        lease_token: None,
+    };
+    assert!(matches!(
+        client.request(&run("existing.invalid")).await.unwrap(),
+        Response::Error { message } if message.contains("sloosh request")
+    ));
     stop(child, client).await;
     let (child, client) = start(&home.0, true).await;
     let request = || Request::RequestLease {
@@ -96,27 +108,26 @@ async fn bypass_human_operations_unlock_new_and_existing_credentials_without_app
     assert!(
         matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("vault is locked"))
     );
+    assert!(matches!(
+        client.request(&run("existing.invalid")).await.unwrap(),
+        Response::Error { message } if message.contains("vault is locked")
+    ));
     // First add before any active lease must publish a bounded unlock.
     assert_eq!(
         client.request(&add("added.invalid")).await.unwrap(),
         Response::Ok
     );
-    assert_eq!(client.request(&request()).await.unwrap(), Response::Ok);
-    let result = client
-        .request(&Request::Run {
-            host: "added.invalid".into(),
-            command: "true".into(),
-            session: None,
-            timeout_secs: 1,
-            raw: false,
-            lease_token: None,
-        })
-        .await
-        .unwrap();
+    let result = client.request(&run("added.invalid")).await.unwrap();
     assert!(
         matches!(result,Response::Error{message} if message.contains("127.0.0.1:1")),
         "the vault endpoint, never the alias, must be dialed"
     );
+    // Compatibility requests do not create leases; no renewal is needed.
+    assert_eq!(client.request(&request()).await.unwrap(), Response::Ok);
+    let Response::Status(status) = client.request(&Request::Status).await.unwrap() else {
+        panic!("expected status");
+    };
+    assert!(status.leases.is_empty());
     stop(child, client).await;
     // Restart forgets the key, not the encrypted records.
     let (child, client) = start(&home.0, true).await;

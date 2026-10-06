@@ -1,6 +1,6 @@
 # Security
 
-## v0.2.8 credential and lease invariants
+## Credential and lease invariants
 
 In bypass mode only, successful Master Password verification by InitVault,
 AddCred, UpdateHost, RmCred or ListHosts publishes a daemon-owned unlock cache.
@@ -22,7 +22,7 @@ immutable snapshot; every jump follows the same rule. Editing/removing a
 profile cannot switch credentials during that handshake. Auth material is
 zeroized when the operation ends, not retained in Connection.resolved.
 
-Lease anchors never use PID 1. CLI wrappers inherit a meaningful non-shell
+Normal-mode lease anchors never use PID 1. CLI wrappers inherit a meaningful non-shell
 parent; GUI/SDK callers anchor themselves. No safe parent means NoAnchor,
 not a shared-root fallback. PID plus start-time and token checks remain.
 Desktop locking affects its management session, not daemon leases or cache;
@@ -33,12 +33,16 @@ stop the daemon for immediate shutdown of all its authority.
 
 Default behavior below assumes this mode is disabled. Starting the selected
 local daemon with `slooshd --dangerous-bypass-mode`, or explicitly enabling
-`dangerous_bypass_mode` in protected local settings, disables human
-lease approval for every same-user client of that daemon. `RequestLease`
-automatically activates an exact expanded host scope, retaining PID/start-time
-anchoring, expiry, revocation, stable forward grants, and resource limits.
-Bypass grants are not restricted to system-agent authentication. SSH login
-credentials are still required; encrypted vaults still require unlock.
+`dangerous_bypass_mode` in protected local settings, disables lease authorization
+for every same-user client of that daemon. Host operations need no `RequestLease`,
+process anchor, host scope, lease token, or renewal. This is all-access startup
+policy, not an automatically renewed lease. Resource bounds and the negotiated
+owner-only Unix socket boundary remain enforced. `RequestLease` remains an optional
+route/vault-readiness check returning `Ok` without creating pending or active leases.
+Internal forwarding handles recheck the startup policy rather than lease expiry;
+manual stop, route lifecycle, and connection failures still apply.
+All SSH authentication methods remain available. SSH login credentials are still
+required; encrypted vaults still require unlock, with their existing cache limits.
 
 Unknown SSH host keys, including ProxyJump hops, are automatically persisted
 in Sloosh's protected known_hosts store on first connection. This forfeits
@@ -54,8 +58,9 @@ owner-only permissions, bounded reads, symlink refusal, and atomic writes;
 corrupt or unsafe settings prevent daemon startup, even with the flag.
 The GUI Security page saves this setting only after explicit risk confirmation;
 it does not restart or change the running daemon. Startup emits a prominent warning
-and `dangerous_bypass_enabled` audit event; each automatic bypass lease emits
-`lease_approved_dangerous_bypass`. First-use trust emits a daemon warning.
+and `dangerous_bypass_enabled` audit event. Compatibility `RequestLease` calls
+remain recorded as `lease_requested`, but no bypass lease is created or approved.
+First-use trust emits a daemon warning.
 Disable the saved setting and restart without the flag to disable the mode.
 Stopping loses active sessions, forwards, and leases. There is no remote control API.
 
@@ -161,7 +166,7 @@ and replacements.
 The daemon gets the peer PID from `SO_PEERCRED` on Linux or `LOCAL_PEERPID` on
 macOS. It never accepts a caller-supplied PID as identity.
 
-An active lease is anchored to a PID plus process start time. The daemon keeps
+In normal mode, an active lease is anchored to a PID plus process start time. The daemon keeps
 the kernel-provided subsecond resolution: Linux clock ticks and macOS `timeval`
 microseconds are not truncated to whole seconds. A later caller is authorized
 only when:
@@ -491,10 +496,11 @@ failure does not commit a trust change. Rename is the commit point; a later
 parent-directory sync failure is logged instead of falsely reporting an
 uncommitted operation.
 
-The desktop connection test does not bypass leases. It requests an ordinary
-exact-scope lease, which may activate automatically only under the
-system-agent-only policy, runs `true` in a fresh reserved PTY session, and then
-kills that session. Success therefore covers TCP reachability, SSH handshake,
+The desktop connection test follows the daemon's startup policy. In normal mode
+it requests an ordinary exact-scope lease, which may activate automatically only
+under the system-agent-only policy. Bypass uses an optional readiness check,
+not a lease. Both modes run `true` in a fresh reserved PTY session and then kill
+that session. Success therefore covers TCP reachability, SSH handshake,
 host-key verification, configured authentication, and a working remote shell.
 Pending approval, unknown keys, mismatches, ProxyJump lease coverage, and
 authentication errors remain fail closed.
@@ -504,7 +510,10 @@ authentication errors remain fail closed.
 The daemon, not the CLI, is the authority for host operations. Current request
 classes are below. Except for `Status`, `Hello`, and `Shutdown`, every wire
 request first requires a negotiated protocol 3 connection; the table lists
-additional authority after that gate.
+additional authority after that gate in normal mode. Dangerous Bypass Mode
+removes the active-lease requirements for host operations, including vault-backed
+ProxyJump hops and forwarding traffic. Vault CRUD still requires the Master Password;
+credential-cache expiry, SSH authentication, and resource bounds are not bypassed.
 
 | Request or command | Required authority | Notes |
 |---|---|---|

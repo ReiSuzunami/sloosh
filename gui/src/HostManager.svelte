@@ -534,11 +534,7 @@
 
 <section class="hosts-page" aria-labelledby="hosts-heading">
   <div class="hosts-toolbar">
-    <div>
-      <p class="section-kicker">Vault inventory</p>
-      <h2 id="hosts-heading">SSH hosts</h2>
-      <p>Vault-backed connection profiles available to approved sessions.</p>
-    </div>
+    <h2 id="hosts-heading" class="sr-only">SSH hosts</h2>
     <div class="toolbar-actions">
       {#if hosts !== null}
         <span class="unlock-status" aria-live="off">
@@ -565,6 +561,7 @@
           <LockKeyhole size={17} />
         </button>
       {/if}
+      {#if hosts?.length !== 0}
       <button
         class="primary-button"
         onclick={openAdd}
@@ -573,6 +570,7 @@
       >
         <Plus size={16} /> Add host
       </button>
+      {/if}
     </div>
   </div>
 
@@ -605,7 +603,7 @@
       <div class="host-gate-mark"><KeyRound size={22} /></div>
       <div>
         <h3>Credential vault locked</h3>
-        <p>Unlock once to manage hosts. It locks after {unlock.idleTimeoutMinutes} minutes of inactivity.</p>
+        <p>Unlock to manage hosts. Auto-locks after {unlock.idleTimeoutMinutes} idle minutes.</p>
       </div>
       <div class="unlock-actions" aria-label="Unlock methods">
         {#if snapshot?.touchIdEnrolled}
@@ -626,8 +624,8 @@
   {:else if hosts.length === 0}
     <div class="host-empty" in:fade={{ duration: enterDuration }}>
       <Server size={24} />
-      <h3>No vault-backed hosts</h3>
-      <p>Add the first connection profile for approved SSH work.</p>
+      <h3>No saved hosts</h3>
+      <p>Only vault hosts appear here, not SSH config entries.</p>
       <button class="primary-button" onclick={openAdd}><Plus size={16} /> Add host</button>
     </div>
   {:else}
@@ -703,7 +701,6 @@
             title="Close"
           ><X size={17} /></button>
           <div>
-            <p class="section-kicker">{mode === 'edit' ? 'Vault update' : 'New connection'}</p>
             <h2 id="host-dialog-title">{mode === 'edit' ? `Edit ${selected?.alias}` : 'Add SSH host'}</h2>
           </div>
         </header>
@@ -745,7 +742,7 @@
                 <label class:chosen={form.auth === 'agent'}>
                   <input bind:group={form.auth} type="radio" value="agent" />
                   <KeyRound size={18} />
-                  <span><strong>SSH agent</strong><small>Uses keys already loaded in the system SSH Agent. Sloosh stores no private key.</small></span>
+                  <span><strong>SSH agent</strong><small>Uses loaded system SSH Agent keys. Stores no private key.</small></span>
                 </label>
                 <label class:chosen={form.auth === 'password'}>
                   <input bind:group={form.auth} type="radio" value="password" />
@@ -755,16 +752,13 @@
                 <label class:chosen={form.auth === 'key_file'}>
                   <input bind:group={form.auth} type="radio" value="key_file" />
                   <FileKey2 size={18} />
-                  <span><strong>Key file</strong><small>Uses this exact key. RSA and encrypted OpenSSH keys must also be loaded in SSH Agent.</small></span>
+                  <span><strong>Key file</strong><small>Uses the selected private key.</small></span>
                 </label>
               </div>
-              {#if form.auth === 'agent'}
-                <p class="auth-guidance" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}><Check size={15} /> Choose this when macOS Keychain or <code>ssh-add</code> already loaded your key.</p>
-              {:else if form.auth === 'password'}
+              {#if form.auth === 'password'}
                 <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                   <span>SSH password</span>
                   <input bind:value={form.password} type="password" autocomplete="current-password" placeholder="Password for this SSH account" />
-                  <small>Encrypted in the Sloosh vault. Cleared from this form immediately after submission.</small>
                 </label>
               {:else if form.auth === 'key_file'}
                 <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
@@ -775,7 +769,7 @@
                       <FolderOpen size={15} /> Choose…
                     </button>
                   </div>
-                  <small>Type a full path when Finder hides <code>.ssh</code>, or choose a file. For RSA or encrypted OpenSSH keys, load this same key into the daemon's SSH Agent; keep Key file selected.</small>
+                  <small>RSA or encrypted OpenSSH: load this key in the daemon's SSH Agent.<br />Keep Key file selected.</small>
                 </label>
               {/if}
             {/if}
@@ -786,20 +780,20 @@
             <div class="route-choices">
               <label class:chosen={form.routeMode === 'direct'}>
                 <input bind:group={form.routeMode} type="radio" value="direct" />
-                <span><strong>Direct</strong><small>Connect to the host without a jump.</small></span>
+                <span><strong>Direct</strong></span>
               </label>
               <label class:chosen={form.routeMode === 'managed_host'}>
                 <input bind:group={form.routeMode} type="radio" value="managed_host" />
-                <span><strong>Through managed host</strong><small>Reuse another Sloosh host profile.</small></span>
+                <span><strong>Through saved host</strong><small>Use another Sloosh host as a jump.</small></span>
               </label>
               <label class:chosen={form.routeMode === 'proxy_jump'}>
                 <input bind:group={form.routeMode} type="radio" value="proxy_jump" />
-                <span><strong>Advanced ProxyJump</strong><small>Use raw OpenSSH jump syntax.</small></span>
+                <span><strong>ProxyJump</strong><small>Enter an OpenSSH jump route.</small></span>
               </label>
             </div>
             {#if form.routeMode === 'managed_host'}
               <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
-                <span>Managed host</span>
+                <span>Jump host</span>
                 <select bind:value={form.managedHost} required>
                   <option value="" disabled>Select a host profile</option>
                   {#each (hosts ?? []).filter((host) => host.alias !== form.alias) as host}
@@ -811,7 +805,7 @@
               <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <span>ProxyJump specification</span>
                 <input bind:value={form.proxyJump} autocomplete="off" placeholder="user@bastion:22,edge" />
-                <small>Comma-separated OpenSSH syntax. Cycles and routes over 8 hops are rejected.</small>
+                <small>Comma-separated jumps. No cycles; up to 8 hops.</small>
               </label>
             {/if}
             <div class="route-preview" aria-live="polite">
@@ -825,7 +819,7 @@
         <footer>
           <button type="button" class="secondary-button" onclick={closeDialog} disabled={activeAction !== null}>Cancel</button>
           <button type="submit" class="primary-button" disabled={activeAction !== null}>
-            {activeAction ? 'Authorizing...' : mode === 'edit' ? 'Save changes' : 'Add host'}
+            {activeAction ? 'Saving...' : mode === 'edit' ? 'Save changes' : 'Add host'}
           </button>
         </footer>
       </form>
@@ -856,21 +850,16 @@
           title="Close"
         ><X size={17} /></button>
         <div>
-          <p class="section-kicker">
-            {keyPreview.state === 'new' ? 'Untrusted remote key' : 'Remote key changed'}
-          </p>
           <h2 id="trust-host-key-title">
-            {keyPreview.state === 'new' ? `Trust ${keyPreview.host}?` : `Review ${keyPreview.host}`}
+            {keyPreview.state === 'new' ? `Trust host key for ${keyPreview.host}?` : `Host key changed for ${keyPreview.host}`}
           </h2>
         </div>
       </header>
       <p id="trust-host-key-description">
         {#if keyPreview.state === 'new'}
-          Sloosh has not trusted this endpoint yet. Compare the fingerprint with a trusted,
-          independent source before adding it.
+          Verify this fingerprint with an independent, trusted source.
         {:else}
-          The endpoint presented a different key. Verify why it changed through an independent
-          channel before replacing anything.
+          Verify this change independently before replacing the key.
         {/if}
       </p>
       <dl class="host-key-details">
@@ -891,20 +880,18 @@
       </dl>
       <p class="trust-boundary" id="trust-host-key-boundary">
         {#if keyPreview.state === 'external_mismatch'}
-          This conflict comes from <code>~/.ssh/known_hosts</code>. Sloosh will not modify it;
-          resolve that entry manually, then recheck.
+          Edit <code>~/.ssh/known_hosts</code> manually, then recheck. Sloosh will not change it.
         {:else if keyPreview.state === 'changed' && !keyPreview.replaceable}
-          This Sloosh entry is not a single replaceable host line. Update it manually, then recheck.
+          This entry cannot be replaced here. Edit <code>~/.sloosh/known_hosts</code> manually, then recheck.
         {:else}
-          Sloosh re-resolves and re-probes immediately before changing only
-          <code>~/.sloosh/known_hosts</code>.
+          Changes only <code>~/.sloosh/known_hosts</code>.
         {/if}
       </p>
       {#if keyPreviewMessage}<p class="dialog-status" role="status">{keyPreviewMessage}</p>{/if}
       <footer>
         <button class="secondary-button" onclick={closeKeyPreview} disabled={activeAction !== null}>Cancel</button>
         <button class="secondary-button" onclick={() => void copyFingerprint()} disabled={activeAction !== null}>
-          <Copy size={15} /> {keyPreview.state === 'new' ? 'Copy fingerprint' : 'Copy new'}
+          <Copy size={15} /> {keyPreview.state === 'new' ? 'Copy fingerprint' : 'Copy new fingerprint'}
         </button>
         <button class="secondary-button" onclick={() => void recheckHostKey()} disabled={activeAction !== null}>
           <RefreshCw size={15} /> Recheck
@@ -917,10 +904,10 @@
           disabled={activeAction !== null}
         >
           {activeAction?.startsWith('trust_host_key:')
-            ? 'Verifying again...'
+            ? 'Verifying...'
             : keyPreview.state === 'new'
-              ? 'Trust and retry'
-              : 'Replace + retry'}
+              ? 'Trust host key'
+              : 'Replace host key'}
         </button>
         {/if}
       </footer>
@@ -939,14 +926,13 @@
     >
       <header>
         <div>
-          <p class="section-kicker">Vault update</p>
           <h2 id="remove-host-title">Remove {selected.alias}?</h2>
         </div>
       </header>
       {#if dependentHosts.length > 0}
-        <p class="dependency-warning">Route used by {dependentHosts.map((host) => host.alias).join(', ')}. Change those hosts to another route before removing this profile.</p>
+        <p class="dependency-warning">Jump host for {dependentHosts.map((host) => host.alias).join(', ')}. Change their routes before removing it.</p>
       {:else}
-        <p>Removes its stored connection profile. Existing SSH sessions remain open until closed.</p>
+        <p>Deletes this vault entry and any stored password. Existing SSH sessions stay open.</p>
       {/if}
       {#if formError}<p class="dialog-error" role="alert">{formError}</p>{/if}
       <footer>

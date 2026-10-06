@@ -201,11 +201,13 @@ enum LeaseAuthorization {
     DangerousBypass,
 }
 
-/// Opaque handle to the exact active lease that authorized one host.
+/// Opaque authorization handle: an exact active lease in normal mode, or
+/// the daemon's startup bypass policy without a bearer token in bypass mode.
 ///
 /// Long-lived daemon work stores this instead of the short-lived CLI PID.
 /// The token never leaves this module, and `host` narrows the handle to the
-/// capability resolved when the work was created.
+/// capability resolved when the work was created. A bypass handle's host is
+/// only an operation label, not an authorization scope.
 #[derive(Clone)]
 pub(crate) struct LeaseGrant {
     token: String,
@@ -214,6 +216,14 @@ pub(crate) struct LeaseGrant {
 }
 
 impl LeaseGrant {
+    fn dangerous_bypass(host: &str) -> Self {
+        Self {
+            token: String::new(),
+            host: host.to_string(),
+            authorization: LeaseAuthorization::DangerousBypass,
+        }
+    }
+
     /// Whether this grant came from automatic default-system-agent policy.
     /// Connection setup carries this restriction to the exact auth snapshot
     /// it uses so a concurrent host edit cannot broaden authority.
@@ -394,6 +404,9 @@ pub async fn request_lease(
     caller_pid: u32,
     hosts: Vec<String>,
 ) -> Result<RequestOutcome, LeaseError> {
+    if super::dangerous_bypass_enabled() {
+        return request_lease_for_chain(Vec::new(), hosts).await;
+    }
     request_lease_for_chain(
         procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
         hosts,
@@ -410,6 +423,9 @@ async fn request_lease_for_chain(
 ) -> Result<RequestOutcome, LeaseError> {
     if hosts.is_empty() {
         return Err(LeaseError::NoHostsRequested);
+    }
+    if super::dangerous_bypass_enabled() {
+        return Ok(RequestOutcome::AlreadyAuthorized);
     }
 
     let mut st = state().lock().await;
@@ -653,26 +669,6 @@ pub async fn approve_lease_system_agent(
     )))
 }
 
-/// Startup bypass policy still grants only a bounded, process-anchored scope.
-pub(crate) async fn approve_lease_dangerous_bypass(
-    id: &str,
-) -> Result<LeaseActivatedInfo, LeaseError> {
-    let mut st = state().lock().await;
-    prune_expired(&mut st).await;
-    let hosts = st
-        .pending
-        .get(id)
-        .map(|pending| pending.hosts.clone())
-        .ok_or_else(|| LeaseError::NoSuchRequest(id.to_string()))?;
-    let resolved_hosts = expand_approval_hosts(&hosts).await?;
-    Ok(activate_pending(
-        &mut st,
-        id,
-        resolved_hosts,
-        LeaseAuthorization::DangerousBypass,
-    ))
-}
-
 /// Drop cache populated only for an unsuccessful native preview. Preserve it
 /// when another active lease still owns cache lifetime.
 pub async fn discard_native_preview() {
@@ -842,6 +838,9 @@ fn format_host_list(hosts: &[String]) -> String {
 /// Touches `last_used` on the matching lease if so (docs/internals/architecture.md idle-timeout
 /// clock).
 pub async fn check_authorized(caller_pid: u32, host: &str, lease_token: Option<&str>) -> bool {
+    if super::dangerous_bypass_enabled() {
+        return true;
+    }
     // The token check never needs the ancestry walk, but doing the walk
     // unconditionally keeps this simple; it's cheap (a handful of sysctls /
     // /proc reads).
@@ -863,6 +862,9 @@ pub(crate) async fn resolve_grant(
     host: &str,
     lease_token: Option<&str>,
 ) -> Option<LeaseGrant> {
+    if super::dangerous_bypass_enabled() {
+        return Some(LeaseGrant::dangerous_bypass(host));
+    }
     resolve_grant_for_chain(
         &procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
         host,
@@ -888,6 +890,9 @@ pub(crate) async fn peek_grant(grant: &LeaseGrant) -> bool {
 /// touching variant would refresh the idle clock forever and no lease
 /// backing a forward could ever idle out.
 pub async fn peek_authorized(caller_pid: u32, host: &str, lease_token: Option<&str>) -> bool {
+    if super::dangerous_bypass_enabled() {
+        return true;
+    }
     authorized_for_chain(
         &procs::ancestry_chain::<procs::ProcessTree>(caller_pid),
         host,
@@ -917,6 +922,9 @@ async fn resolve_grant_for_chain(
     lease_token: Option<&str>,
     touch: bool,
 ) -> Option<LeaseGrant> {
+    if super::dangerous_bypass_enabled() {
+        return Some(LeaseGrant::dangerous_bypass(host));
+    }
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
 
@@ -968,6 +976,9 @@ async fn resolve_grant_for_chain(
 }
 
 async fn grant_is_active(grant: &LeaseGrant, touch: bool) -> bool {
+    if grant.authorization == LeaseAuthorization::DangerousBypass {
+        return super::dangerous_bypass_enabled();
+    }
     let mut st = state().lock().await;
     prune_expired(&mut st).await;
 
@@ -1338,36 +1349,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dangerous_bypass_preserves_scope_identity_and_expiry() {
+    async fn dangerous_bypass_ignores_lease_scope_identity_and_expiry() {
         let _guard = test_lock().lock().await;
         reset_state().await;
-        let chain = vec![ancestor(99, 100, Some("agent"))];
-        let RequestOutcome::Pending(info) =
-            request_lease_for_chain(chain.clone(), vec!["web".to_string()])
-                .await
-                .unwrap()
-        else {
-            panic!("expected pending request");
-        };
-        approve_lease_dangerous_bypass(&info.id).await.unwrap();
-        let grant = resolve_grant_for_chain(&chain, "web", None, true)
+        struct ResetBypass;
+        impl Drop for ResetBypass {
+            fn drop(&mut self) {
+                crate::daemon::DANGEROUS_BYPASS.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetBypass;
+        crate::daemon::DANGEROUS_BYPASS.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let grant = resolve_grant_for_chain(&[], "unrequested", Some("stale-token"), true)
             .await
-            .unwrap();
+            .expect("bypass must authorize without a lease or ancestry anchor");
         assert!(!grant.requires_system_agent());
         assert!(check_grant(&grant).await);
-        assert!(
-            resolve_grant_for_chain(&chain, "other", None, true)
+        assert!(matches!(
+            request_lease_for_chain(vec![], vec!["other".to_string()])
                 .await
-                .is_none()
-        );
-        let reused_pid = vec![ancestor(99, 101, Some("agent"))];
+                .unwrap(),
+            RequestOutcome::AlreadyAuthorized
+        ));
+        {
+            let mut st = state().lock().await;
+            assert!(st.pending.is_empty());
+            assert!(st.active.is_empty());
+            st.active.push(ActiveLease {
+                anchor: Anchor::from_ancestor(&ancestor(99, 100, Some("agent"))),
+                hosts: HashSet::from(["old".to_string()]),
+                created_at: Instant::now() - MAX_LIFETIME,
+                last_used: Instant::now(),
+                token: "expired-test-lease".to_string(),
+                authorization: LeaseAuthorization::Human,
+            });
+            prune_expired(&mut st).await;
+            assert!(st.active.is_empty());
+        }
+        assert!(peek_grant(&grant).await);
+        assert!(check_grant(&grant).await);
         assert!(
-            resolve_grant_for_chain(&reused_pid, "web", None, true)
+            resolve_grant_for_chain(&[], "another-host", None, true)
                 .await
-                .is_none()
+                .is_some()
         );
-        state().lock().await.active[0].created_at = Instant::now() - MAX_LIFETIME;
+
+        crate::daemon::DANGEROUS_BYPASS.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!check_grant(&grant).await);
+        assert!(
+            resolve_grant_for_chain(&[], "unrequested", None, true)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

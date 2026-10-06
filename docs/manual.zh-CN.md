@@ -7,7 +7,7 @@
 重启 daemon 或凭据缓存过期后，请在桌面 Hosts 页面解锁，或自行运行
 `sloosh host list`。成功的新增、编辑、删除、列举与 vault 初始化，也会向
 bypass daemon 发布已验证凭据。首次新增可以早于任何 lease，无需再次 approve/trust。
-空闲时限复用超时设置，绝对上限为缓存创建后 8 小时；普通读取与新租约不重置绝对上限。
+空闲时限复用超时设置，绝对上限为缓存创建后 8 小时；普通读取不重置绝对上限。
 daemon 不保存主密码；错误密码不会解锁缓存。
 
 vault 锁定时无法判断别名是否存在，目标与跳板会明确报 VaultLocked，不尝试其他地址。
@@ -18,7 +18,7 @@ vault 锁定时无法判断别名是否存在，目标与跳板会明确报 Vaul
 
 
 
-仅在接受同用户进程免审批访问主机、首次连接可能信任攻击者的风险时开启。
+仅在接受同一系统用户的客户端全访问、首次连接可能信任攻击者的风险时开启。
 使用 CLI 实际选择的 `slooshd`：命令行安装通常选同目录 helper，macOS 已安装 App
 时可能优先选 App 内 helper。先停现有 daemon（会终止会话与转发），另开终端启动：
 
@@ -27,10 +27,11 @@ sloosh daemon stop
 /path/to/selected/slooshd --dangerous-bypass-mode
 ```
 
-保持运行。工作终端执行 `sloosh request myhost`，再正常使用 `run`、`put`、`get`
-或 `forward`。无需 approve 弹窗或终端确认；未知目标与跳板主机密钥自动保存，
-已知密钥变更仍拒绝。SSH 登录凭据与加密 vault 解锁仍必需。
-启动和每次 bypass 授权可通过 `sloosh log` 查看；首次信任会在 daemon 输出警告。
+保持运行，直接使用 `run`、`put`、`get` 或 `forward`：无需申请 lease、主机范围授权、
+token 或续约。`sloosh request myhost` 可选，仅检查路由与 vault 就绪状态，不创建 lease。
+无需 approve 弹窗或终端确认；未知目标与跳板主机密钥自动保存，已知密钥变更仍拒绝。
+SSH 登录凭据与加密 vault 解锁仍必需；凭据缓存过期后需要人类重新解锁，而非续约 lease。
+启动和兼容请求可通过 `sloosh log` 查看；首次信任会在 daemon 输出警告。
 它不是单次调用参数。
 
 持久开启：桌面端 **Security → Dangerous Bypass Mode → Enable on next start**，
@@ -142,22 +143,29 @@ Agent 访问时，请另用 Homebrew、Cargo 或命令行压缩包安装 `sloosh
 通过 shell 调用 CLI。
 
 Setup 安装内嵌 Agent Skill 并初始化 vault；Security 配置 Touch ID、可选的 6 位
-Sloosh PIN 与共用 vault 空闲期。这些操作不会导入 SSH 私钥，也不会批准主机。
+Sloosh PIN 与共用 Idle timeout（空闲超时）。启用 Touch ID 或 PIN 会把 vault Master
+Password 的受保护副本存入 macOS login Keychain。若 macOS 询问，`Always Allow` 可避免
+该项目的重复访问提示，`Allow` 只授权一次。这些操作不会导入 SSH 私钥，也不会授予 SSH 访问权限。
 
 Hosts 管理与 CLI 相同的 vault 主机配置，可使用 Touch ID、Sloosh PIN 或 Master
-Password 解锁。Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
+Password 解锁。原生审批按钮显示 `Master Password (vault)`，指 vault 主密码而非 macOS
+登录密码。PIN 提交按钮在桌面解锁时为 `Unlock`，SSH 审批时为 `Approve`。
+Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebView。
 Hosts 中输入的 SSH password 仅短暂存在，通过本地命令边界时使用脱敏 secret，提交后
 立即清空。Finder 隐藏 `.ssh` 时，可直接输入私钥完整路径，也可继续使用文件选择器。
 
 每条主机记录还提供手动 host-key 信任与端到端连接测试。信任流程会显示实际解析的
 endpoint、key algorithm 与 SHA256 指纹；key 发生变化时，同时显示旧、新指纹及其来源文件。
-请通过独立来源核对新指纹，再直接选择新增或替换。Sloosh 写入前会重新解析路由并重新探测，
+请通过独立来源核对新指纹，再选择 `Trust host key` 或 `Replace host key`。
+Sloosh 写入前会重新解析路由并重新探测，
 且只会修改 `~/.sloosh/known_hosts`，绝不修改 `~/.ssh/known_hosts`。若预览期间状态又有
 变化，弹窗只刷新内容，不执行写入。ProxyJump key 按依赖顺序逐个展示。
 
 终端中的 `sloosh host trust myhost` 提供同样的人类专用流程。连接测试遇到未信任或变化的
-key 时会先打开该弹窗；成功新增或替换后自动重试普通 lease 流程，并依次验证 TCP、
+key 时会先打开该弹窗；路由上的 key 全部受信任后自动重试普通 lease 流程，并依次验证 TCP、
 SSH handshake、host key、配置的认证方式与远端 shell，最后清理专用测试 session。
+从主机记录直接打开信任弹窗不会启动连接测试。删除主机会移除该条 vault 记录及其中存储的
+密码；已有 SSH session 仍保持连接。
 
 达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
 App 会锁定 vault session。凭据、超时与审批边界以
@@ -165,7 +173,7 @@ App 会锁定 vault session。凭据、超时与审批边界以
 
 ## 批准访问
 
-使用主机前先请求 lease：
+未开启 Dangerous Bypass Mode 时，使用主机前先请求 lease：
 
 ```sh
 sloosh request myhost

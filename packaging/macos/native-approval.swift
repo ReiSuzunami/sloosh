@@ -66,11 +66,11 @@ private enum ApprovalMethod: Int {
     var title: String {
         switch self {
         case .touchID:
-            return "Touch ID — fingerprint"
+            return "Touch ID"
         case .pin:
-            return "Sloosh PIN — 6-digit local PIN"
+            return "Sloosh PIN"
         case .masterPassword:
-            return "Master Password — vault password"
+            return "Master Password (vault)"
         }
     }
 }
@@ -311,7 +311,7 @@ private final class HostScopeView: NSView, NSTableViewDataSource, NSTableViewDel
         let height = Self.headerHeight + Self.headerSpacing + listHeight
         super.init(frame: NSRect(x: 0, y: 0, width: ApprovalLayout.contentWidth, height: height))
 
-        let heading = NSTextField(labelWithString: "Hosts in scope")
+        let heading = NSTextField(labelWithString: "Hosts")
         heading.font = .systemFont(ofSize: 12, weight: .semibold)
         heading.textColor = .secondaryLabelColor
         heading.frame = NSRect(
@@ -687,7 +687,7 @@ private final class PINCodeInputView: NSView, NSTextFieldDelegate {
     }
 }
 
-private func promptPin(title: String, message: String) -> Response {
+private func promptPin(title: String, submitTitle: String) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
@@ -696,11 +696,9 @@ private func promptPin(title: String, message: String) -> Response {
         accessibilityDescription: "Sloosh PIN"
     )
     alert.messageText = title
-    alert.informativeText = message
-
-    let input = PINCodeInputView(label: "PIN", autofocus: true)
+    let input = PINCodeInputView(label: "Sloosh PIN (6 digits)", autofocus: true)
     alert.accessoryView = input
-    let continueButton = alert.addButton(withTitle: "Continue")
+    let continueButton = alert.addButton(withTitle: submitTitle)
     continueButton.isEnabled = false
     alert.addButton(withTitle: "Cancel")
     input.onChange = { [weak input, weak continueButton] in
@@ -737,7 +735,11 @@ private func labeledSecureField(
     return (stack, field)
 }
 
-private func promptMasterPassword(purpose: String, confirmation: Bool) -> Response {
+private func promptMasterPassword(
+    purpose: String,
+    confirmation: Bool,
+    submitTitle: String = "Verify"
+) -> Response {
     activateApplication()
     let alert = NSAlert()
     alert.alertStyle = .informational
@@ -745,10 +747,10 @@ private func promptMasterPassword(purpose: String, confirmation: Bool) -> Respon
         systemSymbolName: "lock.shield.fill",
         accessibilityDescription: "Master Password"
     )
-    alert.messageText = confirmation ? "Create Master Password" : "Master Password required"
+    alert.messageText = confirmation ? "Create vault" : purpose
     alert.informativeText = confirmation
-        ? "Protect your Sloosh credential vault. This is separate from the 6-digit approval PIN."
-        : "Authorize \"\(purpose)\" with your vault Master Password, not your approval PIN."
+        ? "Choose a vault Master Password, separate from your Sloosh PIN."
+        : "Enter your vault Master Password, not your Sloosh PIN or macOS login password."
     let firstSection = labeledSecureField(
         label: confirmation ? "New Master Password" : "Master Password",
         placeholder: "Enter vault password"
@@ -786,7 +788,7 @@ private func promptMasterPassword(purpose: String, confirmation: Bool) -> Respon
         DispatchQueue.main.async {
             alert.window.makeFirstResponder(first)
         }
-        alert.addButton(withTitle: "Authorize")
+        alert.addButton(withTitle: submitTitle)
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
             return .error("cancelled", "Master Password input was cancelled")
@@ -835,8 +837,8 @@ private func promptNewPin() -> Response {
         systemSymbolName: "number.circle.fill",
         accessibilityDescription: "Sloosh PIN"
     )
-    alert.messageText = "Create approval PIN"
-    alert.informativeText = "Choose a 6-digit PIN for local SSH approvals."
+    alert.messageText = "Create Sloosh PIN"
+    alert.informativeText = "Choose 6 digits to unlock the vault and approve SSH requests."
     let first = PINCodeInputView(label: "New PIN", autofocus: true)
     let second = PINCodeInputView(label: "Confirm PIN")
     first.nextInput = second
@@ -891,7 +893,7 @@ private func confirm(
     alert.alertStyle = .informational
     alert.icon = applicationIcon()
     alert.messageText = "Approve SSH access"
-    alert.informativeText = "Review all target and ProxyJump hosts below, then approve with one method."
+    alert.informativeText = "Review the targets and jump hosts before approving."
     let hostScope = HostScopeView(hosts: hosts)
     let methodButtons = ApprovalMethodButtonsView(
         touchIDAvailable: enrolledDomainState != nil,
@@ -923,13 +925,14 @@ private func confirm(
     switch selectedMethod {
     case .pin:
         return promptPin(
-            title: "Enter approval PIN",
-            message: "Enter your 6-digit Sloosh approval PIN."
+            title: "Approve SSH access",
+            submitTitle: "Approve"
         )
     case .masterPassword:
         return promptMasterPassword(
-            purpose: "SSH access to \(hosts.joined(separator: ", "))",
-            confirmation: false
+            purpose: "Approve SSH access to \(hosts.joined(separator: ", "))",
+            confirmation: false,
+            submitTitle: "Approve"
         )
     case .touchID:
         guard let enrolledDomainState else {
@@ -1048,7 +1051,7 @@ case "begin_pin_unlock":
     }
     let response = promptPin(
         title: "Unlock Sloosh",
-        message: "Enter your 6-digit Sloosh PIN."
+        submitTitle: "Unlock"
     )
     send(response)
     guard response.type == "pin_entered" else {

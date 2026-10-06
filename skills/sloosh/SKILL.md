@@ -46,11 +46,13 @@ Once the CLI is available, explain the matching authorization setup:
   pending; treat that as human approval, never infer the hidden profile.
 - On macOS with the desktop app, the human uses its Setup and Security screens
   for login Keychain and the possible `Sloosh Approval` prompt. Native lease
-  approval presents direct Touch ID, PIN, and Master Password buttons for
+  approval presents direct Touch ID, Sloosh PIN, and Master Password (vault) buttons for
   scopes that are not system-agent-only.
   The CLI and app then share the app's private daemon. The user handles every
   native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
-  grants one-time access.
+  grants one-time access. The vault Master Password is not the macOS login
+  password. PIN submission uses `Unlock` for desktop access and `Approve` for
+  SSH approval; unlocking Hosts does not approve SSH requests.
 
 Then ask the user to run `sloosh init` themselves in their own terminal, stop,
 and wait. Never run it for them, fake a TTY, or enter a vault password. After
@@ -74,10 +76,11 @@ of guessing.
 Only when the user explicitly chooses this mode, they can start the selected
 local `slooshd --dangerous-bypass-mode` after stopping the existing daemon
 (stopping loses sessions and forwards). Do not enable it merely to fix pending
-approval or unknown-host errors. With that daemon running, `sloosh request`
-automatically grants bounded exact scope without approve; unknown target and
+approval or unknown-host errors. With that daemon running, unknown target and
 jump-host keys are trusted and saved on connection. Changed keys still fail.
-SSH credentials and vault unlock remain required. Startup and bypass grants
+Same-user host operations need no lease request, host scope, token, or renewal.
+`sloosh request` is optional and creates no lease in this mode. SSH credentials
+and vault unlock remain required. Startup and compatibility requests
 appear in `sloosh log`. The user can also explicitly save `dangerous_bypass_mode`
 in protected `vault-settings.json`, or confirm it in desktop Security. GUI saves
 startup policy only; CLI/desktop auto-spawn honor it on the next start. Do not
@@ -91,7 +94,7 @@ or run `sloosh host list`; do not ask them to approve a bypass lease, infer a
 hidden alias, dial its literal name, or work around credential locks. Successful
 human host CRUD/list and initialization populate a bounded daemon cache.
 Expiry/restart requires unlock again; bypass does not save the master password.
-Only verified absence permits SSH-config fallback. GUI/SDK leases bind that
+Only verified absence permits SSH-config fallback. In normal mode, GUI/SDK leases bind that
 client process; CLI leases use a safe parent and never PID 1. Desktop management
 lock does not revoke leases; stopping daemon terminates its authority.
 

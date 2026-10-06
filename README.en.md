@@ -1,8 +1,10 @@
 # sloosh
 
 Dangerous Bypass Mode supports a startup argument and persistent configuration,
-with explicit opt-in in GUI Security (applied on restart; default off). It skips approval
-and trusts unknown host keys automatically. Known-key changes still fail.
+with explicit opt-in in GUI Security (applied on restart; default off). Same-user clients
+have all access without lease requests, scope limits, or renewal. SSH authentication
+and vault unlock remain required. Unknown host keys are trusted automatically;
+known-key changes still fail.
 See [usage and risks](docs/manual.md#dangerous-bypass-mode).
 
 

@@ -9,7 +9,7 @@ page or run `sloosh host list` yourself. Successful host add/edit/remove/list
 and vault initialization also publish verified credentials to the bypass daemon.
 Adding a host works before any lease exists; no second approve/trust is needed.
 The idle limit follows the timeout setting; the hard limit is eight hours.
-Normal reads and lease renewal do not reset that hard limit. Master Password
+Normal reads do not reset that hard limit. Master Password
 is not saved by the daemon. Wrong-password operations never unlock it.
 
 A locked vault cannot tell whether an alias exists: connection and jump
@@ -23,7 +23,7 @@ bypass cache; stop the daemon if immediate shutdown is required.
 
 
 
-Opt in only when you accept unrestricted same-user lease approval and the
+Opt in only when you accept all-access authority for same-user clients and the
 risk of trusting a first-connection attacker. Use the exact `slooshd` selected
 by your CLI (its sibling for command-line installs; on macOS the installed app's
 private helper may take precedence). Stop an existing daemon first; stopping
@@ -34,11 +34,13 @@ sloosh daemon stop
 /path/to/selected/slooshd --dangerous-bypass-mode
 ```
 
-Keep it running. In your working terminal, use `sloosh request myhost`, then
-normal `run`, `put`, `get`, or `forward` commands. No approve popup/terminal
-confirmation is needed. Unknown target and jump-host keys are saved automatically;
+Keep it running. Use `run`, `put`, `get`, or `forward` directly: no lease request,
+host-scope authorization, token, or renewal is needed. `sloosh request myhost`
+remains an optional route/vault-readiness check and creates no lease.
+No approve popup/terminal confirmation is needed. Unknown target and jump-host keys are saved automatically;
 known-key changes still fail. SSH authentication and encrypted-vault unlock
-remain required. Startup and each bypass grant are visible in `sloosh log`;
+remain required. Credential-cache expiry still requires a human unlock, not
+lease renewal. Startup and compatibility requests are visible in `sloosh log`;
 first-use trust is warned in daemon output. This is not a per-call flag.
 
 For persistent opt-in, open desktop **Security → Dangerous Bypass Mode →
@@ -171,11 +173,16 @@ in Applications; the desktop talks to that daemon directly and never shells
 out to the CLI.
 
 Setup installs the embedded Agent Skill and initializes the vault; Security
-configures Touch ID, an optional 6-digit Sloosh PIN, and the shared vault
-timeout. These actions do not import SSH private keys or approve a host.
+configures Touch ID, an optional 6-digit Sloosh PIN, and the shared Idle timeout.
+Enabling Touch ID or PIN stores a protected copy of the vault Master Password
+in the macOS login Keychain. If macOS asks, `Always Allow` avoids repeated
+access prompts for that item; `Allow` grants one-time access. These actions do
+not import SSH private keys or grant SSH access.
 
 Hosts manages the same vault-backed profiles as the CLI. Unlock it with Touch
-ID, the Sloosh PIN, or the Master Password. Master Password and PIN entry stay
+ID, the Sloosh PIN, or the vault Master Password. Native approval labels the
+latter `Master Password (vault)`, not the macOS login password. PIN submission
+uses `Unlock` for desktop access and `Approve` for SSH approval. Master Password and PIN entry stay
 in the bundled native helper and never enter the WebView. An SSH password
 entered in Hosts is transient, crosses the local command boundary as a redacted
 secret, and is cleared after submission. A private-key path can be typed
@@ -185,17 +192,19 @@ Each host row also provides manual host-key trust and an end-to-end connection
 test. Trust shows the exact resolved endpoint, key algorithm, and SHA256
 fingerprint. A changed key shows both stored and newly observed fingerprints
 plus the owning file. Compare the new value with an independent source before
-choosing the direct Add or Replace action. Sloosh re-resolves and re-probes
+choosing `Trust host key` or `Replace host key`. Sloosh re-resolves and re-probes
 before changing only `~/.sloosh/known_hosts`; it never modifies
 `~/.ssh/known_hosts`. If the preview changes, the dialog refreshes without
 writing. ProxyJump keys are presented dependency-first.
 
 `sloosh host trust myhost` provides the same human-only flow in a terminal.
-The connection-test action opens this trust dialog first when needed. After a
-successful Add or Replace, it automatically retries the normal lease flow and
+The connection-test action opens this trust dialog first when needed. After
+all route keys have been trusted, it automatically retries the normal lease flow and
 verifies the TCP connection, SSH handshake, host key,
 configured authentication, and remote shell before cleaning up its reserved
-test session.
+test session. Opening trust directly from a host row does not start a connection
+test. Removing a host deletes its vault entry, including any stored password;
+existing SSH sessions stay open.
 
 The app locks the vault session after its configured idle period and on system
 sleep, screen lock, user switch, manual lock, app exit, or the absolute session
@@ -204,7 +213,7 @@ ceiling. Exact credential, timeout, and approval boundaries belong to
 
 ## Authorize access
 
-Request a lease before using a host:
+Outside Dangerous Bypass Mode, request a lease before using a host:
 
 ```sh
 sloosh request myhost

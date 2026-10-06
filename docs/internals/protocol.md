@@ -1,6 +1,6 @@
 # Local Wire Protocol
 
-The v0.2.8 repair retains protocol 3 and adds no request types. In bypass mode,
+The v0.2.9 update retains protocol 3 and adds no request types. In bypass mode,
 existing InitVault/AddCred/UpdateHost/RmCred/ListHosts operations with verified
 Master Password publish a bounded credential unlock. A cold vault produces an
 Error with unlock guidance, not an approval popup or an incomplete bypass grant.
@@ -11,8 +11,11 @@ are daemon-side authority checks, not caller-supplied identity fields.
 Dangerous Bypass Mode is explicit daemon startup policy (argument or protected
 local configuration), not a wire field. GUI saves config locally, not over IPC.
 It retains protocol 3 framing and negotiation. With the mode enabled,
-`RequestLease` returns existing `Ok` after activating a bounded exact-scope
-lease without human approval; default authorization behavior is unchanged.
+host operations do not require a lease request, token, scope, or renewal.
+`RequestLease` optionally checks route/vault readiness and returns existing `Ok`
+without creating lease state. Authentication and bounded credential unlock are
+unchanged. This is an explicit daemon-local policy change, not a new caller flag
+or a change to message shapes, defaults, framing, or sequencing; normal mode is unchanged.
 
 
 This document specifies the current local client-to-daemon wire contract used
@@ -217,7 +220,7 @@ Behavior:
 
 - Failure before the remote file is ready returns NDJSON `Error` instead of
   `TransferReady`; no raw stream follows.
-- `TransferReady` means the start-time lease check passed and the remote handle
+- `TransferReady` means start-time authorization passed (lease or daemon bypass policy) and the remote handle
   is open. The grant covers this complete in-flight operation; the daemon does
   not reevaluate authorization during the stream.
 - If remote writing fails after readiness, the daemon drains

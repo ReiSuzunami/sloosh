@@ -76,8 +76,8 @@
     if (!snapshot && loading) {
       return {
         tone: 'checking',
-        title: 'Checking local security',
-        description: 'Reading daemon and approval state.',
+        title: 'Checking setup',
+        description: '',
         action: null,
         actionLabel: null,
       };
@@ -86,7 +86,7 @@
       return {
         tone: 'unavailable',
         title: 'Status unavailable',
-        description: 'Local security state could not be read.',
+        description: 'Refresh to check setup.',
         action: 'refresh',
         actionLabel: 'Try again',
       };
@@ -95,7 +95,7 @@
       return {
         tone: 'blocked',
         title: 'Agent Skill required',
-        description: 'The embedded Agent Skill is not installed.',
+        description: 'Install the Agent Skill in Setup.',
         action: 'setup',
         actionLabel: 'Continue setup',
       };
@@ -104,7 +104,7 @@
       return {
         tone: 'blocked',
         title: 'Daemon offline',
-        description: snapshot.daemon.error ?? 'The local daemon is not reachable.',
+        description: snapshot.daemon.error ?? 'Check the daemon in Setup.',
         action: 'setup',
         actionLabel: 'Review setup',
       };
@@ -113,7 +113,7 @@
       return {
         tone: 'blocked',
         title: 'Vault required',
-        description: 'The credential vault has not been created.',
+        description: 'Create a vault with a Master Password.',
         action: 'setup',
         actionLabel: 'Create vault',
       };
@@ -129,8 +129,8 @@
     }
     return {
       tone: 'ready',
-      title: 'Ready for approval',
-      description: 'All local approval requirements are satisfied.',
+      title: 'Setup complete',
+      description: '',
       action: null,
       actionLabel: null,
     };
@@ -202,7 +202,7 @@
     success = null;
     try {
       snapshot = await invoke<AppSnapshot>('set_vault_timeout', { minutes });
-      success = `Vault timeout set to ${minutes} minute${minutes === 1 ? '' : 's'}.`;
+      success = `Idle timeout set to ${minutes} minute${minutes === 1 ? '' : 's'}.`;
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -227,13 +227,13 @@
     try {
       const accepted = await confirm(
         enabled
-          ? 'On the next daemon start, every same-user client can obtain SSH leases without human approval. Unknown host keys will be trusted automatically, allowing a first-connection attacker. SSH credentials and vault unlock remain required. This stays enabled across restarts until you disable it. Save this dangerous setting?'
-          : 'Disable bypass on the next daemon start? Current daemon policy stays unchanged until restarted. Previously trusted host keys remain trusted.',
-        { title: 'Dangerous Bypass Mode', kind: 'warning', okLabel: enabled ? 'Enable on next start' : 'Disable on next start', cancelLabel: 'Cancel' },
+          ? 'All clients under your macOS account:\n• All host access, without lease requests, scope limits, or renewal.\n• Unknown host keys trusted — risk of man-in-the-middle attacks.\n\nSSH credentials and vault unlock are still required.\nApplies on the next daemon start; stays enabled until disabled.\nRestarting ends sessions, forwards, and leases.'
+          : 'Applies on the next daemon start.\n\n• Default system SSH Agent-only requests still authorize automatically.\n• Previously trusted host keys remain trusted.\n• Restarting ends sessions, forwards, and leases.',
+        { title: enabled ? 'Enable Dangerous Bypass Mode?' : 'Disable Dangerous Bypass Mode?', kind: 'warning', okLabel: enabled ? 'Enable on next start' : 'Disable on next start', cancelLabel: 'Cancel' },
       );
       if (!accepted) return;
       snapshot = await invoke<AppSnapshot>('set_dangerous_bypass_mode', { enabled });
-      success = 'Startup policy saved. Run sloosh daemon stop, then sloosh daemon start to apply. Stopping terminates sessions, forwards, and leases.';
+      success = 'Saved for the next daemon start.';
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -367,7 +367,6 @@
   <main id="main-content">
     <header class="topbar">
       <div>
-        <p class="context-label">{view === 'hosts' ? 'Credential vault' : 'SSH approval'}</p>
         <h1>
           {view === 'overview'
             ? 'Overview'
@@ -417,9 +416,8 @@
             {/if}
           </div>
           <div class="readiness-copy">
-            <p class="section-kicker">Security readiness</p>
-            <h2 id="readiness-heading">{readiness.title}</h2>
-            <p>{readiness.description}</p>
+            <h2 id="readiness-heading">{snapshot ? `${readiness.title} · ${setupProgress}/4` : readiness.title}</h2>
+            {#if readiness.description}<p>{readiness.description}</p>{/if}
           </div>
           {#if readiness.action && readiness.actionLabel}
             <button class="secondary-button" onclick={handleReadinessAction}>
@@ -428,6 +426,7 @@
           {/if}
         </div>
 
+        {#if snapshot && readiness.tone === 'blocked'}
         <ul class="readiness-checks" aria-label="Setup requirements">
           <li class:complete={snapshot?.skillReady}>
             <span class="requirement-mark">{#if snapshot?.skillReady}<Check size={12} />{/if}</span>
@@ -446,16 +445,16 @@
           </li>
           <li class:complete={localApprovalReady}>
             <span class="requirement-mark">{#if localApprovalReady}<Check size={12} />{/if}</span>
-            <span>Keychain approval</span>
+            <span>Approval method</span>
             <strong>{localApprovalReady ? 'Ready' : 'Required'}</strong>
           </li>
         </ul>
+        {/if}
       </section>
 
       <section class="activity-strip" aria-labelledby="activity-heading">
         <div>
-          <p class="section-kicker">Current activity</p>
-          <h2 id="activity-heading">Local runtime</h2>
+          <h2 id="activity-heading">Activity</h2>
         </div>
         <dl>
           <div><dt>Sessions</dt><dd>{snapshot?.daemon.sessions ?? '-'}</dd></div>
@@ -467,7 +466,7 @@
       <details class="diagnostics">
         <summary>
           <ChevronRight size={16} />
-          <span><strong>Diagnostics</strong><small>Runtime, protocol, and installation details</small></span>
+          <span><strong>Diagnostics</strong></span>
         </summary>
         <dl class="detail-list">
           <div><dt>Daemon</dt><dd class:positive={snapshot?.daemon.online}>{snapshot?.daemon.online ? `Online - PID ${snapshot.daemon.pid}` : 'Offline'}</dd></div>
@@ -484,29 +483,13 @@
     {:else if view === 'hosts'}
       <HostManager {snapshot} onSetup={() => (view = 'setup')} onUnlockChange={updateVaultUnlock} />
     {:else if view === 'security'}
-      <section class="page-intro" aria-labelledby="approval-heading">
-        <p class="section-kicker">Local verification</p>
-        <h2 id="approval-heading">Approval methods</h2>
-        <p>Password, key-file, and custom-agent scopes show three direct approval buttons. System SSH-agent-only scopes authorize automatically.</p>
-      </section>
-
-      <section class="settings-list" aria-label="Approval methods">
-        <div class="setting-row">
-          <div class="setting-icon"><LockKeyhole size={20} /></div>
-          <div class="setting-copy">
-            <h3>macOS login Keychain</h3>
-            <p>Protects a local vault credential; SSH private keys stay where you configured them</p>
-          </div>
-          <span class:enabled={localApprovalReady} class="state-label">
-            {localApprovalReady ? 'Configured' : 'Set up with a method'}
-          </span>
-        </div>
-
+      <p class="approval-note">Approval is required except for default system SSH Agent-only requests or active bypass.</p>
+      <section class="settings-list" aria-labelledby="approval-heading">
+        <h2 id="approval-heading" class="sr-only">Approval methods</h2>
         <div class="setting-row">
           <div class="setting-icon"><Fingerprint size={20} /></div>
           <div class="setting-copy">
             <h3>Touch ID</h3>
-            <p>System biometric authentication</p>
             {#if approvalBlocker}<span class="constraint">{approvalBlocker}</span>{/if}
           </div>
           <div class="setting-actions">
@@ -532,14 +515,20 @@
           <div class="setting-icon"><KeyRound size={20} /></div>
           <div class="setting-copy">
             <h3>Sloosh PIN</h3>
-            <p>Unlocks this app and approves confirmed SSH requests</p>
             {#if approvalBlocker && snapshot?.pin.state !== 'ready'}<span class="constraint">{approvalBlocker}</span>{/if}
           </div>
           <div class="setting-actions">
             <span class:enabled={snapshot?.pin.state === 'ready'} class="state-label">{pinLabel()}</span>
             {#if snapshot?.pin.state === 'error'}
               <span class="state-detail" title={snapshot.pin.error ?? undefined}>Check local state</span>
-            {:else if snapshot?.pin.state !== 'ready' && snapshot?.pin.state !== 'locked'}
+            {:else if snapshot?.pin.state === 'ready' || snapshot?.pin.state === 'locked'}
+              <button
+                class="secondary-button danger-button"
+                aria-label="Disable PIN"
+                disabled={activeAction !== null}
+                onclick={() => runAction('disable_pin', 'Approval PIN disabled.')}
+              >{activeAction === 'disable_pin' ? 'Disabling...' : 'Disable'}</button>
+            {:else}
               <button
                 class="secondary-button"
                 disabled={Boolean(approvalBlocker) || activeAction !== null}
@@ -553,14 +542,20 @@
         </div>
 
         <div class="setting-row">
+          <div class="setting-icon"><LockKeyhole size={20} /></div>
+          <div class="setting-copy"><h3>Master Password</h3><p>Required to change approval settings.</p></div>
+          <span class:enabled={snapshot?.vaultExists} class="state-label">{snapshot?.vaultExists ? 'Set' : 'Not set'}</span>
+        </div>
+
+        <div class="setting-row">
           <div class="setting-icon"><Clock3 size={20} /></div>
           <div class="setting-copy">
-            <h3>Vault timeout</h3>
-            <p>Locks the desktop vault and idle CLI/Agent leases</p>
+            <h3>Idle timeout</h3>
+            <p>Auto-locks the desktop vault; expires normal-mode idle leases.</p>
           </div>
           <div class="setting-actions">
             <label class="compact-select">
-              <span class="sr-only">Vault timeout</span>
+              <span class="sr-only">Idle timeout</span>
               <select
                 value={snapshot?.vaultTimeoutMinutes ?? 15}
                 disabled={!snapshot?.vaultExists || activeAction !== null}
@@ -579,8 +574,18 @@
       <section class="danger-zone" aria-labelledby="bypass-heading">
         <div>
           <h2 id="bypass-heading">Dangerous Bypass Mode</h2>
-          <p>Skips human approval and trusts unknown SSH host keys for all same-user clients. Known-key changes still fail.</p>
-          <p>Saved startup policy: {snapshot?.dangerousBypassMode == null ? 'Unavailable' : snapshot.dangerousBypassMode ? 'Enabled' : 'Disabled'}. Current daemon is unchanged. Restart to apply; stopping ends sessions, forwards, and leases. In bypass mode, unlock Hosts once to make stored credentials available; its daemon cache has an idle timeout and an eight-hour limit.</p>
+          <p>All host access for every client under your macOS account. No leases or renewal; unknown host keys are trusted automatically.</p>
+          <p class="bypass-risk">First connections risk man-in-the-middle attacks.</p>
+          <p><strong>Saved: {snapshot?.dangerousBypassMode == null ? 'Unavailable' : snapshot.dangerousBypassMode ? 'Enabled' : 'Disabled'}</strong> · Applies on the next daemon start.</p>
+          <details class="bypass-details">
+            <summary>Restart and credential details</summary>
+            <dl class="compact-facts">
+              <div><dt>Restart</dt><dd>Ends sessions, forwards and leases</dd></div>
+              <div><dt>Known keys</dt><dd>Changes still fail</dd></div>
+              <div><dt>Credentials</dt><dd>Unlock Hosts first</dd></div>
+              <div><dt>Cache</dt><dd>Idle timeout; eight-hour maximum. Locking Hosts does not clear it.</dd></div>
+            </dl>
+          </details>
         </div>
         <button
           class="secondary-button danger-button"
@@ -589,37 +594,12 @@
         >{activeAction === 'set_dangerous_bypass_mode' ? 'Saving...' : snapshot?.dangerousBypassMode ? 'Disable on next start' : 'Enable on next start'}</button>
       </section>
 
-      <section class="section-block" aria-labelledby="recovery-heading">
-        <div class="section-heading"><h2 id="recovery-heading">Recovery</h2></div>
-        <div class="setting-row compact">
-          <div class="setting-copy"><h3>Master Password</h3><p>Required to change protected approval settings.</p></div>
-          <span class:enabled={snapshot?.vaultExists} class="state-label">{snapshot?.vaultExists ? 'Set' : 'Not set'}</span>
-        </div>
-      </section>
-
-      {#if snapshot?.pin.state === 'ready' || snapshot?.pin.state === 'locked'}
-        <section class="danger-zone" aria-labelledby="danger-heading">
-          <div>
-            <h2 id="danger-heading">Disable approval PIN</h2>
-            <p>Touch ID remains available when configured.</p>
-          </div>
-          <button
-            class="secondary-button danger-button"
-            disabled={activeAction !== null}
-            onclick={() => runAction('disable_pin', 'Approval PIN disabled.')}
-          >
-            {activeAction === 'disable_pin' ? 'Disabling...' : 'Disable PIN'}
-          </button>
-        </section>
-      {/if}
     {:else}
       <section class="setup-header" aria-labelledby="setup-heading">
         <div>
-          <p class="section-kicker">Guided configuration</p>
-          <h2 id="setup-heading">Local setup</h2>
-          <p>{setupComplete ? 'All required steps are complete.' : 'Complete the remaining security steps.'}</p>
+          <h2 id="setup-heading">{setupComplete ? 'Setup complete' : 'Setup checklist'}</h2>
         </div>
-        <span>{setupProgress} of 4</span>
+        <span>{setupProgress}/4</span>
       </section>
 
       <ol class="setup-flow">
@@ -679,13 +659,13 @@
         <li class:complete={localApprovalReady} class:current={Boolean(snapshot?.vaultExists) && !localApprovalReady}>
           <span class="step-number">{#if localApprovalReady}<Check size={14} />{:else}4{/if}</span>
           <div class="step-copy">
-            <h3>Keychain &amp; local approval</h3>
+            <h3>Approval method</h3>
             <p>
               {localApprovalReady && snapshot?.touchIdEnrolled
-                ? 'Keychain protected with Touch ID'
+                ? 'Touch ID enabled'
                 : localApprovalReady && snapshot?.pin.state === 'ready'
-                  ? 'Keychain protected with Sloosh PIN'
-                  : 'Choose how the native helper unlocks the protected credential'}
+                  ? 'Sloosh PIN enabled'
+                  : 'Choose Touch ID or Sloosh PIN'}
             </p>
             {#if approvalBlocker && !localApprovalReady}<span class="constraint">{approvalBlocker}</span>{/if}
           </div>
@@ -745,52 +725,28 @@
           title="Close"
         ><X size={17} /></button>
         <div>
-          <p class="section-kicker">macOS protection</p>
-          <h2 id="keychain-dialog-title">Allow Sloosh to use your login Keychain</h2>
+          <h2 id="keychain-dialog-title">Set up {pendingApprovalMethod === 'touch_id' ? 'Touch ID' : 'Sloosh PIN'}</h2>
         </div>
       </header>
 
-      <div class="keychain-summary">
-        <span class="keychain-mark"><LockKeyhole size={22} /></span>
-        <p id="keychain-dialog-description">
-          Sloosh stores a protected copy of your vault Master Password in the macOS login Keychain.
-          The bundled native helper uses it only after you authenticate.
-        </p>
+      <p id="keychain-dialog-description" class="keychain-description">
+        Saves your vault Master Password in login Keychain for local authentication.
+      </p>
+
+      <div class="keychain-access">
+        <p>If macOS asks about <strong>Sloosh Approval</strong>:</p>
+        <dl class="compact-facts">
+          <div><dt>Allow</dt><dd>One-time access</dd></div>
+          <div><dt>Always Allow</dt><dd>Future access to this item</dd></div>
+        </dl>
       </div>
 
-      <ol class="keychain-steps">
-        <li><span>1</span><p>Confirm your Master Password in a native Sloosh window.</p></li>
-        <li>
-          <span>2</span>
-          <p>
-            If macOS asks whether <strong>Sloosh Approval</strong> may access the Keychain item,
-            choose <strong>Always Allow</strong> on your Mac to avoid repeated prompts, or
-            <strong>Allow</strong> for one-time access.
-          </p>
-        </li>
-        <li>
-          <span>3</span>
-          <p>
-            {pendingApprovalMethod === 'touch_id'
-              ? 'Authenticate with Touch ID. Adding or removing fingerprints requires re-enrollment.'
-              : 'Create and confirm a six-digit Sloosh PIN. Its verifier stays on this Mac.'}
-          </p>
-        </li>
-      </ol>
-
-      <div class="keychain-boundary">
-        <ShieldCheck size={17} />
-        <p>
-          This does not import SSH private keys or approve a host. Every future request still shows
-          its exact host scope before authentication. Master Password and PIN stay out of this WebView.
-        </p>
-      </div>
+      <p class="keychain-note">Does not grant SSH access or import SSH keys.</p>
 
       <footer>
         <button type="button" class="secondary-button" onclick={dismissApprovalSetup}>Cancel</button>
         <button type="button" class="primary-button" onclick={continueApprovalSetup}>
-          {pendingApprovalMethod === 'touch_id' ? 'Continue with Touch ID' : 'Continue to create PIN'}
-          <ChevronRight size={16} />
+          Continue
         </button>
       </footer>
     </div>
