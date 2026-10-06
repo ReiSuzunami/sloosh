@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::Pty;
-use russh::keys::{Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{
+    Algorithm, HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -395,11 +397,17 @@ impl russh::client::Handler for Handler {
     /// sloosh's own `~/.sloosh/known_hosts` (docs/internals/architecture.md). A mismatch in
     /// either file is a hard refusal — never silently fall through to the
     /// other file once a *different* key has been recorded for this host.
-    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
+    async fn check_server_key(
+        &mut self,
+        server_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, SshError> {
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server_key else {
+            return Ok(false);
+        };
         verify_server_key_with_policy_at_paths(
             &self.host,
             self.port,
-            server_public_key,
+            key,
             &ssh_known_hosts_path(),
             &sloosh_known_hosts_path(),
             super::dangerous_bypass_enabled(),
@@ -550,9 +558,15 @@ struct KeyCapturingHandler {
 impl russh::client::Handler for KeyCapturingHandler {
     type Error = SshError;
 
-    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, SshError> {
+    async fn check_server_key(
+        &mut self,
+        server_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, SshError> {
+        let PublicKeyOrCertificate::PublicKey { key, .. } = server_key else {
+            return Ok(false);
+        };
         let mut guard = self.captured.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(server_public_key.clone());
+        *guard = Some(key.clone());
         Ok(true)
     }
 }

@@ -99,10 +99,41 @@ fn vault_key_file_rejects_unsupported_encryption_and_oversized_files() {
 }
 
 struct TestClient;
+
+#[tokio::test]
+async fn host_key_probe_rejects_certificates_without_capturing_subject_key() {
+    let key = ed25519_key();
+    let mut builder = ssh_key::certificate::Builder::new(
+        vec![0; 16],
+        key.public_key().key_data().clone(),
+        0,
+        u64::MAX,
+    )
+    .unwrap();
+    builder
+        .cert_type(ssh_key::certificate::CertType::Host)
+        .unwrap();
+    builder.all_principals_valid().unwrap();
+    let certificate = PublicKeyOrCertificate::Certificate(builder.sign(&key).unwrap());
+    let captured = Arc::new(Mutex::new(None));
+    let mut handler = KeyCapturingHandler {
+        captured: captured.clone(),
+    };
+    assert!(
+        !russh::client::Handler::check_server_key(&mut handler, &certificate)
+            .await
+            .unwrap()
+    );
+    assert!(captured.lock().unwrap().is_none());
+}
+
 impl russh::client::Handler for TestClient {
     type Error = russh::Error;
-    async fn check_server_key(&mut self, _: &PublicKey) -> Result<bool, Self::Error> {
-        Ok(true)
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(matches!(key, PublicKeyOrCertificate::PublicKey { .. }))
     }
 }
 

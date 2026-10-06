@@ -48,6 +48,8 @@ Unknown SSH host keys, including ProxyJump hops, are automatically persisted
 in Sloosh's protected known_hosts store on first connection. This forfeits
 independent fingerprint verification and permits a first-connection MITM.
 Existing key mismatches and trust-store write failures still fail closed.
+Only plain SSH host keys are supported; host certificates do not establish CA trust
+and are rejected, including in bypass mode.
 Automatically added keys remain trusted after disabling this mode.
 
 The mode is daemon startup policy, never a caller-supplied IPC flag. It defaults
