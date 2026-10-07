@@ -83,7 +83,7 @@ async fn dangerous_bypass_is_explicit_daemon_startup_policy() {
             .unwrap();
         if enabled {
             assert!(
-                matches!(response,Response::Error { message } if message.contains("vault is locked"))
+                matches!(response,Response::Error { message } if message.contains("automatic Keychain unlock failed") && message.contains("no host approval was requested"))
             );
         } else {
             assert!(matches!(response, Response::LeaseRequestPending(_)));
