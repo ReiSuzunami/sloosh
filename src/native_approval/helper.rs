@@ -22,6 +22,7 @@ const HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) enum HelperRequest<'a> {
     Status,
     UnlockWithTouchId,
+    UnlockFromKeychain,
     BeginPinUnlock,
     CompletePinUnlock {
         verified: bool,

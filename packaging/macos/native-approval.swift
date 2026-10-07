@@ -236,10 +236,15 @@ private func enroll(password: String) -> Response {
     return response.type == "credential_stored" ? .simple("enrolled") : response
 }
 
-private func loadCredential() -> CredentialResult {
+private func loadCredential(allowInteraction: Bool = true) -> CredentialResult {
     var query = keychainBaseQuery()
     query[kSecReturnData] = true
     query[kSecMatchLimit] = kSecMatchLimitOne
+    if !allowInteraction {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext] = context
+    }
 
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -1009,6 +1014,18 @@ case "status":
             exit(0)
         }
         send(response)
+        exit(1)
+    }
+
+case "unlock_from_keychain":
+    switch loadCredential(allowInteraction: false) {
+    case .success(let credential):
+        send(.unlocked(credential.masterPassword))
+        exit(0)
+    case .failure(let response):
+        send(response.code == "not_enrolled"
+            ? .error("keychain", "No stored Sloosh Keychain credential; enable Touch ID or PIN in Security")
+            : response)
         exit(1)
     }
 

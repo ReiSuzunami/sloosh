@@ -89,11 +89,16 @@ setting and restart without the flag; saved trust remains. Default is off.
 
 ## Locked credentials and process ownership
 
-In bypass mode, VaultLocked means the human must unlock the desktop Hosts page
+Dangerous Bypass Mode automatically unlocks from the existing macOS Sloosh
+Keychain credential after restart or cache expiry; no separate switch exists.
+Keychain failure returns a specific error without a popup;
+ask the user to repair enrollment in Security, not approve a lease.
+Without a usable helper/Keychain credential, the human can explicitly unlock the desktop Hosts page
 or run `sloosh host list`; do not ask them to approve a bypass lease, infer a
 hidden alias, dial its literal name, or work around credential locks. Successful
 human host CRUD/list and initialization populate a bounded daemon cache.
-Expiry/restart requires unlock again; bypass does not save the master password.
+Expiry/restart requires verified unlock again (automatic in bypass mode);
+the daemon does not save the master password.
 Only verified absence permits SSH-config fallback. In normal mode, GUI/SDK leases bind that
 client process; CLI leases use a safe parent and never PID 1. Desktop management
 lock does not revoke leases; stopping daemon terminates its authority.

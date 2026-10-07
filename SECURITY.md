@@ -12,8 +12,21 @@ Reads and new leases cannot reset its absolute lifetime. The existing reaper
 and access checks expire it even without active leases. Normal mode remains
 lease-owned; dropping the last lease clears only lease-owned cache.
 
+Dangerous Bypass Mode includes lazy automatic vault decryption. The
+bundled macOS helper reads the existing Sloosh login-Keychain credential with
+Keychain interaction explicitly forbidden; there is no Touch ID/PIN/password
+prompt or host-approval fallback. Missing, inaccessible or stale credentials
+fail closed with a Keychain-specific error. No second credential store is added.
+The daemon verifies the credential against the current encrypted vault before
+publishing the same bounded cache; concurrent cold requests share one unlock.
+Expiry clears memory, but the next connection may unlock again. Thus expiry is
+not an ongoing human-presence boundary in bypass mode: every same-user
+client can use vault credentials after restart or expiry without manual unlock.
+Normal mode never invokes this automatic path. GUI management unlock is separate.
+
 A locked vault is not an absent profile. Target and jump resolution fail with
-VaultLocked before network access, including SSH-config-only hosts while a
+a locked-vault or automatic-Keychain-unlock error before network access,
+including SSH-config-only hosts while a
 vault exists but is locked. Verified absence, or no vault, permits normal
 config/literal fallback. No plaintext alias index is stored.
 
@@ -42,7 +55,8 @@ route/vault-readiness check returning `Ok` without creating pending or active le
 Internal forwarding handles recheck the startup policy rather than lease expiry;
 manual stop, route lifecycle, and connection failures still apply.
 All SSH authentication methods remain available. SSH login credentials are still
-required; encrypted vaults still require unlock, with their existing cache limits.
+required; encrypted vaults still require verified decryption, with their existing
+cache limits. Bypass automatically supplies that decryption from Keychain.
 
 Unknown SSH host keys, including ProxyJump hops, are automatically persisted
 in Sloosh's protected known_hosts store on first connection. This forfeits

@@ -5,6 +5,7 @@ with explicit opt-in in GUI Security (applied on restart; default off). Same-use
 have all access without lease requests, scope limits, or renewal. SSH authentication
 and vault unlock remain required. Unknown host keys are trusted automatically;
 known-key changes still fail.
+On macOS, bypass automatically unlocks from the existing Keychain credential after restart or cache expiry.
 See [usage and risks](docs/manual.md#dangerous-bypass-mode).
 
 

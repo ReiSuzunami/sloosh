@@ -3,6 +3,7 @@
 Dangerous Bypass Mode 支持启动参数与持久配置，GUI Security 可显式开启（重启生效）：
 本地 daemon 允许同一系统用户全访问：无需申请或续约 lease，不限制授权主机范围；
 SSH 登录认证与 vault 解锁仍需完成。未知主机自动信任，默认关闭。
+macOS bypass 自动用现有 Keychain 凭据解锁，重启／缓存过期后无需手动解锁。
 已知密钥变更仍拒绝。见[用法与风险](docs/manual.zh-CN.md#dangerous-bypass-mode)。
 
 

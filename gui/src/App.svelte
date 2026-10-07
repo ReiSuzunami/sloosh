@@ -227,7 +227,7 @@
     try {
       const accepted = await confirm(
         enabled
-          ? 'All clients under your macOS account:\n• All host access, without lease requests, scope limits, or renewal.\n• Unknown host keys trusted — risk of man-in-the-middle attacks.\n\nSSH credentials and vault unlock are still required.\nApplies on the next daemon start; stays enabled until disabled.\nRestarting ends sessions, forwards, and leases.'
+          ? 'All clients under your macOS account:\n• All host access, without lease requests, scope limits, or renewal.\n• Unknown host keys trusted — risk of man-in-the-middle attacks.\n• Vault credentials usable without manual unlock, including after restart or cache expiry.\n\nUses the existing Sloosh Keychain credential. Access failures return an error, without a popup. SSH authentication is still required.\nApplies on the next daemon start; stays enabled until disabled.\nRestarting ends sessions, forwards, and leases.'
           : 'Applies on the next daemon start.\n\n• Default system SSH Agent-only requests still authorize automatically.\n• Previously trusted host keys remain trusted.\n• Restarting ends sessions, forwards, and leases.',
         { title: enabled ? 'Enable Dangerous Bypass Mode?' : 'Disable Dangerous Bypass Mode?', kind: 'warning', okLabel: enabled ? 'Enable on next start' : 'Disable on next start', cancelLabel: 'Cancel' },
       );
@@ -582,8 +582,8 @@
             <dl class="compact-facts">
               <div><dt>Restart</dt><dd>Ends sessions, forwards and leases</dd></div>
               <div><dt>Known keys</dt><dd>Changes still fail</dd></div>
-              <div><dt>Credentials</dt><dd>Unlock Hosts first</dd></div>
-              <div><dt>Cache</dt><dd>Idle timeout; eight-hour maximum. Locking Hosts does not clear it.</dd></div>
+              <div><dt>Credentials</dt><dd>Automatically unlocked from the existing Sloosh Keychain credential; access failures return an error without a popup</dd></div>
+              <div><dt>Cache</dt><dd>Idle timeout; eight-hour maximum, then automatic re-unlock. Locking Hosts does not clear it.</dd></div>
             </dl>
           </details>
         </div>

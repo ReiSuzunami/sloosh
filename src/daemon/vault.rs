@@ -295,6 +295,10 @@ impl fmt::Debug for AuthMethod {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
+    #[error(
+        "bypass automatic Keychain unlock failed: {0}; configure the existing Sloosh Keychain credential in the app's Security page — no host approval was requested"
+    )]
+    AutomaticUnlock(String),
     #[error("credential inventory worker failed: {0}")]
     InventoryWorker(#[from] tokio::task::JoinError),
     #[error(
@@ -1004,6 +1008,46 @@ pub(crate) async fn expire_bypass_cache() {
     expire_bypass_at(&mut *cache().lock().await, Instant::now());
 }
 
+/// Lazy unlock for SSH resolution in bypass mode only. Normal mode never
+/// reads Keychain. Lifecycle serialization coalesces concurrent requests
+/// and prevents mutations from racing the verified cache publication.
+pub(crate) async fn ensure_bypass_unlocked() -> Result<(), VaultError> {
+    if !crate::daemon::dangerous_bypass_enabled() || !exists() || is_cached().await {
+        return Ok(());
+    }
+    unlock_bypass_with(crate::native_approval::unlock_from_keychain).await
+}
+
+async fn unlock_bypass_with<F, Fut>(load: F) -> Result<(), VaultError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<
+        Output = Result<crate::proto::SecretString, crate::native_approval::NativeApprovalError>,
+    >,
+{
+    let _lifecycle = cache_lifecycle_lock().lock().await;
+    if is_cached().await {
+        return Ok(());
+    }
+    let password = load()
+        .await
+        .map_err(|error| VaultError::AutomaticUnlock(error.to_string()))?;
+    let _mutation = vault_mutation_lock().lock().await;
+    let (data, kdf, key) = tokio::task::spawn_blocking(move || {
+        let _writer = vault_writer_guard();
+        unlock_material_at(&vault_path(), password.expose_secret().as_bytes())
+    })
+    .await?
+    .map_err(|error| match error {
+        VaultError::WrongPassword => VaultError::AutomaticUnlock(
+            "stored Keychain credential does not decrypt the vault".into(),
+        ),
+        error => error,
+    })?;
+    publish_verified(data, kdf, key, true).await;
+    Ok(())
+}
+
 /// Existing human RPCs provide verified decryption, never host approval.
 pub(crate) async fn initialize_verified(password: &[u8]) -> Result<(), VaultError> {
     let _lifecycle = cache_lifecycle_lock().lock().await;
@@ -1252,6 +1296,65 @@ pub(crate) fn cache_test_lock() -> &'static AsyncMutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn automatic_unlock_coalesces_and_reloads_after_expiry() {
+        let _guard = cache_test_lock().lock().await;
+        clear_cache().await;
+        let path = vault_path();
+        let _ = std::fs::remove_file(&path);
+        let mut data = VaultData::default();
+        data.hosts.insert("web".into(), sample_entry());
+        create_at(&path, &data, b"fixture").unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let load = || async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Ok(crate::proto::SecretString::new("fixture"))
+        };
+        let (first, second) = tokio::join!(unlock_bypass_with(load), unlock_bypass_with(load));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(lookup_entry("web").await, EntryLookup::Entry(_)));
+
+        let mut updated = sample_entry();
+        updated.hostname = "new.example".into();
+        add_entry_at(&path, "new", updated, b"fixture", false)
+            .await
+            .unwrap();
+        for hard_expiry in [false, true] {
+            let now = Instant::now();
+            cache().lock().await.as_mut().unwrap().owner = CacheOwner::BypassUnlock {
+                created_at: if hard_expiry {
+                    now - crate::daemon::lease::MAX_LIFETIME
+                } else {
+                    now
+                },
+                last_used: now - crate::daemon::lease::configured_idle_timeout(),
+            };
+            assert!(!is_cached().await);
+            unlock_bypass_with(load).await.unwrap();
+            assert!(
+                matches!(lookup_entry("new").await, EntryLookup::Entry(entry) if entry.hostname == "new.example")
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        clear_cache().await;
+        let error = unlock_bypass_with(|| async { Ok(crate::proto::SecretString::new("wrong")) })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VaultError::AutomaticUnlock(_)));
+        assert!(!is_cached().await);
+        let error = unlock_bypass_with(|| async {
+            Err(crate::native_approval::NativeApprovalError::Unavailable)
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VaultError::AutomaticUnlock(_)));
+        assert!(!is_cached().await);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn bypass_cache_has_independent_bounded_ownership() {

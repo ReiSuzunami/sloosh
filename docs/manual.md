@@ -4,8 +4,19 @@
 
 ### Credential unlock in bypass mode
 
-After a daemon restart or credential-cache expiry, unlock the desktop Hosts
-page or run `sloosh host list` yourself. Successful host add/edit/remove/list
+On macOS, Dangerous Bypass Mode automatically uses the existing Sloosh Keychain
+credential, enrolled through Touch ID or PIN. Enabling bypass accepts that every
+same-user client can use vault credentials without manual unlock after daemon
+restart or cache expiry. There is no separate automatic-unlock setting.
+Cold connection/route resolution silently reads Keychain and verifies the
+current vault. No additional password is saved. Keychain access failure or an
+outdated credential returns a specific error without any prompt or approval
+fallback. Cache limits remain; the next connection can unlock again.
+Normal mode and desktop management-page authentication are unchanged.
+
+On installations without the bundled helper or a usable Keychain credential,
+you can explicitly unlock the desktop Hosts page or run `sloosh host list`
+yourself; the daemon never opens a fallback prompt. Successful host add/edit/remove/list
 and vault initialization also publish verified credentials to the bypass daemon.
 Adding a host works before any lease exists; no second approve/trust is needed.
 The idle limit follows the timeout setting; the hard limit is eight hours.
@@ -13,7 +24,8 @@ Normal reads do not reset that hard limit. Master Password
 is not saved by the daemon. Wrong-password operations never unlock it.
 
 A locked vault cannot tell whether an alias exists: connection and jump
-resolution report VaultLocked rather than trying another destination. This
+resolution fails before network access rather than trying another destination.
+In bypass, automatic-unlock failure returns the specific Keychain error. This
 also applies to config-only hosts while an encrypted vault is locked. After
 unlock, truly absent profiles still follow SSH config/system Agent normally.
 Existing SSH connections keep their original connection; edits affect new
@@ -39,8 +51,8 @@ host-scope authorization, token, or renewal is needed. `sloosh request myhost`
 remains an optional route/vault-readiness check and creates no lease.
 No approve popup/terminal confirmation is needed. Unknown target and jump-host keys are saved automatically;
 known-key changes still fail. SSH authentication and encrypted-vault unlock
-remain required. Credential-cache expiry still requires a human unlock, not
-lease renewal. Startup and compatibility requests are visible in `sloosh log`;
+remain required; bypass attempts automatic Keychain unlock after cache expiry,
+not lease renewal. Startup and compatibility requests are visible in `sloosh log`;
 first-use trust is warned in daemon output. This is not a per-call flag.
 
 For persistent opt-in, open desktop **Security → Dangerous Bypass Mode →

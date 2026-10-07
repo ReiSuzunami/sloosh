@@ -78,6 +78,8 @@ pub enum SshError {
     )]
     VaultLocked,
     #[error(transparent)]
+    Vault(#[from] vault::VaultError),
+    #[error(transparent)]
     Config(#[from] SshConfigError),
 
     #[error(
@@ -863,6 +865,7 @@ pub(crate) async fn connect_with_route(
 /// Capture endpoint and auth together. A locked vault is not an absent alias;
 /// config fallback is allowed only when absence is actually known.
 async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<ResolvedHost, SshError> {
+    vault::ensure_bypass_unlocked().await?;
     match vault::lookup_entry(alias).await {
         vault::EntryLookup::Locked => Err(SshError::VaultLocked),
         vault::EntryLookup::Absent => Ok(ResolvedHost {

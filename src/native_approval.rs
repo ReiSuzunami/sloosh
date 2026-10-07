@@ -110,6 +110,22 @@ pub fn is_available() -> bool {
         .is_some_and(|path| validate_helper(path).is_ok())
 }
 
+/// Read the existing Keychain credential without UI or human approval.
+/// Only the daemon's explicit Dangerous Bypass Mode uses this path.
+pub(crate) async fn unlock_from_keychain() -> Result<SecretString, NativeApprovalError> {
+    let mut helper = HelperProcess::spawn().await?;
+    match helper.exchange(&HelperRequest::UnlockFromKeychain).await? {
+        HelperResponse::Unlocked { master_password } => {
+            helper.finish().await?;
+            Ok(master_password)
+        }
+        HelperResponse::Error { code, message } => Err(map_helper_error(code, message)),
+        _ => Err(NativeApprovalError::InvalidData(
+            "unexpected Keychain unlock response".into(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeApprovalStatus {
     pub touch_id_enrolled: bool,

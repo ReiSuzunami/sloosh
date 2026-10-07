@@ -27,6 +27,12 @@ with `dangerous_bypass_mode` from the protected `vault-settings.json` store.
 Missing file/field defaults off; invalid settings fail startup. CLI/desktop
 auto-spawn honor this persistent opt-in. The GUI explicitly confirms and saves
 the setting, without restarting or mutating the running daemon.
+Bypass includes automatic credential unlock. SSH target/jump resolution lazily invokes
+the bundled helper's `unlock_from_keychain` request when the vault cache is cold.
+Keychain interaction is forbidden. The existing lifecycle/mutation locks serialize
+credential verification and bounded cache publication; current disk contents are
+decrypted on every new unlock. No CLI wire request or protocol bump is introduced.
+Normal mode and desktop management authentication retain their human gates.
 The socket-owning daemon latches the
 startup policy before serving clients. Wire request shapes and protocol 3
 negotiation remain unchanged. Host operations skip lease authorization entirely:

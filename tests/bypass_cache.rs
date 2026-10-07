@@ -68,6 +68,55 @@ fn add(alias: &str) -> Request {
 }
 
 #[tokio::test]
+async fn auto_unlock_is_bypass_only_and_missing_helper_fails_without_approval() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home(std::env::temp_dir().join(format!("sloosh-a-{:x}", rand::random::<u32>())));
+    std::fs::create_dir(&home.0).unwrap();
+    std::fs::set_permissions(&home.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (child, client) = start(&home.0, false).await;
+    assert_eq!(
+        client
+            .request(&Request::InitVault {
+                master_password: master()
+            })
+            .await
+            .unwrap(),
+        Response::Ok
+    );
+    assert_eq!(
+        client.request(&add("existing.invalid")).await.unwrap(),
+        Response::Ok
+    );
+    let run = Request::Run {
+        host: "existing.invalid".into(),
+        command: "true".into(),
+        session: None,
+        timeout_secs: 1,
+        raw: false,
+        lease_token: None,
+    };
+    assert!(
+        matches!(client.request(&run).await.unwrap(), Response::Error { message } if message.contains("sloosh request") && !message.contains("Keychain"))
+    );
+    stop(child, client).await;
+    let (child, client) = start(&home.0, true).await;
+    for request in [
+        run,
+        Request::RequestLease {
+            hosts: vec!["existing.invalid".into()],
+        },
+    ] {
+        assert!(
+            matches!(client.request(&request).await.unwrap(), Response::Error { message } if message.contains("automatic Keychain unlock failed") && message.contains("no host approval was requested"))
+        );
+    }
+    assert!(
+        matches!(client.request(&Request::Status).await.unwrap(), Response::Status(status) if status.leases.is_empty())
+    );
+    stop(child, client).await;
+}
+
+#[tokio::test]
 async fn bypass_human_operations_unlock_new_and_existing_credentials_without_approval() {
     use std::os::unix::fs::PermissionsExt;
     let home = Home(std::env::temp_dir().join(format!("sloosh-c-{:x}", rand::random::<u32>())));
@@ -106,11 +155,11 @@ async fn bypass_human_operations_unlock_new_and_existing_credentials_without_app
         hosts: vec!["added.invalid".into()],
     };
     assert!(
-        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("vault is locked"))
+        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("automatic Keychain unlock failed"))
     );
     assert!(matches!(
         client.request(&run("existing.invalid")).await.unwrap(),
-        Response::Error { message } if message.contains("vault is locked")
+        Response::Error { message } if message.contains("automatic Keychain unlock failed")
     ));
     // First add before any active lease must publish a bounded unlock.
     assert_eq!(
@@ -132,7 +181,7 @@ async fn bypass_human_operations_unlock_new_and_existing_credentials_without_app
     // Restart forgets the key, not the encrypted records.
     let (child, client) = start(&home.0, true).await;
     assert!(
-        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("vault is locked"))
+        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("automatic Keychain unlock failed"))
     );
     assert!(matches!(
         client
@@ -144,7 +193,7 @@ async fn bypass_human_operations_unlock_new_and_existing_credentials_without_app
         Response::Error { .. }
     ));
     assert!(
-        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("vault is locked"))
+        matches!(client.request(&request()).await.unwrap(),Response::Error{message} if message.contains("automatic Keychain unlock failed"))
     );
     assert!(
         matches!(client.request(&Request::ListHosts{master_password:master()}).await.unwrap(),Response::Hosts{hosts} if hosts.len()==2)
