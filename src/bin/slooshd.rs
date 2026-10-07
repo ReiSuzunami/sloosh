@@ -12,6 +12,8 @@ struct Args {
     /// DANGER: disable lease authorization and automatically trust unknown host keys.
     /// Known-key mismatches still fail; SSH authentication and vault encryption remain.
     /// All same-user host access without lease requests, scope limits, or renewal.
+    /// On macOS, use the existing Keychain credential to unlock without UI,
+    /// including after restart or cache expiry; access failures return an error.
     /// Also enabled by dangerous_bypass_mode in local vault-settings.json; default off.
     #[arg(long)]
     dangerous_bypass_mode: bool,
