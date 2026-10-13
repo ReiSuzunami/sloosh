@@ -57,15 +57,14 @@ impl WarningLimiter {
             return WarningAction::Emit { suppressed };
         }
 
-        if self.entries.len() >= MAX_WARNING_KEYS {
-            if let Some(oldest) = self
+        if self.entries.len() >= MAX_WARNING_KEYS
+            && let Some(oldest) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.window_start)
                 .map(|(key, _)| *key)
-            {
-                self.entries.remove(&oldest);
-            }
+        {
+            self.entries.remove(&oldest);
         }
         self.entries.insert(
             key,

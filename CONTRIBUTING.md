@@ -5,11 +5,11 @@ changes and test their failure paths.
 
 ## Setup
 
-Requires current stable Rust plus MSRV 1.85. The
+Requires current stable Rust plus MSRV 1.89. The
 [README](README.en.md#build-from-source) covers checkout and release builds.
 
 ```sh
-rustup toolchain install stable 1.85.0
+rustup toolchain install stable 1.89.0
 cargo build --bins
 ```
 
@@ -25,7 +25,7 @@ Run before opening a pull request:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
-cargo +1.85.0 check --all-targets --all-features --locked
+cargo +1.89.0 check --all-targets --all-features --locked
 pnpm --dir gui install --frozen-lockfile
 pnpm --dir gui check
 pnpm --dir gui test:unit
@@ -46,7 +46,7 @@ done
 git diff --check
 ```
 
-Root CLI/daemon code retains MSRV 1.85. The isolated Tauri crate uses current
+Root CLI/daemon code retains MSRV 1.89. The isolated Tauri crate uses current
 stable Rust and its own lockfile. Install
 [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) before running the
 dependency checks. All commands must pass. Hosted CI repeats formatting, lint,

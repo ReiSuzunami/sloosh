@@ -14,7 +14,7 @@ relative symlink to this file.
 
 `sloosh` is a security-sensitive Rust 2024 CLI and daemon for persistent SSH
 sessions, human-approved host leases, SFTP, and forwarding on macOS and Linux.
-MSRV is Rust 1.85; runtime is Tokio with `russh` and `russh-sftp`.
+MSRV is Rust 1.89; runtime is Tokio with `russh` and `russh-sftp`.
 
 Read each owner relevant to the change:
 
@@ -82,7 +82,7 @@ pattern. Do not broaden forwarding, filesystem, or credential authority.
 
 ## Rust and tests
 
-- Keep rustfmt and strict Clippy clean; preserve Rust 1.85 compatibility.
+- Keep rustfmt and strict Clippy clean; preserve Rust 1.89 compatibility.
 - Prefer typed errors and self-teaching messages over string parsing.
 - Bound attacker-controlled lengths before allocation.
 - Keep `unsafe` minimal with a concrete `SAFETY` comment.

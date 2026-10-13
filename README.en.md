@@ -54,7 +54,7 @@ You are my sloosh installation guide.
 1. Detect the OS and architecture, then run `command -v sloosh && sloosh --version`.
    Use only `https://github.com/ReiSuzunami/sloosh`. If sloosh is missing or old,
    choose Homebrew or the matching command-line archive and verify
-   `SHA256SUMS`, or explain the Rust 1.85+ source build when no release exists.
+   `SHA256SUMS`, or explain the Rust 1.89+ source build when no release exists.
    The macOS DMG is an optional desktop control plane and does not provide the
    CLI. Ask before installing anything. Never use `curl | sh`, silently invoke
    a package manager, bypass platform protections, request/display passwords,
@@ -75,7 +75,7 @@ the first connection.
 
 ## Build from source
 
-Requires Rust 1.85+ and a C/C++ build toolchain:
+Requires Rust 1.89+ and a C/C++ build toolchain:
 
 ```sh
 git clone https://github.com/ReiSuzunami/sloosh.git

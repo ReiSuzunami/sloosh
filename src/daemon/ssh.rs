@@ -1357,10 +1357,10 @@ fn apply_proxy_jump_overrides(spec: &str, cfg: &mut HostConfig) {
     if let Some(user) = user_part {
         cfg.user = user.to_string();
     }
-    if let Some((_, port_str)) = host_part.split_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            cfg.port = port;
-        }
+    if let Some((_, port_str)) = host_part.split_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        cfg.port = port;
     }
 }
 

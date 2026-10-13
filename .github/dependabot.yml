@@ -29,7 +29,7 @@ updates:
         update-types:
           - patch
 
-  # Tauri has an independent manifest, lockfile, and Rust 1.88 floor.
+  # Tauri has an independent manifest, lockfile, and Rust 1.89 floor.
   - package-ecosystem: cargo
     directory: "/gui/src-tauri"
     schedule:

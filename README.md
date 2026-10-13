@@ -47,7 +47,7 @@ Homebrew、crates.io 与命令行压缩包提供 `sloosh` 和配套 `slooshd`，
 1. 检测操作系统与架构，执行 `command -v sloosh && sloosh --version`。仅使用官方仓库
    `https://github.com/ReiSuzunami/sloosh`。若未安装或版本过旧，检查最新 Release：
    为 CLI 选择 Homebrew 或对应命令行压缩包并验证 `SHA256SUMS`；没有 Release 时说明
-   Rust 1.85+ 源码构建方案。macOS DMG 是可选桌面控制面，不提供 CLI。任何安装前先
+   Rust 1.89+ 源码构建方案。macOS DMG 是可选桌面控制面，不提供 CLI。任何安装前先
    征得我同意。禁止 `curl | sh`、静默调用包管理器、绕过平台保护，禁止索取或显示
    密码、SSH 密钥、vault secret 或 lease token。不要直接运行 `slooshd`。
 2. CLI 可用后，解释 `sloosh init`，让我在自己的交互式终端运行。你不得代跑、伪造
@@ -62,7 +62,7 @@ Homebrew、crates.io 与命令行压缩包提供 `sloosh` 和配套 `slooshd`，
 
 ## 从源码构建
 
-需要 Rust 1.85+ 与 C/C++ 构建工具链：
+需要 Rust 1.89+ 与 C/C++ 构建工具链：
 
 ```sh
 git clone https://github.com/ReiSuzunami/sloosh.git

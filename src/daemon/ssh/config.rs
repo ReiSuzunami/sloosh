@@ -544,37 +544,27 @@ impl SshConfig {
             if config.host_key_alias.is_none() {
                 config.host_key_alias.clone_from(&block.host_key_alias);
             }
-            if !hostname_set {
-                if let Some(hostname) = &block.hostname {
-                    config.hostname.clone_from(hostname);
-                    hostname_set = true;
-                }
+            if !hostname_set && let Some(hostname) = &block.hostname {
+                config.hostname.clone_from(hostname);
+                hostname_set = true;
             }
-            if !port_set {
-                if let Some(port) = block.port {
-                    config.port = port;
-                    port_set = true;
-                }
+            if !port_set && let Some(port) = block.port {
+                config.port = port;
+                port_set = true;
             }
-            if !user_set {
-                if let Some(user) = &block.user {
-                    config.user.clone_from(user);
-                    user_set = true;
-                }
+            if !user_set && let Some(user) = &block.user {
+                config.user.clone_from(user);
+                user_set = true;
             }
-            if !proxy_jump_set {
-                if let Some(proxy_jump) = &block.proxy_jump {
-                    if !proxy_jump.eq_ignore_ascii_case("none") {
-                        config.proxy_jump = Some(proxy_jump.clone());
-                    }
-                    proxy_jump_set = true;
+            if !proxy_jump_set && let Some(proxy_jump) = &block.proxy_jump {
+                if !proxy_jump.eq_ignore_ascii_case("none") {
+                    config.proxy_jump = Some(proxy_jump.clone());
                 }
+                proxy_jump_set = true;
             }
-            if !identity_agent_set {
-                if let Some(identity_agent) = &block.identity_agent {
-                    config.identity_agent = Some(identity_agent.clone());
-                    identity_agent_set = true;
-                }
+            if !identity_agent_set && let Some(identity_agent) = &block.identity_agent {
+                config.identity_agent = Some(identity_agent.clone());
+                identity_agent_set = true;
             }
             config
                 .identity_files
@@ -690,15 +680,15 @@ fn ssh_config_path() -> PathBuf {
 }
 
 pub(super) fn current_user() -> String {
-    if let Ok(user) = std::env::var("USER") {
-        if !user.is_empty() {
-            return user;
-        }
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        return user;
     }
-    if let Ok(user) = std::env::var("LOGNAME") {
-        if !user.is_empty() {
-            return user;
-        }
+    if let Ok(user) = std::env::var("LOGNAME")
+        && !user.is_empty()
+    {
+        return user;
     }
     // SAFETY: getuid/getpwuid are plain libc lookups with no preconditions;
     // the returned pointer is read immediately.

@@ -143,14 +143,14 @@ fn rewrite(
         None
     };
     let mut block = String::new();
-    if host.is_none() {
-        if let Some(range) = &range {
-            ensure!(
-                !lines[range.clone()].iter().any(|line| split_directive(line)
-                    .is_some_and(|(key, _)| key.eq_ignore_ascii_case("include"))),
-                "This Host block includes other files; remove it in the source config directly"
-            );
-        }
+    if host.is_none()
+        && let Some(range) = &range
+    {
+        ensure!(
+            !lines[range.clone()].iter().any(|line| split_directive(line)
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("include"))),
+            "This Host block includes other files; remove it in the source config directly"
+        );
     }
     if let Some(host) = host {
         ensure!(safe_value(&host.hostname), "Invalid SSH hostname");

@@ -1282,10 +1282,10 @@ pub async fn ls(host_filter: Option<String>) -> Vec<SessionSummary> {
     let reg = registry().lock().await;
     let mut out = Vec::with_capacity(reg.len());
     for ((host, name), inner) in reg.iter() {
-        if let Some(hf) = &host_filter {
-            if hf != host {
-                continue;
-            }
+        if let Some(hf) = &host_filter
+            && hf != host
+        {
+            continue;
         }
         let state = inner.state.lock().await;
         out.push(summarize(host, name, &state));

@@ -166,7 +166,7 @@ brew install ReiSuzunami/tap/sloosh
 
 Formula 会安装 `sloosh` 与由其管理的 `slooshd`，但不安装桌面 App，也不生成 DMG。
 
-也可从 crates.io 下载源码并在本机编译命令行包。需要 Rust 1.85 或更新版本，以及
+也可从 crates.io 下载源码并在本机编译命令行包。需要 Rust 1.89 或更新版本，以及
 可用的 C/C++ 工具链：
 
 ```sh

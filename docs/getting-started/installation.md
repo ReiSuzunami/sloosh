@@ -196,7 +196,7 @@ The formula installs both `sloosh` and its managed `slooshd`; it does not
 install the desktop app or generate a DMG.
 
 crates.io can instead download the source and compile the command-line package
-locally. This requires Rust 1.85 or newer and a working C/C++ toolchain:
+locally. This requires Rust 1.89 or newer and a working C/C++ toolchain:
 
 ```sh
 cargo install sloosh --locked

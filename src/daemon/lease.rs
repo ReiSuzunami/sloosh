@@ -632,14 +632,14 @@ pub async fn approve_lease_system_agent(
     }
 
     let resolved_hosts = expand_approval_hosts(&requested_hosts).await?;
-    if let Some(expected_hosts) = expected_hosts {
-        if expected_hosts != resolved_hosts {
-            return Err(LeaseError::ApprovedHostsMismatch {
-                id: id.to_string(),
-                approved: format_host_list(expected_hosts),
-                resolved: format_host_list(&resolved_hosts),
-            });
-        }
+    if let Some(expected_hosts) = expected_hosts
+        && expected_hosts != resolved_hosts
+    {
+        return Err(LeaseError::ApprovedHostsMismatch {
+            id: id.to_string(),
+            approved: format_host_list(expected_hosts),
+            resolved: format_host_list(&resolved_hosts),
+        });
     }
     if !ssh::scope_uses_system_agent(&resolved_hosts).await? {
         return Ok(SystemAgentApprovalOutcome::NotEligible);
@@ -759,20 +759,20 @@ async fn approve_lease_for_chain_checked(
             return Err(error.into());
         }
     };
-    if let Some(approved_hosts) = approved_hosts {
-        if approved_hosts != resolved_hosts {
-            let approved = format_host_list(approved_hosts);
-            let resolved = format_host_list(&resolved_hosts);
-            let clear_cache = cleanup_failed_preview && st.active.is_empty();
-            if clear_cache {
-                vault::clear_cache().await;
-            }
-            return Err(LeaseError::ApprovedHostsMismatch {
-                id: id.to_string(),
-                approved,
-                resolved,
-            });
+    if let Some(approved_hosts) = approved_hosts
+        && approved_hosts != resolved_hosts
+    {
+        let approved = format_host_list(approved_hosts);
+        let resolved = format_host_list(&resolved_hosts);
+        let clear_cache = cleanup_failed_preview && st.active.is_empty();
+        if clear_cache {
+            vault::clear_cache().await;
         }
+        return Err(LeaseError::ApprovedHostsMismatch {
+            id: id.to_string(),
+            approved,
+            resolved,
+        });
     }
 
     Ok(activate_pending(

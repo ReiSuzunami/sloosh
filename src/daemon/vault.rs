@@ -108,7 +108,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VaultError> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(VaultError::TamperedOrCorrupt);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -1226,10 +1226,10 @@ pub async fn lookup_entry(alias: &str) -> EntryLookup {
         };
     };
     let entry = cached.data.hosts.get(alias).cloned();
-    if entry.is_some() {
-        if let CacheOwner::BypassUnlock { last_used, .. } = &mut cached.owner {
-            *last_used = now;
-        }
+    if entry.is_some()
+        && let CacheOwner::BypassUnlock { last_used, .. } = &mut cached.owner
+    {
+        *last_used = now;
     }
     entry.map_or(EntryLookup::Absent, EntryLookup::Entry)
 }
