@@ -41,6 +41,23 @@ pub(super) enum SkillStatus {
     External,
 }
 
+impl SkillStatus {
+    pub(super) fn is_current(self) -> bool {
+        matches!(self, Self::CurrentManaged | Self::CurrentExternal)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::CurrentManaged => "current (managed by sloosh)",
+            Self::CurrentExternal => "current (externally managed)",
+            Self::UpgradeAvailable => "upgrade available",
+            Self::Modified => "locally modified",
+            Self::External => "externally managed",
+        }
+    }
+}
+
 const MANAGED_MARKER: &str = ".sloosh-managed.json";
 const SKILL_FILE: &str = "SKILL.md";
 const MAX_MANAGED_FILE_BYTES: u64 = 1024 * 1024;
@@ -54,6 +71,11 @@ struct ManagedMarker {
 }
 
 pub(super) fn install_target(target: &SkillTarget, force: bool) -> anyhow::Result<InstallOutcome> {
+    if is_directory_link(target) && !force && inspect_target(target)?.is_current() {
+        // Shared installations may already have been updated through their
+        // direct target. Never write through or take ownership of the link.
+        return Ok(InstallOutcome::CurrentExternal);
+    }
     let directory =
         open_target_directory(target, true)?.expect("create always returns a directory");
     if let Some(existing) = directory.read_optional(SKILL_FILE)? {
@@ -93,6 +115,33 @@ pub(super) fn install_target(target: &SkillTarget, force: bool) -> anyhow::Resul
 }
 
 pub(super) fn inspect_target(target: &SkillTarget) -> anyhow::Result<SkillStatus> {
+    let resolved;
+    let target = if is_directory_link(target) {
+        // Validate the link's parent with the same descriptor-based policy,
+        // then read only a resolved directory beneath the original HOME.
+        let parent = SkillTarget {
+            directory: target
+                .directory
+                .parent()
+                .context("skill directory has no parent")?
+                .to_path_buf(),
+            ..target.clone()
+        };
+        open_target_directory(&parent, false)?.context("skill link parent is missing")?;
+        resolved = SkillTarget {
+            root: target.root.canonicalize()?,
+            directory: target.directory.canonicalize().with_context(|| {
+                format!(
+                    "could not resolve skill directory link {}",
+                    target.directory.display()
+                )
+            })?,
+            ..target.clone()
+        };
+        &resolved
+    } else {
+        target
+    };
     let Some(directory) = open_target_directory(target, false)? else {
         return Ok(SkillStatus::Missing);
     };
@@ -117,6 +166,11 @@ pub(super) fn inspect_target(target: &SkillTarget) -> anyhow::Result<SkillStatus
             None => Ok(SkillStatus::External),
         }
     }
+}
+
+fn is_directory_link(target: &SkillTarget) -> bool {
+    std::fs::symlink_metadata(&target.directory)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 pub(super) fn resolve_targets_from_home(
@@ -751,6 +805,58 @@ mod tests {
 
         assert!(error.contains("symlink"), "{error}");
         assert!(!outside.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn shared_directory_link_is_inspected_but_never_written_through() {
+        let temp = TestDir::new("shared-link");
+        let direct = temp.target();
+        install_target(&direct, false).unwrap();
+        let linked = SkillTarget {
+            directory: temp.0.join("claude/sloosh"),
+            ..direct.clone()
+        };
+        std::fs::create_dir_all(linked.directory.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&direct.directory, &linked.directory).unwrap();
+        assert_eq!(
+            inspect_target(&linked).unwrap(),
+            SkillStatus::CurrentManaged
+        );
+        assert_eq!(
+            install_target(&linked, false).unwrap(),
+            InstallOutcome::CurrentExternal
+        );
+        assert!(install_target(&linked, true).is_err());
+        std::fs::write(skill_path(&direct), "customized\n").unwrap();
+        assert_eq!(inspect_target(&linked).unwrap(), SkillStatus::Modified);
+        assert!(install_target(&linked, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(skill_path(&direct)).unwrap(),
+            "customized\n"
+        );
+    }
+
+    #[test]
+    fn linked_status_reports_broken_and_outside_root_links_as_errors() {
+        let temp = TestDir::new("bad-link");
+        let outside = TestDir::new("outside-root");
+        let target = temp.target();
+        std::fs::create_dir_all(target.directory.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside.0, &target.directory).unwrap();
+        assert!(
+            inspect_target(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("outside its root")
+        );
+        std::fs::remove_file(&target.directory).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("missing"), &target.directory).unwrap();
+        assert!(
+            inspect_target(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("could not resolve")
+        );
     }
 
     #[test]

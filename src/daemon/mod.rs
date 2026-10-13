@@ -309,6 +309,7 @@ async fn handle_connection(
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
                             target_requires_system_agent,
+                            trust_new_host: false,
                         };
                         audit::record(
                             "run_started",
@@ -427,6 +428,7 @@ async fn handle_connection(
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
                             target_requires_system_agent,
+                            trust_new_host: false,
                         };
                         match session::open(&host, &name, lease_ctx).await {
                             Ok(summary) => Response::Session(summary),
@@ -485,6 +487,7 @@ async fn handle_connection(
                     caller_pid,
                     lease_token: lease_token.clone(),
                     target_requires_system_agent,
+                    trust_new_host: false,
                 };
                 let mut upload =
                     match session::begin_put(&host, session, &local_path, &remote_path, lease_ctx)
@@ -545,6 +548,7 @@ async fn handle_connection(
                     caller_pid,
                     lease_token: lease_token.clone(),
                     target_requires_system_agent,
+                    trust_new_host: false,
                 };
                 let mut download =
                     match session::begin_get(&host, session, &remote_path, &local_path, lease_ctx)
@@ -590,6 +594,7 @@ async fn handle_connection(
                             caller_pid: peer.expect("require_lease Ok implies peer is Some"),
                             lease_token: lease_token.clone(),
                             target_requires_system_agent,
+                            trust_new_host: false,
                         };
                         let opened = match direction {
                             proto::ForwardDirection::Local { spec } => {
@@ -628,7 +633,44 @@ async fn handle_connection(
                 };
                 chan.send(&resp).await?;
             }
-            Request::RequestLease { hosts } => {
+            Request::TestConnection { host, lease_token } => {
+                let response = match require_lease(peer, &host, &lease_token).await {
+                    Err(denied) => denied,
+                    Ok(target_requires_system_agent) => {
+                        let context = ssh::LeaseContext {
+                            caller_pid: peer.expect("authorized peer"),
+                            lease_token,
+                            target_requires_system_agent,
+                            trust_new_host: false,
+                        };
+                        let check = async {
+                            let connection = ssh::connect(&host, &context).await?;
+                            let channel = connection.handle.channel_open_session().await?;
+                            channel.close().await?;
+                            Ok::<(), ssh::SshError>(())
+                        };
+                        match tokio::time::timeout(std::time::Duration::from_secs(30), check).await
+                        {
+                            Ok(Ok(())) => Response::Ok,
+                            Ok(Err(error)) => Response::Error {
+                                message: error.to_string(),
+                            },
+                            Err(_) => Response::Error {
+                                message: format!(
+                                    "Connection test for {host} timed out after 30 seconds"
+                                ),
+                            },
+                        }
+                    }
+                };
+                chan.send(&response).await?;
+            }
+            request @ (Request::RequestLease { .. } | Request::RequestLeaseTrustNew { .. }) => {
+                let (hosts, trust_new_host) = match request {
+                    Request::RequestLease { hosts } => (hosts, false),
+                    Request::RequestLeaseTrustNew { hosts } => (hosts, true),
+                    _ => unreachable!(),
+                };
                 let Some(caller_pid) = peer else {
                     chan.send(&Response::Error {
                         message: "could not determine the calling process's PID (peer \
@@ -680,7 +722,9 @@ async fn handle_connection(
                                     Ok(lease::SystemAgentApprovalOutcome::NotEligible)
                                         if info.vault_exists =>
                                     {
-                                        match native_approval::try_approve(&info).await {
+                                        match native_approval::try_approve(&info, trust_new_host)
+                                            .await
+                                        {
                                             Ok(native_approval::NativeApprovalOutcome::Human(
                                                 activated,
                                             )) => {
@@ -732,6 +776,46 @@ async fn handle_connection(
                         message: e.to_string(),
                     },
                 };
+                let mut resp = resp;
+                if trust_new_host && matches!(resp, Response::Ok) {
+                    for host in &hosts {
+                        let restricted = match require_lease(peer, host, &None).await {
+                            Ok(restricted) => restricted,
+                            Err(denied) => {
+                                resp = denied;
+                                break;
+                            }
+                        };
+                        let context = ssh::LeaseContext {
+                            caller_pid,
+                            lease_token: None,
+                            target_requires_system_agent: restricted,
+                            trust_new_host: true,
+                        };
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            ssh::connect(host, &context),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_connection)) => {}
+                            Ok(Err(error)) => {
+                                resp = Response::Error {
+                                    message: error.to_string(),
+                                };
+                                break;
+                            }
+                            Err(_) => {
+                                resp = Response::Error {
+                                    message: format!(
+                                        "SSH connection to {host} timed out after 30 seconds; authorization is unchanged."
+                                    ),
+                                };
+                                break;
+                            }
+                        }
+                    }
+                }
                 chan.send(&resp).await?;
             }
             Request::DescribeLeaseRequest { id } => {
@@ -852,6 +936,9 @@ async fn handle_connection(
                         password: password.into_string(),
                     },
                     proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                    proto::HostAuth::PrivateKey { private_key } => {
+                        vault::AuthMethod::PrivateKey { private_key }
+                    }
                 };
                 let entry = vault::HostEntry {
                     hostname,
@@ -874,6 +961,51 @@ async fn handle_connection(
                     },
                 };
                 chan.send(&resp).await?;
+            }
+            Request::EnrollHost {
+                alias,
+                hostname,
+                port,
+                user,
+                auth,
+                key_file,
+                route,
+            } => {
+                let result = async {
+                    anyhow::ensure!(vault::exists(), "Initialize the vault in Sloosh before adding hosts from an Agent.");
+                    let auth = match auth {
+                        proto::HostAuthKind::Agent => {
+                            anyhow::ensure!(key_file.is_none(), "Agent authentication does not accept a key file.");
+                            vault::AuthMethod::Agent
+                        }
+                        proto::HostAuthKind::KeyFile => vault::AuthMethod::KeyFile {
+                            path: key_file.ok_or_else(|| anyhow::anyhow!("Choose a private key file."))?,
+                        },
+                        proto::HostAuthKind::Password => {
+                            anyhow::ensure!(key_file.is_none(), "Password authentication does not accept a key file.");
+                            vault::AuthMethod::Password {
+                                password: native_approval::prompt_ssh_password(&alias).await?.into_string(),
+                            }
+                        }
+                        proto::HostAuthKind::PrivateKey => anyhow::bail!("Paste private keys in the Sloosh host editor, not through an Agent."),
+                    };
+                    let purpose = format!("Add Sloosh host {alias:?}: {user:?}@{hostname:?}:{port:?}, authentication {:?}, route {route:?}. This does not grant a connection lease.", auth.kind());
+                    let password = if dangerous_bypass_enabled() {
+                        native_approval::unlock_from_keychain().await?
+                    } else {
+                        native_approval::prompt_master_password(&purpose, false).await?
+                    };
+                    vault::add_entry(&alias, vault::HostEntry { hostname, port, user, auth, route },
+                        password.expose_secret().as_bytes(), false).await?;
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                chan.send(&match result {
+                    Ok(()) => Response::Ok,
+                    Err(error) => Response::Error {
+                        message: error.to_string(),
+                    },
+                })
+                .await?;
             }
             Request::ListHosts { master_password } => {
                 let inventory =
@@ -920,6 +1052,9 @@ async fn handle_connection(
                         password: password.into_string(),
                     },
                     proto::HostAuth::KeyFile { path } => vault::AuthMethod::KeyFile { path },
+                    proto::HostAuth::PrivateKey { private_key } => {
+                        vault::AuthMethod::PrivateKey { private_key }
+                    }
                 });
                 let resp = match vault::update_entry(
                     metadata,

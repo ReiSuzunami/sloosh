@@ -1,175 +1,25 @@
 ---
 name: sloosh
-description: Use when a task needs to run commands on a remote server/VPS over SSH — deploying, checking logs, restarting services, editing files remotely — especially when the work spans multiple calls and needs a persistent shell (cwd/env/background jobs must survive between commands), or when the agent must never see SSH passwords/keys and credential access needs a bounded automatic system-agent lease or human approval.
+description: Run remote SSH commands in persistent sessions, transfer files, and manage tunnels without exposing credentials to the Agent.
 ---
 
-# sloosh
+# Sloosh
 
-`sloosh` runs commands on remote hosts over SSH from a long-lived background
-daemon. It fixes two things plain `ssh`/subprocess calls don't: your shell
-state (cwd, env vars, background jobs) survives across calls, and you never
-touch a password or key. Default system SSH-agent-only scopes authorize
-automatically; every other credential scope needs out-of-band human approval.
-
-System SSH aliases support nested `Include` files and ordered globs, including
-Host-conditional includes. Included ProxyJump and credential settings count
-toward the complete approval scope. If include loading fails, fix the config
-or use a managed profile; never bypass approval or remove route settings to
-silence the error. Dynamic include path tokens and `Match` remain unsupported.
-
-## Bootstrap
-
-Before the first SSH task, check whether the binary is available:
-
-```sh
-command -v sloosh && sloosh --version
-```
-
-If it is missing or too old to provide `sloosh init` and `sloosh skill`, explain
-the official command-line package for the user's OS and ask before installing
-anything. Prefer the verified GitHub Release archive or Homebrew path described
-in the repository's installation guide. That package includes the managed
-`slooshd`; never start it directly. The macOS DMG is an optional desktop
-control plane and does not install the CLI. Do not use `curl | sh`, request
-credentials, bypass Gatekeeper/SmartScreen, or silently invoke a package
-manager.
-
-Once the CLI is available, explain the matching authorization setup:
-
-- `sloosh init` is a human-only terminal flow and command-line-only installs
-  use the separate-terminal approval fallback: the human runs the printed
-  `sloosh approve <ID>` command in another terminal.
-- A complete target plus ProxyJump scope using only vault `agent` profiles or
-  default `$SSH_AUTH_SOCK`, with no `IdentityFile` or custom `IdentityAgent`,
-  receives a process-bound, time-limited lease automatically when the daemon
-  can inspect the exact scope. A CLI-only cold encrypted vault may still return
-  pending; treat that as human approval, never infer the hidden profile.
-- On macOS with the desktop app, the human uses its Setup and Security screens
-  for login Keychain and the possible `Sloosh Approval` prompt. Native lease
-  approval presents direct Touch ID, Sloosh PIN, and Master Password (vault) buttons for
-  scopes that are not system-agent-only.
-  The CLI and app then share the app's private daemon. The user handles every
-  native prompt; `Always Allow` avoids repeated Keychain prompts, while `Allow`
-  grants one-time access. The vault Master Password is not the macOS login
-  password. PIN submission uses `Unlock` for desktop access and `Approve` for
-  SSH approval; unlocking Hosts does not approve SSH requests.
-
-Then ask the user to run `sloosh init` themselves in their own terminal, stop,
-and wait. Never run it for them, fake a TTY, or enter a vault password. After
-they confirm completion, you may run `sloosh skill status` and `sloosh status`
-to verify Skill and daemon state. If they want native approval, ask them to
-open the desktop app and complete its setup themselves; do not automate its
-secure prompts.
-
-## Mental model
-
-A `sloosh` session is a persistent remote shell, not a one-shot command —
-`cd` and `export` in one call are still in effect on the next. Every
-host-touching command needs a **lease**. `sloosh request` creates it
-automatically for a system-agent-only scope; a human approves every other
-scope. When you're unsure what's going on (is there a
-session already? is a host authorized?), run `sloosh status` first instead
-of guessing.
-
-## Explicit Dangerous Bypass Mode
-
-Only when the user explicitly chooses this mode, they can start the selected
-local `slooshd --dangerous-bypass-mode` after stopping the existing daemon
-(stopping loses sessions and forwards). Do not enable it merely to fix pending
-approval or unknown-host errors. With that daemon running, unknown target and
-jump-host keys are trusted and saved on connection. Changed keys still fail.
-Same-user host operations need no lease request, host scope, token, or renewal.
-`sloosh request` is optional and creates no lease in this mode. SSH credentials
-and vault unlock remain required. Startup and compatibility requests
-appear in `sloosh log`. The user can also explicitly save `dangerous_bypass_mode`
-in protected `vault-settings.json`, or confirm it in desktop Security. GUI saves
-startup policy only; CLI/desktop auto-spawn honor it on the next start. Do not
-change this setting without explicit user direction. To disable, clear the saved
-setting and restart without the flag; saved trust remains. Default is off.
-
-## Locked credentials and process ownership
-
-Dangerous Bypass Mode automatically unlocks from the existing macOS Sloosh
-Keychain credential after restart or cache expiry; no separate switch exists.
-Keychain failure returns a specific error without a popup;
-ask the user to repair enrollment in Security, not approve a lease.
-Without a usable helper/Keychain credential, the human can explicitly unlock the desktop Hosts page
-or run `sloosh host list`; do not ask them to approve a bypass lease, infer a
-hidden alias, dial its literal name, or work around credential locks. Successful
-human host CRUD/list and initialization populate a bounded daemon cache.
-Expiry/restart requires verified unlock again (automatic in bypass mode);
-the daemon does not save the master password.
-Only verified absence permits SSH-config fallback. In normal mode, GUI/SDK leases bind that
-client process; CLI leases use a safe parent and never PID 1. Desktop management
-lock does not revoke leases; stopping daemon terminates its authority.
-
-## Key commands
-
-```
-sloosh request myhost                       # auto-authorize system Agent, otherwise ask human
-sloosh host trust myhost                    # human-only: inspect/add/replace a host key
-sloosh run myhost "npm test"                 # run a command in myhost's default session
-sloosh peek myhost                           # incremental output since your last peek
-sloosh put myhost ./build.tar.gz /srv/app/   # upload a local file over the same connection
-sloosh get myhost /var/log/app.log ./log.txt # download a remote file
-sloosh forward myhost -L 8080:127.0.0.1:80  # loopback-only local tunnel
-sloosh forward myhost -R 9000:127.0.0.1:3000 # remote listener to a local service
-sloosh skill status                          # Agent Skill install/update state
-sloosh status                                # daemon/lease/session overview — run this when lost
-```
-
-## Fixed behavior rules
-
-- After `sloosh request <host>`, continue when it prints `authorized`; this may
-  be daemon-issued system-agent authorization or human approval. On a
-  pending fallback, show the printed approval command to your user and **stop
-  and wait** — do not poll in a loop or re-request. On DMG-installed macOS,
-  direct Touch ID, approval PIN, or Master Password buttons may complete the
-  request without another terminal.
-- If `request` reports an invalid ProxyJump cycle or depth, show that error to
-  the user and stop. Never retry with a subset of hosts or bypass the route.
-- Active leases idle out according to the human's shared vault timeout
-  (1, 5, 15, or 30 minutes; default 15). Do not assume a prior lease remains
-  active; use `sloosh status` and request approval again when needed.
-- If `run` returns `running` (it hit its timeout but the command is still
-  going), use `sloosh peek <host>` to follow up incrementally — do not
-  re-run the command.
-- **Never ask the user for a password or key.** Host management
-  (`sloosh host add/edit/trust/rm/list/show`) is something the user does themselves, interactively, in
-  their own terminal. If a host isn't set up yet, tell them to run
-  `sloosh host add` and wait. Humans may choose SSH agent, password, or an
-  key-file profile plus direct, managed-host, or ProxyJump routing. Unencrypted
-  Ed25519/ECDSA keys sign directly. RSA and encrypted OpenSSH KeyFile profiles
-  delegate signing only to their exact public identity already loaded in the
-  daemon's SSH Agent; keep the KeyFile profile and its approval policy.
-  When that identity is missing, show the human the error's socket-specific
-  ssh-add command and wait. Never load keys yourself or switch the profile to
-  broad Agent authentication. Sloosh does not decrypt keys or persist Agent
-  loading; encrypted formats without OpenSSH public metadata are unsupported.
-- `sloosh init`, `sloosh approve`, and every `sloosh host` command are human-only.
-  Never work around their TTY checks. The Agent Skill cannot approve a pending
-  lease, initialize the vault, or broaden authority. Only daemon policy may
-  auto-activate a system-agent-only request.
-- If an operation reports an unknown or changed host key, ask the user to open
-  Hosts in the desktop app or run `sloosh host trust <alias>` themselves, then
-  stop and wait. The user must compare the shown new fingerprint with an
-  independent source and choose Add/Replace/Recheck/Cancel. Never invoke the
-  trust command, edit either known_hosts file, or auto-accept a changed key.
-- Sessions keep their working directory and environment between calls; you
-  don't need to `cd` back into place or re-`export` things every time.
-- `put` truncates an existing remote destination; check the path first. A
-  transfer authorized before lease expiry may finish, but new operations fail.
-- `get` refuses to overwrite an existing local file. Use `--force` only when
-  replacing that file is explicitly intended; completed downloads are
-  committed atomically.
-- Port forwarding supports loopback-only `-L` and remote `-R`. Use `-R` only
-  when a remote listener is intended, and choose its bind address carefully:
-  the SSH server's `GatewayPorts` policy decides whether it is externally
-  reachable. Non-loopback local `-L` listeners are rejected.
-
-## More detail
-
-Every subcommand explains itself: run `sloosh <command> --help`. Error
-messages are self-teaching too — e.g. a missing lease tells you exactly
-which command to run and what to show your user. This document intentionally
-does not duplicate the flag reference.
+- Use `sloosh <command> --help` for syntax; `sloosh status` for current state.
+  Sessions retain cwd, environment, and background jobs.
+- Request all needed hosts together: `sloosh request host-a host-b`.
+  Continue on `authorized`; if pending, show the printed approval command and wait.
+  Do not poll or repeatedly request approval. Leases are process-bound and expire.
+- Run with `sloosh run <host> "command"`. If it returns `running`, use
+  `sloosh peek <host>`; do not run the command again.
+- `sloosh host add --auth agent` writes only SSH config, without a TTY or vault copy.
+  `sloosh init`, `sloosh approve <ID>`, and other host-management commands are human-only.
+- Never read or collect passwords, private keys, or lease tokens; never fake a TTY
+  or automate secure prompts. Missing setup or credentials requires the user.
+- For explicit TOFU, use `sloosh request --trust-new-host <host>` (includes jumps).
+  Changed keys still require human verification via `sloosh host trust <alias>` or desktop Hosts.
+- Do not bypass vault locks, change authentication, or remove ProxyJump routes to
+  evade authorization. Dangerous Bypass Mode requires explicit user opt-in;
+  when already enabled, no lease is needed. Credential and changed-key errors still apply.
+- `put` overwrites remote files; `get --force` overwrites local files.
+  Remote `forward -R` may expose a listener. Use either only when intended.

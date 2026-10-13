@@ -16,6 +16,7 @@ pub struct HostKeyTrustPreview {
     pub requested_host: String,
     pub host: String,
     pub hostname: String,
+    pub host_key_alias: Option<String>,
     pub port: u16,
     pub algorithm: String,
     pub fingerprint: String,
@@ -49,6 +50,8 @@ pub enum HostKeyTrustAction {
 
 #[derive(Debug, Error)]
 pub enum HostKeyTrustError {
+    #[error("unlock the vault to inspect a host that is not defined in SSH config")]
+    VaultUnlockRequired,
     #[error("another host-key operation is already using this process's vault cache")]
     VaultCacheInUse,
     #[error(transparent)]
@@ -78,7 +81,8 @@ async fn first_actionable_preview(
     let targets = ssh::host_key_confirmation_order(&[requested_host.to_string()]).await?;
     for target in targets {
         let probe = ssh::fetch_host_key_for_confirmation_target(&target).await?;
-        let trust = ssh::inspect_host_key_trust(&probe.hostname, probe.port, &probe.key)?;
+        let (key_host, key_port) = probe.known_host_endpoint();
+        let trust = ssh::inspect_host_key_trust(key_host, key_port, &probe.key)?;
         if !matches!(trust, ssh::HostKeyTrustState::Trusted) {
             return Ok(Some((target, probe, trust)));
         }
@@ -120,6 +124,7 @@ fn preview_from_probe(
         requested_host: requested_host.to_string(),
         host: target.alias.clone(),
         hostname: probe.hostname.clone(),
+        host_key_alias: probe.host_key_alias.clone(),
         port: probe.port,
         algorithm: probe.key.algorithm().to_string(),
         fingerprint: probe
@@ -149,8 +154,14 @@ async fn preview_unlocked(
 
 pub async fn preview_host_key(
     requested_host: &str,
-    master_password: &SecretString,
+    master_password: Option<&SecretString>,
 ) -> Result<Option<HostKeyTrustPreview>, HostKeyTrustError> {
+    let Some(master_password) = master_password else {
+        if !ssh::SshConfig::load_default().contains_alias(requested_host) {
+            return Err(HostKeyTrustError::VaultUnlockRequired);
+        }
+        return preview_unlocked(requested_host).await;
+    };
     match vault::with_temporary_cache(master_password.expose_secret().as_bytes(), || {
         preview_unlocked(requested_host)
     })
@@ -166,9 +177,9 @@ pub async fn preview_host_key(
 pub async fn apply_host_key_action(
     expected: &HostKeyTrustPreview,
     action: HostKeyTrustAction,
-    master_password: &SecretString,
+    master_password: Option<&SecretString>,
 ) -> Result<(), HostKeyTrustError> {
-    match vault::with_temporary_cache(master_password.expose_secret().as_bytes(), || async {
+    let operation = || async {
         let Some((target, probe, trust)) =
             first_actionable_preview(&expected.requested_host).await?
         else {
@@ -180,12 +191,14 @@ pub async fn apply_host_key_action(
         }
         match (action, observed.state) {
             (HostKeyTrustAction::Add, HostKeyTrustState::New) => {
-                ssh::record_sloosh_known_host(&probe.hostname, probe.port, &probe.key)?;
+                let (key_host, key_port) = probe.known_host_endpoint();
+                ssh::record_sloosh_known_host(key_host, key_port, &probe.key)?;
             }
             (HostKeyTrustAction::Replace, HostKeyTrustState::Changed) if observed.replaceable => {
+                let (key_host, key_port) = probe.known_host_endpoint();
                 ssh::replace_sloosh_known_host(
-                    &probe.hostname,
-                    probe.port,
+                    key_host,
+                    key_port,
                     &probe.key,
                     observed
                         .stored_fingerprint
@@ -196,9 +209,14 @@ pub async fn apply_host_key_action(
             _ => return Err(HostKeyTrustError::InvalidAction),
         }
         Ok(())
-    })
-    .await
-    {
+    };
+    let Some(master_password) = master_password else {
+        if !ssh::SshConfig::load_default().contains_alias(&expected.requested_host) {
+            return Err(HostKeyTrustError::VaultUnlockRequired);
+        }
+        return operation().await;
+    };
+    match vault::with_temporary_cache(master_password.expose_secret().as_bytes(), operation).await {
         Ok(()) => Ok(()),
         Err(vault::TemporaryCacheError::CacheInUse) => Err(HostKeyTrustError::VaultCacheInUse),
         Err(vault::TemporaryCacheError::Vault(error)) => Err(error.into()),
@@ -216,6 +234,7 @@ mod tests {
             requested_host: "production".into(),
             host: "bastion".into(),
             hostname: "bastion.example.com".into(),
+            host_key_alias: None,
             port: 2222,
             algorithm: "ssh-ed25519".into(),
             fingerprint: "SHA256:example".into(),
@@ -234,6 +253,7 @@ mod tests {
             requested_host: "production".into(),
             host: "bastion".into(),
             hostname: "bastion.example.com".into(),
+            host_key_alias: None,
             port: 2222,
             algorithm: "ssh-ed25519".into(),
             fingerprint: "SHA256:expected".into(),
@@ -243,6 +263,10 @@ mod tests {
             replaceable: true,
         };
         for changed in [
+            HostKeyTrustPreview {
+                host_key_alias: Some("other-key-name".into()),
+                ..expected.clone()
+            },
             HostKeyTrustPreview {
                 host: "other".into(),
                 ..expected.clone()

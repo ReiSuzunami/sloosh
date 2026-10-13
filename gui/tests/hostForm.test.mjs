@@ -16,6 +16,7 @@ const hostForm = await import(
 
 test('ordinary edits omit stale authentication fields', () => {
   const form = hostForm.hostFormFromSummary({
+    source: 'vault',
     alias: 'web',
     hostname: 'web.internal',
     port: 22,
@@ -25,12 +26,16 @@ test('ordinary edits omit stale authentication fields', () => {
   });
   form.password = 'stale-password';
   form.keyFile = '/stale/key';
+  form.privateKey = 'stale-private-key';
+  form.syncToAgent = true;
 
   const result = hostForm.buildHostSubmission(form, 'edit');
 
   assert.equal(result.ok, true);
   assert.equal(result.value.commandHost.password, null);
   assert.equal(result.value.commandHost.keyFile, null);
+  assert.equal(result.value.commandHost.privateKey, null);
+  assert.equal(result.value.commandHost.syncToAgent, false);
   assert.equal(result.value.changeAuth, false);
 });
 
@@ -39,6 +44,7 @@ test('add and explicit auth change send only the selected credential', () => {
   add.alias = 'bastion';
   add.hostname = 'bastion.internal';
   add.auth = 'password';
+  add.source = 'vault';
   add.password = 'one-use-password';
 
   const added = hostForm.buildHostSubmission(add, 'add');
@@ -85,4 +91,27 @@ test('numeric values from an input[type=number] are accepted', () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.value.host.port, 56875);
+});
+
+test('pasted keys stay out of summaries and agent loading is opt-in', () => {
+  const form = hostForm.emptyHostForm();
+  form.alias = 'web';
+  form.hostname = 'web.example';
+  form.auth = 'private_key';
+  form.source = 'vault';
+  assert.match(hostForm.buildHostSubmission(form, 'add').error, /Paste/);
+  form.privateKey = 'private-key-fixture';
+  let result = hostForm.buildHostSubmission(form, 'add');
+  assert.equal(result.value.commandHost.privateKey, 'private-key-fixture');
+  assert.equal(result.value.commandHost.syncToAgent, false);
+  assert.equal(JSON.stringify(result.value.host).includes('private-key-fixture'), false);
+  form.source = 'ssh_config';
+  result = hostForm.buildHostSubmission(form, 'add');
+  assert.equal(result.value.commandHost.syncToAgent, true);
+  assert.equal(result.value.commandHost.source, 'ssh_config');
+  assert.equal(result.value.host.auth, 'agent');
+  form.auth = 'agent';
+  result = hostForm.buildHostSubmission(form, 'add');
+  assert.equal(result.value.commandHost.privateKey, null);
+  assert.equal(result.value.commandHost.syncToAgent, false);
 });

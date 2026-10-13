@@ -241,6 +241,7 @@ async fn remote_forward_tunnels_to_local_target_and_stops_cleanly() {
             caller_pid: std::process::id(),
             lease_token: None,
             target_requires_system_agent: false,
+            trust_new_host: false,
         },
     )
     .await
@@ -306,6 +307,7 @@ async fn remote_forward_listener_and_tunnel_close_when_lease_expires() {
             caller_pid: std::process::id(),
             lease_token: None,
             target_requires_system_agent: false,
+            trust_new_host: false,
         },
     )
     .await

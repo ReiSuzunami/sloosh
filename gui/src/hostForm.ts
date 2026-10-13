@@ -3,6 +3,7 @@ import type { HostSummary } from './types';
 export type HostMode = 'add' | 'edit' | 'delete' | null;
 
 export type HostForm = {
+  source: HostSummary['source'];
   alias: string;
   hostname: string;
   port: string | number;
@@ -10,6 +11,7 @@ export type HostForm = {
   auth: HostSummary['auth'];
   password: string;
   keyFile: string;
+  privateKey: string;
   changeAuth: boolean;
   routeMode: 'direct' | 'managed_host' | 'proxy_jump';
   managedHost: string;
@@ -19,6 +21,8 @@ export type HostForm = {
 export type HostCommandInput = HostSummary & {
   password: string | null;
   keyFile: string | null;
+  privateKey: string | null;
+  syncToAgent: boolean;
 };
 
 export type HostSubmission = {
@@ -33,6 +37,7 @@ type HostSubmissionResult =
 
 export function emptyHostForm(): HostForm {
   return {
+    source: 'ssh_config',
     alias: '',
     hostname: '',
     port: '',
@@ -40,6 +45,7 @@ export function emptyHostForm(): HostForm {
     auth: 'agent',
     password: '',
     keyFile: '',
+    privateKey: '',
     changeAuth: false,
     routeMode: 'direct',
     managedHost: '',
@@ -49,6 +55,7 @@ export function emptyHostForm(): HostForm {
 
 export function hostFormFromSummary(host: HostSummary): HostForm {
   return {
+    source: host.source,
     alias: host.alias,
     hostname: host.hostname,
     port: host.port?.toString() ?? '',
@@ -56,6 +63,7 @@ export function hostFormFromSummary(host: HostSummary): HostForm {
     auth: host.auth,
     password: '',
     keyFile: '',
+    privateKey: '',
     changeAuth: false,
     routeMode: host.route.type,
     managedHost: host.route.type === 'managed_host' ? host.route.alias : '',
@@ -81,6 +89,16 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
   }
 
   const changesAuth = mode === 'add' || form.changeAuth;
+  const syncToAgent = changesAuth && form.source === 'ssh_config' && (form.auth === 'key_file' || form.auth === 'private_key');
+  if (form.source === 'ssh_config' && form.auth === 'password') {
+    return { ok: false, error: 'Password authentication belongs in the Sloosh vault.' };
+  }
+  if (changesAuth && form.source === 'vault' && form.auth === 'agent') {
+    return { ok: false, error: 'Choose a vault credential, or add a system SSH host.' };
+  }
+  if (changesAuth && form.auth === 'private_key' && !form.privateKey.trim()) {
+    return { ok: false, error: 'Paste a private key.' };
+  }
   if (changesAuth && form.auth === 'key_file' && !form.keyFile.trim()) {
     return { ok: false, error: 'Choose a private key file.' };
   }
@@ -105,11 +123,13 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
   }
 
   const host: HostSummary = {
+    source: form.source,
+    editError: null,
     alias,
     hostname,
     port,
     user: form.user.trim() || null,
-    auth: form.auth,
+    auth: form.auth === 'agent' || syncToAgent ? 'agent' : form.auth,
     route,
   };
   return {
@@ -118,6 +138,9 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
       host,
       commandHost: {
         ...host,
+        auth: form.auth,
+        privateKey: changesAuth && form.auth === 'private_key' ? form.privateKey : null,
+        syncToAgent,
         password: changesAuth && form.auth === 'password' ? form.password : null,
         keyFile: changesAuth && form.auth === 'key_file' ? form.keyFile.trim() : null,
       },

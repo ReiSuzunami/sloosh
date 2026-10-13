@@ -18,7 +18,6 @@
     Pencil,
     Plus,
     RefreshCw,
-    Server,
     ShieldCheck,
     Trash2,
     X,
@@ -55,11 +54,12 @@
   let activeAction = $state<string | null>(null);
   let error = $state<string | null>(null);
   let success = $state<string | null>(null);
+  let warning = $state<string | null>(null);
+  const hostSources = ['ssh_config', 'vault'] as const;
   let formError = $state<string | null>(null);
   let form = $state<HostForm>(emptyHostForm());
   let keyPreview = $state<HostKeyPreview | null>(null);
   let keyPreviewMessage = $state<string | null>(null);
-  let retryConnectionAlias = $state<string | null>(null);
   let reducedMotion = $state(false);
   let unlock = $state<VaultUnlockSnapshot>({
     state: 'locked',
@@ -86,13 +86,7 @@
   const blocker = $derived(
     !snapshot
       ? 'Local status is unavailable.'
-      : !snapshot.daemon.online
-        ? 'The local daemon must be online.'
-        : !snapshot.vaultExists
-          ? 'Create the credential vault first.'
-          : !snapshot.nativeApprovalAvailable
-            ? 'Native secure input is unavailable in this installation.'
-            : null,
+      : null,
   );
 
   function errorMessage(cause: unknown): string {
@@ -120,6 +114,7 @@
     const update = () => (reducedMotion = query.matches);
     update();
     query.addEventListener('change', update);
+    void loadHosts();
     const timer = window.setInterval(() => {
       if (unlock.state === 'unlocked') {
         const previousIdle = unlock.idleRemainingSecs ?? 0;
@@ -157,17 +152,17 @@
     unlock = next;
     expirySyncRequested = false;
     if (notify) onUnlockChange(next);
-    if (next.state === 'locked') {
+    if (next.state === 'locked' && !wasLocked) {
       hostOperationGeneration += 1;
-      hosts = null;
+      hosts = hosts?.filter((host) => host.source === 'ssh_config') ?? null;
       form.password = '';
+      form.privateKey = '';
       mode = null;
       selected = null;
       formError = null;
       keyPreview = null;
       keyPreviewMessage = null;
-      retryConnectionAlias = null;
-    } else if (wasLocked && hosts === null && activeAction === null) {
+    } else if (wasLocked && next.state === 'unlocked' && activeAction === null) {
       queueMicrotask(() => void loadHosts());
     }
   }
@@ -212,14 +207,15 @@
   }
 
   async function loadHosts() {
-    if (activeAction !== null || blocker) return;
+    if (activeAction !== null) return;
     activeAction = 'list_hosts';
     const operation = ++hostOperationGeneration;
     error = null;
     success = null;
+    warning = null;
     try {
       const nextHosts = await invoke<HostSummary[]>('list_hosts');
-      if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
+      if (operation === hostOperationGeneration) {
         hosts = nextHosts;
       }
       await syncUnlockStatus();
@@ -239,17 +235,20 @@
     let refreshAfterFailure = false;
     error = null;
     success = null;
+    warning = null;
+    formError = null;
     try {
       const next = await invoke<VaultUnlockSnapshot>(command);
       if (generation !== unlockGeneration) return;
       setUnlock(next);
       const nextHosts = await invoke<HostSummary[]>('list_hosts');
-      if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
+      if (operation === hostOperationGeneration) {
         hosts = nextHosts;
-        success = 'Management vault unlocked. In active bypass mode, daemon credentials are now available until its cache expires. Locking this page does not revoke SSH leases.';
+        success = 'Vault unlocked.';
       }
     } catch (cause) {
-      error = errorMessage(cause);
+      if (mode === 'add' || mode === 'edit') formError = errorMessage(cause);
+      else error = errorMessage(cause);
       refreshAfterFailure = true;
     } finally {
       activeAction = null;
@@ -267,6 +266,7 @@
         setUnlock(next);
         error = null;
         success = null;
+    warning = null;
       }
     } catch (cause) {
       error = errorMessage(cause);
@@ -294,6 +294,14 @@
     mode = 'add';
   }
 
+  function chooseSource(source: HostSummary['source']) {
+    form.source = source;
+    form.auth = source === 'ssh_config' ? 'agent' : 'password';
+    form.password = '';
+    form.privateKey = '';
+    form.keyFile = '';
+  }
+
   function openEdit(host: HostSummary) {
     selected = host;
     form = hostFormFromSummary(host);
@@ -309,6 +317,7 @@
 
   function closeDialog() {
     form.password = '';
+    form.privateKey = '';
     form.keyFile = '';
     mode = null;
     selected = null;
@@ -332,6 +341,10 @@
 
   async function saveHost() {
     if (activeAction !== null) return;
+    if (form.source === 'vault' && unlock.state !== 'unlocked') {
+      formError = 'Unlock the vault below Save to before saving.';
+      return;
+    }
     let submission;
     try {
       submission = buildHostSubmission(form, mode);
@@ -351,23 +364,28 @@
     formError = null;
     error = null;
     success = null;
+    warning = null;
     form.password = '';
+    form.privateKey = '';
     try {
-      await invoke<void>(command, {
+      const agentWarning = await invoke<string | null>(command, {
         host: commandHost,
         ...(command === 'update_host' ? { changeAuth } : {}),
       });
-      if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
+      if (operation === hostOperationGeneration && (unlock.state === 'unlocked' || host.source === 'ssh_config')) {
         hosts = command === 'update_host'
           ? (hosts ?? []).map((entry) => entry.alias === host.alias ? host : entry)
           : [...(hosts ?? []), host].sort((left, right) => left.alias.localeCompare(right.alias));
         success = command === 'update_host' ? `Updated ${host.alias}.` : `Added ${host.alias}.`;
+        if (agentWarning) { success = null; warning = agentWarning; }
         mode = null;
         selected = null;
       }
     } catch (cause) {
       formError = errorMessage(cause);
     } finally {
+      commandHost.password = null;
+      commandHost.privateKey = null;
       activeAction = null;
     }
   }
@@ -375,14 +393,16 @@
   async function removeHost() {
     if (!selected || activeAction !== null) return;
     const alias = selected.alias;
+    const source = selected.source;
     activeAction = 'remove_host';
     const operation = ++hostOperationGeneration;
     formError = null;
     error = null;
     success = null;
+    warning = null;
     try {
-      await invoke<void>('remove_host', { alias });
-      if (operation === hostOperationGeneration && unlock.state === 'unlocked') {
+      await invoke<void>('remove_host', { alias, source });
+      if (operation === hostOperationGeneration && (unlock.state === 'unlocked' || source === 'ssh_config')) {
         hosts = (hosts ?? []).filter((host) => host.alias !== alias);
         success = `Removed ${alias}.`;
         mode = null;
@@ -399,25 +419,24 @@
     return invoke<HostKeyPreview | null>('preview_host_key', { alias });
   }
 
-  async function previewHostKey(host: HostSummary, retryConnection = false) {
+  async function testHostConnection(host: HostSummary) {
     if (activeAction !== null) return;
     activeAction = `preview_host_key:${host.alias}`;
     error = null;
     success = null;
+    warning = null;
     keyPreviewMessage = null;
-    retryConnectionAlias = retryConnection ? host.alias : null;
     try {
       const preview = await loadHostKeyPreview(host.alias);
       if (preview) {
         keyPreview = preview;
       } else {
         keyPreview = null;
-        retryConnectionAlias = null;
-        success = `All host keys for ${host.alias} are trusted.`;
+        activeAction = `test_host_connection:${host.alias}`;
+        success = await invoke<string>('test_host_connection', { alias: host.alias });
       }
     } catch (cause) {
       keyPreview = null;
-      retryConnectionAlias = null;
       error = errorMessage(cause);
     } finally {
       activeAction = null;
@@ -428,9 +447,9 @@
     if (activeAction !== null) return;
     keyPreview = null;
     keyPreviewMessage = null;
-    retryConnectionAlias = null;
     error = null;
     success = null;
+    warning = null;
   }
 
   async function recheckHostKey() {
@@ -440,14 +459,16 @@
     keyPreviewMessage = null;
     error = null;
     success = null;
+    warning = null;
     try {
       keyPreview = await loadHostKeyPreview(requestedHost);
       if (!keyPreview) {
-        retryConnectionAlias = null;
-        success = `All host keys for ${requestedHost} are trusted.`;
+        activeAction = `test_host_connection:${requestedHost}`;
+        success = await invoke<string>('test_host_connection', { alias: requestedHost });
       }
     } catch (cause) {
-      keyPreviewMessage = errorMessage(cause);
+      if (keyPreview) keyPreviewMessage = errorMessage(cause);
+      else error = errorMessage(cause);
     } finally {
       activeAction = null;
     }
@@ -471,6 +492,7 @@
     activeAction = `trust_host_key:${trustedHost}`;
     error = null;
     success = null;
+    warning = null;
     keyPreviewMessage = null;
     try {
       const result = await invoke<HostKeyActionResult>('trust_host_key', {
@@ -478,37 +500,15 @@
         action,
       });
       keyPreview = result.preview;
-      if (result.refreshed) {
-        keyPreviewMessage = result.preview
-          ? 'The remote key changed while this dialog was open. Review the refreshed details.'
-          : 'The stored host-key state changed; all keys are trusted now.';
-        retryConnectionAlias = result.preview ? retryConnectionAlias : null;
-      } else if (!result.preview) {
-        const retryAlias = retryConnectionAlias;
-        retryConnectionAlias = null;
-        if (retryAlias) {
-          activeAction = `test_host_connection:${retryAlias}`;
-          success = await invoke<string>('test_host_connection', { alias: retryAlias });
-        } else {
-          success = `All host keys for ${requestedHost} are trusted.`;
-        }
+      if (!result.preview) {
+        activeAction = `test_host_connection:${requestedHost}`;
+        success = await invoke<string>('test_host_connection', { alias: requestedHost });
+      } else if (result.refreshed) {
+        keyPreviewMessage = 'The remote key changed while this dialog was open. Review the refreshed details.';
       }
     } catch (cause) {
-      keyPreviewMessage = errorMessage(cause);
-    } finally {
-      activeAction = null;
-    }
-  }
-
-  async function testHostConnection(host: HostSummary) {
-    if (activeAction !== null) return;
-    await previewHostKey(host, true);
-    if (keyPreview || error) return;
-    activeAction = `test_host_connection:${host.alias}`;
-    try {
-      success = await invoke<string>('test_host_connection', { alias: host.alias });
-    } catch (cause) {
-      error = errorMessage(cause);
+      if (keyPreview) keyPreviewMessage = errorMessage(cause);
+      else error = errorMessage(cause);
     } finally {
       activeAction = null;
     }
@@ -522,7 +522,7 @@
   }
 
   function authLabel(auth: HostSummary['auth']): string {
-    return auth === 'agent' ? 'SSH agent' : auth === 'password' ? 'Password' : 'Key file';
+    return auth === 'agent' ? 'SSH agent' : auth === 'password' ? 'Password' : auth === 'private_key' ? 'Private key' : 'Key file';
   }
 
   function routeLabel(route: HostSummary['route']): string {
@@ -534,149 +534,94 @@
 
 <section class="hosts-page" aria-labelledby="hosts-heading">
   <div class="hosts-toolbar">
-    <h2 id="hosts-heading" class="sr-only">SSH hosts</h2>
+    <h1 id="hosts-heading">Hosts</h1>
     <div class="toolbar-actions">
-      {#if hosts !== null}
-        <span class="unlock-status" aria-live="off">
-          <ShieldCheck size={15} />
-          <span>{unlockMethodLabel()}</span>
-          <strong>{formatCountdown(unlock.idleRemainingSecs)}</strong>
-        </span>
-        <button
-          class="icon-button"
-          onclick={loadHosts}
-          disabled={activeAction !== null}
-          aria-label="Refresh hosts"
-          title="Refresh hosts"
-        >
-          <RefreshCw size={17} class={activeAction === 'list_hosts' ? 'spin' : undefined} />
-        </button>
-        <button
-          class="icon-button"
-          onclick={lockHosts}
-          disabled={activeAction !== null}
-          aria-label="Lock host list"
-          title="Lock host list"
-        >
-          <LockKeyhole size={17} />
-        </button>
-      {/if}
-      {#if hosts?.length !== 0}
-      <button
-        class="primary-button"
-        onclick={openAdd}
-        disabled={Boolean(blocker) || hosts === null || activeAction !== null}
-        title={blocker ?? (hosts === null ? 'Unlock the host list first.' : undefined)}
-      >
-        <Plus size={16} /> Add host
-      </button>
-      {/if}
+      <button class="icon-button" onclick={loadHosts} disabled={activeAction !== null} aria-label="Refresh hosts" title="Refresh hosts"><RefreshCw size={17} /></button>
+      <button class="primary-button" onclick={openAdd} disabled={Boolean(blocker) || hosts === null || activeAction !== null}><Plus size={16} /> Add host</button>
     </div>
   </div>
-
-  {#if error}
-    <div class="notice error" role="alert" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
-      <CircleAlert size={18} />
-      <span>{error}</span>
+  {#if error || warning || success}
+    <div class="notice" class:error={Boolean(error)} class:warning={!error && Boolean(warning)} class:success={!error && !warning} role={error ? 'alert' : 'status'}>
+      {#if error || warning}<CircleAlert size={18} />{:else}<Check size={18} />{/if}
+      <span>{error ?? warning ?? success}</span>
     </div>
   {/if}
-  {#if success}
-    <div class="notice success" role="status" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
-      <Check size={18} />
-      <span>{success}</span>
-    </div>
-  {/if}
-
   {#if blocker}
-    <div class="host-gate" in:fade={{ duration: enterDuration }}>
-      <div class="host-gate-mark"><LockKeyhole size={22} /></div>
-      <div>
-        <h3>Host management unavailable</h3>
-        <p>{blocker}</p>
-      </div>
-      {#if snapshot && !snapshot.vaultExists}
-        <button class="secondary-button" onclick={onSetup}>Open setup</button>
-      {/if}
-    </div>
-  {:else if unlock.state === 'locked' || hosts === null}
-    <div class="host-gate" in:fade={{ duration: enterDuration }}>
-      <div class="host-gate-mark"><KeyRound size={22} /></div>
-      <div>
-        <h3>Credential vault locked</h3>
-        <p>Unlock to manage hosts. Auto-locks after {unlock.idleTimeoutMinutes} idle minutes.</p>
-      </div>
-      <div class="unlock-actions" aria-label="Unlock methods">
-        {#if snapshot?.touchIdEnrolled}
-          <button class="primary-button" onclick={() => unlockHosts('unlock_vault_with_touch_id')} disabled={activeAction !== null}>
-            <Fingerprint size={16} /> {activeAction === 'unlock_vault_with_touch_id' ? 'Unlocking...' : 'Touch ID'}
-          </button>
-        {/if}
-        {#if snapshot?.pin.state === 'ready'}
-          <button class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_pin')} disabled={activeAction !== null}>
-            <KeyRound size={16} /> {activeAction === 'unlock_vault_with_pin' ? 'Unlocking...' : 'Sloosh PIN'}
-          </button>
-        {/if}
-        <button class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_master')} disabled={activeAction !== null}>
-          <LockKeyhole size={16} /> {activeAction === 'unlock_vault_with_master' ? 'Unlocking...' : 'Master Password'}
-        </button>
-      </div>
-    </div>
-  {:else if hosts.length === 0}
-    <div class="host-empty" in:fade={{ duration: enterDuration }}>
-      <Server size={24} />
-      <h3>No saved hosts</h3>
-      <p>Only vault hosts appear here, not SSH config entries.</p>
-      <button class="primary-button" onclick={openAdd}><Plus size={16} /> Add host</button>
-    </div>
-  {:else}
-    <ul class="host-list" aria-label="Vault-backed SSH hosts">
-      {#each hosts as host (host.alias)}
+    <p class="constraint">{blocker}</p>
+  {:else if hosts !== null}
+    {#each hostSources as source}
+      {@const groupHosts = hosts.filter((host) => host.source === source)}
+      <section class="host-source-group" aria-label={source === 'ssh_config' ? 'System SSH config' : 'Sloosh vault'}>
+        <header class="host-source-header">
+          <div>
+            <h3>{source === 'ssh_config' ? 'System SSH config' : 'Sloosh vault'}</h3>
+            <p>{source === 'ssh_config' ? '~/.ssh/config · keys stay in your SSH Agent' : unlock.state === 'locked' ? 'Locked · private credentials' : 'Unlocked · private credentials'}</p>
+          </div>
+          {#if source === 'vault'}
+            <div class="unlock-actions">
+              {#if unlock.state === 'unlocked'}
+                <span class="unlock-status">{unlockMethodLabel()} · {formatCountdown(unlock.idleRemainingSecs)}</span>
+                <button class="icon-button" onclick={lockHosts} disabled={activeAction !== null} aria-label="Lock vault" title="Lock vault"><LockKeyhole size={16} /></button>
+              {:else if snapshot?.vaultExists && snapshot?.nativeApprovalAvailable}
+                {#if snapshot.touchIdEnrolled}<button class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_touch_id')} disabled={activeAction !== null}><Fingerprint size={15} /> Touch ID</button>{/if}
+                {#if snapshot.pin.state === 'ready'}<button class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_pin')} disabled={activeAction !== null}>PIN</button>{/if}
+                <button class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_master')} disabled={activeAction !== null}>Master password</button>
+              {:else}
+                <button class="secondary-button" onclick={onSetup}>Set up vault</button>
+              {/if}
+            </div>
+          {/if}
+        </header>
+        {#if groupHosts.length > 0}
+    <ul class="host-list" aria-label="SSH hosts">
+      {#each groupHosts as host (host.alias)}
         <li
           animate:flip={{ duration: reducedMotion ? 0 : 160 }}
           in:fade={{ duration: enterDuration }}
           out:fade={{ duration: exitDuration }}
         >
           <div class="host-identity">
-            <span class="host-icon"><Server size={18} /></span>
-            <span><strong>{host.alias}</strong><small>{endpoint(host)}</small></span>
+            <strong>{host.alias}</strong>
+            <span class="host-endpoint" title={endpoint(host)}>{endpoint(host)}</span>
+            {#if host.route.type !== 'direct'}
+              <small class="host-route" title={routeLabel(host.route)}>{routeLabel(host.route)}</small>
+            {/if}
           </div>
-          <dl class="host-meta">
-            <div><dt>Auth</dt><dd>{authLabel(host.auth)}</dd></div>
-            <div><dt>Route</dt><dd title={routeLabel(host.route)}>{routeLabel(host.route)}</dd></div>
-          </dl>
+          <div class="host-tags">
+            {#if host.source === 'vault'}<span class="host-tag">{authLabel(host.auth)}</span>{/if}
+            {#if host.editError}<span class="host-tag muted" title={host.editError}>Read-only</span>{/if}
+          </div>
           <div class="host-actions">
             <button
-              class="icon-button"
-              onclick={() => void previewHostKey(host)}
-              disabled={activeAction !== null}
-              aria-label={`Trust host key for ${host.alias}`}
-              title={`Inspect and trust host key for ${host.alias}`}
-            ><Fingerprint size={16} /></button>
-            <button
-              class="icon-button"
+              class="secondary-button host-test"
               onclick={() => void testHostConnection(host)}
               disabled={activeAction !== null}
               aria-label={`Test connection to ${host.alias}`}
               title={`Test SSH connection to ${host.alias}`}
-            ><Cable size={16} /></button>
+            ><Cable size={15} /> {activeAction?.endsWith(`:${host.alias}`) ? 'Testing…' : 'Test'}</button>
             <button
               class="icon-button"
               onclick={() => openEdit(host)}
-              disabled={activeAction !== null}
+              disabled={activeAction !== null || Boolean(host.editError)}
               aria-label={`Edit ${host.alias}`}
-              title={`Edit ${host.alias}`}
+              title={host.editError ?? `Edit ${host.alias}`}
             ><Pencil size={16} /></button>
             <button
               class="icon-button danger-button"
               onclick={() => openDelete(host)}
-              disabled={activeAction !== null}
+              disabled={activeAction !== null || Boolean(host.editError)}
               aria-label={`Remove ${host.alias}`}
-              title={`Remove ${host.alias}`}
+              title={host.editError ?? `Remove ${host.alias}`}
             ><Trash2 size={16} /></button>
           </div>
         </li>
       {/each}
     </ul>
+        {:else if source === 'ssh_config' || unlock.state === 'unlocked'}
+          <p class="constraint">No hosts saved here.</p>
+        {/if}
+      </section>
+    {/each}
   {/if}
 </section>
 
@@ -702,26 +647,67 @@
           ><X size={17} /></button>
           <div>
             <h2 id="host-dialog-title">{mode === 'edit' ? `Edit ${selected?.alias}` : 'Add SSH host'}</h2>
+            {#if mode === 'edit'}
+              <p class="dialog-subtitle">Saved in {form.source === 'ssh_config' ? '~/.ssh/config' : 'the Sloosh vault'} · source cannot change</p>
+            {/if}
           </div>
         </header>
 
-        <div class="host-form-sections">
+        <div class="host-form-sections compact">
+          {#if mode === 'add'}
+            <fieldset class="form-section">
+              <legend>Save to</legend>
+              <div class="seg-choices" role="radiogroup" aria-label="Save to">
+                <label class:chosen={form.source === 'vault'}>
+                  <input type="radio" name="host-source" checked={form.source === 'vault'} onchange={() => chooseSource('vault')} />
+                  <span>Sloosh vault</span>
+                </label>
+                <label class:chosen={form.source === 'ssh_config'}>
+                  <input type="radio" name="host-source" checked={form.source === 'ssh_config'} onchange={() => chooseSource('ssh_config')} />
+                  <span>System SSH config</span>
+                </label>
+              </div>
+              {#if form.source === 'ssh_config'}
+                <p class="field-hint">~/.ssh/config and your SSH Agent. No vault copy.</p>
+              {:else if unlock.state === 'unlocked'}
+                <p class="field-hint">Private credentials encrypted by Sloosh · unlocked, {unlockMethodLabel()}</p>
+              {:else}
+                <div class="dialog-unlock-row" aria-label="Unlock vault for this host">
+                  <p class="field-hint"><LockKeyhole size={13} /> Vault locked. Unlock to save; entered details stay here.</p>
+                  {#if snapshot?.vaultExists && snapshot?.nativeApprovalAvailable}
+                    <div class="unlock-actions">
+                      {#if snapshot.touchIdEnrolled}
+                        <button type="button" class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_touch_id')} disabled={activeAction !== null}><Fingerprint size={15} /> Touch ID</button>
+                      {/if}
+                      {#if snapshot.pin.state === 'ready'}
+                        <button type="button" class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_pin')} disabled={activeAction !== null}>PIN</button>
+                      {/if}
+                      <button type="button" class="secondary-button" onclick={() => unlockHosts('unlock_vault_with_master')} disabled={activeAction !== null}>Master password</button>
+                    </div>
+                  {:else}
+                    <button type="button" class="secondary-button" onclick={() => { closeDialog(); onSetup(); }}>Open vault setup</button>
+                  {/if}
+                </div>
+                {#if formError}<p class="dialog-error" role="alert">{formError}</p>{/if}
+              {/if}
+            </fieldset>
+          {/if}
           <fieldset class="form-section">
             <legend><Cable size={15} /> Connection</legend>
-            <div class="host-form-grid">
-              <label class="field-wide">
+            <div class="host-form-grid compact">
+              <label class="field-alias">
                 <span>Alias</span>
                 <input bind:value={form.alias} disabled={mode === 'edit'} required autocomplete="off" placeholder="production-api" />
               </label>
-              <label class="field-wide">
+              <label class="field-host">
                 <span>Hostname</span>
                 <input bind:value={form.hostname} required autocomplete="off" placeholder="server.example.com" />
               </label>
-              <label>
+              <label class="field-user">
                 <span>User</span>
                 <input bind:value={form.user} autocomplete="off" placeholder="System default" />
               </label>
-              <label>
+              <label class="field-port">
                 <span>Port</span>
                 <input bind:value={form.port} type="number" min="1" max="65535" inputmode="numeric" placeholder="22" />
               </label>
@@ -733,32 +719,39 @@
             {#if mode === 'edit'}
               <label class="change-toggle">
                 <input bind:checked={form.changeAuth} type="checkbox" />
-                <span>Change authentication method</span>
+                <span>Change authentication</span>
                 <small>Currently {authLabel(selected?.auth ?? form.auth)}</small>
               </label>
             {/if}
             {#if mode === 'add' || form.changeAuth}
-              <div class="choice-grid auth-choices" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+              <div class="seg-choices" role="radiogroup" aria-label="Authentication method" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
+                {#if form.source === 'ssh_config'}
                 <label class:chosen={form.auth === 'agent'}>
                   <input bind:group={form.auth} type="radio" value="agent" />
-                  <KeyRound size={18} />
-                  <span><strong>SSH agent</strong><small>Uses loaded system SSH Agent keys. Stores no private key.</small></span>
+                  <KeyRound size={14} /><span>SSH Agent</span>
                 </label>
+                {:else}
                 <label class:chosen={form.auth === 'password'}>
                   <input bind:group={form.auth} type="radio" value="password" />
-                  <ShieldCheck size={18} />
-                  <span><strong>Password</strong><small>Stored encrypted in the Sloosh vault.</small></span>
+                  <ShieldCheck size={14} /><span>Password</span>
                 </label>
+                {/if}
                 <label class:chosen={form.auth === 'key_file'}>
                   <input bind:group={form.auth} type="radio" value="key_file" />
-                  <FileKey2 size={18} />
-                  <span><strong>Key file</strong><small>Uses the selected private key.</small></span>
+                  <FileKey2 size={14} /><span>Key file</span>
+                </label>
+                <label class:chosen={form.auth === 'private_key'}>
+                  <input bind:group={form.auth} type="radio" value="private_key" />
+                  <FileKey2 size={14} /><span>Paste key</span>
                 </label>
               </div>
-              {#if form.auth === 'password'}
+              {#if form.auth === 'agent'}
+                <p class="field-hint">Uses keys already loaded in your SSH Agent.</p>
+              {:else if form.auth === 'password'}
                 <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                   <span>SSH password</span>
                   <input bind:value={form.password} type="password" autocomplete="current-password" placeholder="Password for this SSH account" />
+                  <small>Stored encrypted in the Sloosh vault.</small>
                 </label>
               {:else if form.auth === 'key_file'}
                 <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
@@ -769,7 +762,13 @@
                       <FolderOpen size={15} /> Choose…
                     </button>
                   </div>
-                  <small>RSA or encrypted OpenSSH: load this key in the daemon's SSH Agent.<br />Keep Key file selected.</small>
+                  <small>{form.source === 'ssh_config' ? 'Saving runs ssh-add once; Sloosh keeps no key. Reload after the agent restarts.' : 'The path is stored in the vault; the key stays on disk.'} RSA or encrypted keys also need the matching identity in the daemon's SSH Agent.</small>
+                </label>
+              {:else if form.auth === 'private_key'}
+                <label class="conditional-field">
+                  <span>Private key content</span>
+                  <textarea bind:value={form.privateKey} rows="5" maxlength="262144" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+                  <small>{form.source === 'ssh_config' ? 'Loaded into SSH Agent once on save; Sloosh keeps no copy. Reload after the agent restarts.' : 'Stored encrypted in the vault, never written to a key file.'} RSA or encrypted keys also need the matching identity in the daemon's SSH Agent.</small>
                 </label>
               {/if}
             {/if}
@@ -777,25 +776,25 @@
 
           <fieldset class="form-section">
             <legend><GitBranch size={15} /> Route</legend>
-            <div class="route-choices">
+            <div class="seg-choices" role="radiogroup" aria-label="Route">
               <label class:chosen={form.routeMode === 'direct'}>
                 <input bind:group={form.routeMode} type="radio" value="direct" />
-                <span><strong>Direct</strong></span>
+                <span>Direct</span>
               </label>
               <label class:chosen={form.routeMode === 'managed_host'}>
                 <input bind:group={form.routeMode} type="radio" value="managed_host" />
-                <span><strong>Through saved host</strong><small>Use another Sloosh host as a jump.</small></span>
+                <span>Through saved host</span>
               </label>
               <label class:chosen={form.routeMode === 'proxy_jump'}>
                 <input bind:group={form.routeMode} type="radio" value="proxy_jump" />
-                <span><strong>ProxyJump</strong><small>Enter an OpenSSH jump route.</small></span>
+                <span>ProxyJump</span>
               </label>
             </div>
             {#if form.routeMode === 'managed_host'}
               <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <span>Jump host</span>
                 <select bind:value={form.managedHost} required>
-                  <option value="" disabled>Select a host profile</option>
+                  <option value="" disabled>Select a saved host</option>
                   {#each (hosts ?? []).filter((host) => host.alias !== form.alias) as host}
                     <option value={host.alias}>{host.alias} · {endpoint(host)}</option>
                   {/each}
@@ -803,23 +802,19 @@
               </label>
             {:else if form.routeMode === 'proxy_jump'}
               <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
-                <span>ProxyJump specification</span>
+                <span>ProxyJump</span>
                 <input bind:value={form.proxyJump} autocomplete="off" placeholder="user@bastion:22,edge" />
-                <small>Comma-separated jumps. No cycles; up to 8 hops.</small>
+                <small>Comma-separated OpenSSH jumps. No cycles; up to 8 hops.</small>
               </label>
             {/if}
-            <div class="route-preview" aria-live="polite">
-              <span>Route preview</span>
-              <strong>{form.alias.trim() || 'This host'} ← {form.routeMode === 'direct' ? 'Direct' : form.routeMode === 'managed_host' ? (form.managedHost || 'Select host') : (form.proxyJump || 'Enter ProxyJump')}</strong>
-            </div>
           </fieldset>
         </div>
 
-        {#if formError}<p class="dialog-error" role="alert">{formError}</p>{/if}
+        {#if formError && !(mode === 'add' && form.source === 'vault' && unlock.state !== 'unlocked')}<p class="dialog-error" role="alert">{formError}</p>{/if}
         <footer>
           <button type="button" class="secondary-button" onclick={closeDialog} disabled={activeAction !== null}>Cancel</button>
-          <button type="submit" class="primary-button" disabled={activeAction !== null}>
-            {activeAction ? 'Saving...' : mode === 'edit' ? 'Save changes' : 'Add host'}
+          <button type="submit" class="primary-button" disabled={activeAction !== null || (form.source === 'vault' && unlock.state !== 'unlocked')}>
+            {activeAction?.startsWith('unlock_vault') ? 'Unlocking...' : activeAction ? 'Saving...' : form.source === 'vault' && unlock.state !== 'unlocked' ? 'Unlock to save' : mode === 'edit' ? 'Save changes' : 'Add host'}
           </button>
         </footer>
       </form>
@@ -840,7 +835,12 @@
       in:scale={{ start: reducedMotion ? 1 : 0.985, duration: enterDuration, opacity: 0 }}
       out:fade={{ duration: exitDuration }}
     >
-      <header>
+      <header class="dialog-header-end">
+        <div>
+          <h2 id="trust-host-key-title">
+            {keyPreview.state === 'new' ? `Trust host key for ${keyPreview.host}?` : `Host key changed for ${keyPreview.host}`}
+          </h2>
+        </div>
         <button
           type="button"
           class="icon-button dialog-close"
@@ -849,11 +849,6 @@
           aria-label="Close"
           title="Close"
         ><X size={17} /></button>
-        <div>
-          <h2 id="trust-host-key-title">
-            {keyPreview.state === 'new' ? `Trust host key for ${keyPreview.host}?` : `Host key changed for ${keyPreview.host}`}
-          </h2>
-        </div>
       </header>
       <p id="trust-host-key-description">
         {#if keyPreview.state === 'new'}
@@ -862,15 +857,31 @@
           Verify this change independently before replacing the key.
         {/if}
       </p>
+      <div class="fingerprint-block">
+        {#if keyPreview.storedFingerprint}
+          <div class="fingerprint-row">
+            <span>Stored fingerprint</span>
+            <code>{keyPreview.storedFingerprint}</code>
+          </div>
+        {/if}
+        <div class="fingerprint-row">
+          <span>{keyPreview.storedFingerprint ? 'New fingerprint' : 'Fingerprint'} · {keyPreview.algorithm}</span>
+          <code>{keyPreview.fingerprint}</code>
+          <button
+            type="button"
+            class="icon-button"
+            onclick={() => void copyFingerprint()}
+            disabled={activeAction !== null}
+            aria-label={keyPreview.storedFingerprint ? 'Copy new fingerprint' : 'Copy fingerprint'}
+            title={keyPreview.storedFingerprint ? 'Copy new fingerprint' : 'Copy fingerprint'}
+          ><Copy size={15} /></button>
+        </div>
+      </div>
       <dl class="host-key-details">
         <div><dt>Requested host</dt><dd>{keyPreview.requestedHost}</dd></div>
         <div><dt>Key belongs to</dt><dd>{keyPreview.host}</dd></div>
+        {#if keyPreview.hostKeyAlias}<div><dt>Host-key alias</dt><dd>{keyPreview.hostKeyAlias}</dd></div>{/if}
         <div><dt>Endpoint</dt><dd>{keyPreview.hostname.includes(':') ? `[${keyPreview.hostname}]:${keyPreview.port}` : `${keyPreview.hostname}:${keyPreview.port}`}</dd></div>
-        <div><dt>Algorithm</dt><dd><code>{keyPreview.algorithm}</code></dd></div>
-        {#if keyPreview.storedFingerprint}
-          <div><dt>Stored fingerprint</dt><dd><code>{keyPreview.storedFingerprint}</code></dd></div>
-        {/if}
-        <div><dt>New fingerprint</dt><dd><code>{keyPreview.fingerprint}</code></dd></div>
         {#if keyPreview.source}
           <div>
             <dt>Stored in</dt>
@@ -890,9 +901,6 @@
       {#if keyPreviewMessage}<p class="dialog-status" role="status">{keyPreviewMessage}</p>{/if}
       <footer>
         <button class="secondary-button" onclick={closeKeyPreview} disabled={activeAction !== null}>Cancel</button>
-        <button class="secondary-button" onclick={() => void copyFingerprint()} disabled={activeAction !== null}>
-          <Copy size={15} /> {keyPreview.state === 'new' ? 'Copy fingerprint' : 'Copy new fingerprint'}
-        </button>
         <button class="secondary-button" onclick={() => void recheckHostKey()} disabled={activeAction !== null}>
           <RefreshCw size={15} /> Recheck
         </button>
@@ -906,8 +914,8 @@
           {activeAction?.startsWith('trust_host_key:')
             ? 'Verifying...'
             : keyPreview.state === 'new'
-              ? 'Trust host key'
-              : 'Replace host key'}
+              ? 'Trust and continue'
+              : 'Replace and continue'}
         </button>
         {/if}
       </footer>
@@ -932,7 +940,7 @@
       {#if dependentHosts.length > 0}
         <p class="dependency-warning">Jump host for {dependentHosts.map((host) => host.alias).join(', ')}. Change their routes before removing it.</p>
       {:else}
-        <p>Deletes this vault entry and any stored password. Existing SSH sessions stay open.</p>
+        <p>{selected.source === 'ssh_config' ? 'Removes this Host block from ~/.ssh/config. Routes using this alias may stop working. Keys in SSH Agent are kept.' : 'Deletes this vault profile and its stored credential.'} Existing SSH sessions stay open.</p>
       {/if}
       {#if formError}<p class="dialog-error" role="alert">{formError}</p>{/if}
       <footer>

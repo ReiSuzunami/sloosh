@@ -28,6 +28,7 @@ struct HostBlock {
     patterns: Vec<String>,
     include_guards: Vec<Vec<String>>,
     hostname: Option<String>,
+    host_key_alias: Option<String>,
     port: Option<u16>,
     user: Option<String>,
     identity_files: Vec<PathBuf>,
@@ -232,6 +233,7 @@ fn include_paths(raw: &str) -> Result<Vec<String>, ()> {
 pub struct HostConfig {
     pub alias: String,
     pub hostname: String,
+    pub host_key_alias: Option<String>,
     pub port: u16,
     pub user: String,
     pub identity_files: Vec<PathBuf>,
@@ -240,6 +242,36 @@ pub struct HostConfig {
 }
 
 impl SshConfig {
+    /// Concrete aliases are system-owned. Wildcards provide defaults, not rows.
+    pub fn aliases(&self) -> Vec<String> {
+        let mut aliases = self
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .patterns
+                    .iter()
+                    .take_while(|name| !name.starts_with('#'))
+            })
+            .filter(|name| !name.contains(['*', '?', '!', '[', ']']))
+            .cloned()
+            .collect::<Vec<_>>();
+        aliases.sort();
+        aliases.dedup();
+        aliases.retain(|alias| self.contains_alias(alias));
+        aliases
+    }
+
+    pub fn contains_alias(&self, alias: &str) -> bool {
+        let name = alias.rsplit_once('@').map_or(alias, |(_, host)| host);
+        self.blocks.iter().any(|block| {
+            block.patterns.iter().any(|pattern| pattern == name) && block.matches(name)
+        })
+    }
+
+    pub(crate) fn parse_at(contents: &str, path: &std::path::Path) -> Self {
+        Self::parse_with_includes(contents, path.parent(), 0, &mut 0)
+    }
     /// Parse the supported directives. Invalid or unknown lines are retained
     /// as target-scoped diagnostics and skipped. Parsing itself never logs:
     /// callers decide whether the selected host actually depends on this
@@ -338,6 +370,9 @@ impl SshConfig {
                 }
                 "hostname" => with_current_or_global(&mut current, &mut blocks[0], |block| {
                     block.hostname.get_or_insert_with(|| rest.to_string());
+                }),
+                "hostkeyalias" => with_current_or_global(&mut current, &mut blocks[0], |block| {
+                    block.host_key_alias.get_or_insert_with(|| unquote(rest));
                 }),
                 "port" => {
                     with_current_or_global(&mut current, &mut blocks[0], |block| {
@@ -441,7 +476,7 @@ impl SshConfig {
     /// Resolve a host for an actual connection. Diagnostics that could change
     /// endpoint, route, trust identity, or port fail closed; lower-impact
     /// unsupported options are warned once and ignored.
-    pub(super) fn resolve_for_connection(&self, alias: &str) -> Result<HostConfig, SshConfigError> {
+    pub(crate) fn resolve_for_connection(&self, alias: &str) -> Result<HostConfig, SshConfigError> {
         if let Some(error) = self
             .diagnostics_for(alias)
             .into_iter()
@@ -487,6 +522,7 @@ impl SshConfig {
         let mut config = HostConfig {
             alias: alias.to_string(),
             hostname: host_key.to_string(),
+            host_key_alias: None,
             port: 22,
             user: user_override
                 .map(str::to_string)
@@ -504,6 +540,9 @@ impl SshConfig {
         for block in &self.blocks {
             if !block.matches(host_key) {
                 continue;
+            }
+            if config.host_key_alias.is_none() {
+                config.host_key_alias.clone_from(&block.host_key_alias);
             }
             if !hostname_set {
                 if let Some(hostname) = &block.hostname {
@@ -575,7 +614,6 @@ fn is_connection_critical_directive(directive: &str) -> bool {
             | "include"
             | "proxycommand"
             | "proxyusefdpass"
-            | "hostkeyalias"
             | "canonicalizehostname"
             | "canonicaldomains"
     )
@@ -618,7 +656,7 @@ fn with_current_or_global(
     }
 }
 
-fn split_directive(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_directive(line: &str) -> Option<(&str, &str)> {
     let line = line.trim();
     if let Some(index) = line.find(|ch: char| ch.is_whitespace() || ch == '=') {
         let rest = line[index..].trim_start();

@@ -156,6 +156,10 @@ pub struct KillArgs {
 
 #[derive(Debug, Args)]
 pub struct RequestArgs {
+    /// After authorization, connect and trust new host keys for targets and
+    /// ProxyJump hops (TOFU). Changed keys still fail; this does not bypass leases.
+    #[arg(long)]
+    pub trust_new_host: bool,
     /// Hosts to request access to (leases are scoped by host, never global).
     #[arg(required = true)]
     pub hosts: Vec<String>,
@@ -169,7 +173,8 @@ pub struct ApproveArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Alias the agent will refer to this credential by (never the credential itself).
+    /// Host alias. Without a TTY, requests add-only enrollment through the native
+    /// helper; secrets never enter the Agent. Initialize the vault first.
     pub alias: String,
     /// Real hostname/address to connect to.
     #[arg(long)]
@@ -525,6 +530,20 @@ pub struct LogArgs {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn request_trust_new_host_is_explicit_and_defaults_off() {
+        for (args, expected) in [
+            (vec!["sloosh", "request", "host"], false),
+            (vec!["sloosh", "request", "--trust-new-host", "host"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Request(args) = cli.command else {
+                panic!("expected request")
+            };
+            assert_eq!(args.trust_new_host, expected);
+        }
+    }
 
     #[test]
     fn forward_help_documents_open_and_management_forms() {

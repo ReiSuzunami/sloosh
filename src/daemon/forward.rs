@@ -980,6 +980,7 @@ mod tests {
                 caller_pid: u32::MAX,
                 lease_token: None,
                 target_requires_system_agent: false,
+                trust_new_host: false,
             },
         )
         .await;

@@ -289,6 +289,7 @@ pub async fn remove_pin_credential() -> Result<(), NativeApprovalError> {
 
 pub async fn try_approve(
     info: &LeaseRequestSummary,
+    trust_new_host: bool,
 ) -> Result<NativeApprovalOutcome, NativeApprovalError> {
     let mut helper = HelperProcess::spawn().await?;
     let master_password = match helper
@@ -310,7 +311,7 @@ pub async fn try_approve(
     };
 
     let mut cleanup = NativePreviewCleanup::armed();
-    let result = finish_native_approval(helper, info, &master_password).await;
+    let result = finish_native_approval(helper, info, &master_password, trust_new_host).await;
     match result {
         Ok(outcome) => {
             cleanup.disarm();
@@ -327,13 +328,14 @@ async fn finish_native_approval(
     mut helper: HelperProcess,
     info: &LeaseRequestSummary,
     master_password: &SecretString,
+    trust_new_host: bool,
 ) -> Result<NativeApprovalOutcome, NativeApprovalError> {
     let approved_hosts =
         lease::preview_native_approval(&info.id, master_password.expose_secret().as_bytes())
             .await?;
     for host in &approved_hosts {
-        let (hostname, port) = ssh::resolve_endpoint(host).await?;
-        if !ssh::host_has_known_key(&hostname, port) {
+        let (hostname, port) = ssh::resolve_host_key_endpoint(host).await?;
+        if !trust_new_host && !ssh::host_has_known_key(&hostname, port) {
             return Err(NativeApprovalError::HostKeyConfirmationRequired);
         }
     }

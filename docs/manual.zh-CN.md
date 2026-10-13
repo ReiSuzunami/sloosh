@@ -88,11 +88,35 @@ sloosh skill status --agent auto
 sloosh status
 ```
 
+Skill 检测区分缺失、当前版本、可更新、本地修改和外部管理。桌面 Setup 显示检测路径，
+单独报告读取失败，窗口重新获得焦点时刷新。Codex 通用路径为 `~/.agents/skills/sloosh`，
+Claude Code 使用 `~/.claude/skills/sloosh`；后者链接到共享目录时可正确识别，不重复写入。
+更新不会沿软链接写入或覆盖自定义内容；需更新直接指向的受管理目录。
+
 安装、校验和、升级与平台排障见[安装指南](getting-started/installation.zh-CN.md)。
 
 ## 配置主机
 
-主机管理是交互式、人类专用操作：
+**系统托管只保留一份配置：** Hosts 无需解锁 vault，即可读取 `~/.ssh/config` 及
+Include 文件中的明确主机别名。选择 System SSH 或系统托管密钥选项，只把连接配置
+写入 SSH config；密钥选项执行 ssh-add 后丢弃粘贴内容，不创建 vault 副本。
+不交给系统的密码／私钥仍可保存在 vault。系统中的明确别名优先于同名旧 vault 记录，
+hostname 和 ProxyJump 均以系统为准；旧记录保留，不擅自迁移或删除。
+通配符仅提供默认值，不列为主机。编辑／删除仅支持主配置文件内唯一、明确的 Host 段；
+Include、共享或重复定义需修改源文件。其他设置和注释原样保留，存在优先级覆盖时拒绝写入。
+`sloosh host add --auth agent` 同样直接写系统配置，无需初始化 vault。
+
+列表按系统与 vault 分组；新增时明确选择 **Save to**，编辑时来源固定，不做隐式迁移。
+Vault 锁定时仍可选中，在添加窗口内解锁后继续保存，已填主机信息不会丢失。
+系统来源中的文件／粘贴密钥在保存时执行 ssh-add；vault 来源的密钥保留在 vault。
+解锁控件只放在 vault 分组。不可编辑条目提前显示原因；删除确认按来源说明实际操作。
+主机保存成功但密钥加载失败时只显示一条警告，不同时出现成功和失败提示。
+
+编辑、列出、删除和信任主机仍由人类操作。Agent 可无 TTY 执行
+`sloosh host add`，只新增、不覆盖。需先初始化 vault：普通模式通过内嵌原生窗口
+收取主密码；危险绕过模式读取已有 Keychain 凭据。SSH 密码也由用户在原生窗口
+输入，Agent 不接触密码。未安装原生 helper 时，仍由人类在终端添加。
+新增配置不授予连接租约，也不自动信任主机指纹。
 
 ```sh
 sloosh host list
@@ -103,9 +127,10 @@ sloosh host trust myhost
 sloosh host rm myhost
 ```
 
-认证方式包括 SSH agent、vault 加密密码，或私钥文件路径。未加密 Ed25519/ECDSA
+认证方式包括 SSH agent、vault 加密密码、私钥文件路径，或在桌面主机编辑器中
+粘贴私钥。粘贴内容加密保存在 vault，不写明文密钥文件，上限 256 KiB。未加密 Ed25519/ECDSA
 直接签名；RSA 或加密 OpenSSH 私钥保留 KeyFile profile，同时由人类把同一把钥匙
-载入 daemon 使用的 SSH Agent。Sloosh 只选择对应公钥身份，不解密、不自动加载钥匙，
+载入 daemon 使用的 SSH Agent。Sloosh 只选择对应公钥身份，不解密钥匙，
 也不在本地进行 RSA 签名。没有可读 OpenSSH 公钥元数据的加密格式不受支持。
 
 Agent 缺少该身份时，错误会给出经过 shell 引号转义、指向 daemon 实际 Agent socket
@@ -113,6 +138,12 @@ Agent 缺少该身份时，错误会给出经过 shell 引号转义、指向 dae
 应检查远端用户的 authorized_keys；加载其他钥匙不会改变此 profile 选中的身份。
 KeyFile 的 lease 审批要求不变，Sloosh 不配置 Agent 重启后的自动加载。
 SSH 配置主机保持现有 Agent 优先的认证顺序。
+
+两种私钥输入均可勾选 **Load into system SSH Agent on save**：保存成功后执行一次
+`ssh-add`。默认关闭，修改认证时需重新勾选。粘贴私钥只通过 stdin 传递，不进入参数、
+环境变量或临时文件。App 的 `SSH_AUTH_SOCK` 必须与 daemon 一致；加密私钥需要已配置
+`SSH_ASKPASS`，或由用户手动加载。使用同一 Agent 的其他应用也能使用该密钥。
+加载失败会明确提示主机已保存并显示警告，不回滚配置；不修改登录或启动加载设置。
 
 使用 `--auth agent` 的 vault profile 只使用默认系统 `$SSH_AUTH_SOCK`；daemon 能检查
 已解锁 vault 后可跳过人工 lease 批准。DMG Keychain 预览可无审批弹窗提供该状态；仅 CLI
@@ -140,7 +171,7 @@ alias 是稳定身份，不能改名。所有选项见 `sloosh host add --help` 
 `~user` 与递归 `**` 通配符仍会拒绝解析，不会静默丢失连接设置。
 其他 `Host` 块中的不支持指令保持静默；命中目标的低影响
 未实现选项只生成一条精简诊断。已知会改变 endpoint、路由或 host-key 身份的
-`ProxyCommand`、`ProxyUseFdpass`、`HostKeyAlias` 与 hostname
+`ProxyCommand`、`ProxyUseFdpass` 与 hostname
 canonicalization 会直接失败，不会猜测默认设置。Sloosh 不解析 `Match` 条件，
 所以任何 `Match` 区段都会让 SSH-config-backed 主机 fail closed。直连 vault
 profile 不读取无关 SSH 配置。
@@ -164,18 +195,26 @@ Master Password 与 PIN 只在内置原生 helper 中输入，不会进入 WebVi
 Hosts 中输入的 SSH password 仅短暂存在，通过本地命令边界时使用脱敏 secret，提交后
 立即清空。Finder 隐藏 `.ssh` 时，可直接输入私钥完整路径，也可继续使用文件选择器。
 
-每条主机记录还提供手动 host-key 信任与端到端连接测试。信任流程会显示实际解析的
+每条主机记录只保留 **Test connection**。需要信任时弹窗显示实际解析的
 endpoint、key algorithm 与 SHA256 指纹；key 发生变化时，同时显示旧、新指纹及其来源文件。
-请通过独立来源核对新指纹，再选择 `Trust host key` 或 `Replace host key`。
+请通过独立来源核对新指纹，再选择 `Trust and continue` 或 `Replace and continue`。
 Sloosh 写入前会重新解析路由并重新探测，
 且只会修改 `~/.sloosh/known_hosts`，绝不修改 `~/.ssh/known_hosts`。若预览期间状态又有
 变化，弹窗只刷新内容，不执行写入。ProxyJump key 按依赖顺序逐个展示。
 
 终端中的 `sloosh host trust myhost` 提供同样的人类专用流程。连接测试遇到未信任或变化的
 key 时会先打开该弹窗；路由上的 key 全部受信任后自动重试普通 lease 流程，并依次验证 TCP、
-SSH handshake、host key、配置的认证方式与远端 shell，最后清理专用测试 session。
-从主机记录直接打开信任弹窗不会启动连接测试。删除主机会移除该条 vault 记录及其中存储的
+SSH handshake、host key、配置的认证方式与 SSH session channel，不执行 Unix 命令，
+不创建持久 shell，整个连接测试限时 30 秒。
+确认后的连接错误仍显示在 Hosts 页面。系统明确别名使用 SSH config 中的 hostname、port 和
+route，不受旧 vault 副本遮蔽；其他 vault 主机使用保存的配置。删除 vault 主机会移除记录及
 密码；已有 SSH session 仍保持连接。
+
+Agent 可显式执行 `sloosh request --trust-new-host myhost`：完成正常租约授权后，
+每个请求主机尝试一次 SSH 连接（限时 30 秒），记录目标及跳板首次出现的密钥。
+已变更密钥（含算法变更）仍拒绝，不开启危险绕过，也不跳过认证或租约检查。
+首次信任无法独立验证服务器身份。授权待定时不连接；批准后重新执行带参数的请求。
+连接失败不撤销已授予租约或本次已记录的密钥。之后正常使用 `sloosh run`。
 
 达到配置的空闲期，或发生系统睡眠、锁屏、切换用户、手动锁定、退出 App、绝对会话上限时，
 App 会锁定 vault session。凭据、超时与审批边界以

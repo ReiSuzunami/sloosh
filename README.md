@@ -1,5 +1,11 @@
 # sloosh
 
+系统托管主机只保存在 `~/.ssh/config`，密钥交给 `ssh-agent`；桌面无需解锁 vault 即可列出。
+`sloosh host add --auth agent` 直接写入系统配置，不创建 vault 副本。
+密码和未交给系统托管的私钥仍可保存在 vault。连接测试包含指纹确认；
+Agent 可显式使用 `sloosh request --trust-new-host <host>` 首次信任。
+详见[配置主机](docs/manual.zh-CN.md#配置主机)。
+
 Dangerous Bypass Mode 支持启动参数与持久配置，GUI Security 可显式开启（重启生效）：
 本地 daemon 允许同一系统用户全访问：无需申请或续约 lease，不限制授权主机范围；
 SSH 登录认证与 vault 解锁仍需完成。未知主机自动信任，默认关闭。

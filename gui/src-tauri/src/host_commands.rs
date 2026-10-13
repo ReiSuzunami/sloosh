@@ -1,6 +1,6 @@
 //! Tauri commands for vault-backed host inventory.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sloosh::proto::{
     HostAuth, HostAuthKind, HostRoute, HostSummary, Request, Response, SecretString,
 };
@@ -11,6 +11,7 @@ use super::gui_error::{daemon_request_failed, unexpected_daemon_response};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HostInput {
+    source: String,
     alias: String,
     hostname: String,
     port: Option<u16>,
@@ -18,7 +19,48 @@ pub(crate) struct HostInput {
     auth: HostAuthKind,
     password: Option<SecretString>,
     key_file: Option<String>,
+    private_key: Option<SecretString>,
+    #[serde(default)]
+    sync_to_agent: bool,
     route: HostRoute,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagedHost {
+    #[serde(flatten)]
+    host: HostSummary,
+    source: &'static str,
+    edit_error: Option<String>,
+}
+
+impl HostInput {
+    fn summary(&self) -> HostSummary {
+        HostSummary {
+            alias: self.alias.clone(),
+            hostname: self.hostname.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            auth: HostAuthKind::Agent,
+            route: self.route.clone(),
+        }
+    }
+}
+
+async fn save_system_host(host: &mut HostInput, replace: bool) -> Result<Option<String>, String> {
+    if host.auth == HostAuthKind::Password {
+        return Err("Password profiles belong in the vault, under a separate alias.".into());
+    }
+    let sync = if host.sync_to_agent {
+        Some(host_auth(host)?)
+    } else {
+        None
+    };
+    if host.auth != HostAuthKind::Agent && sync.is_none() {
+        return Err("System-host keys must be loaded into SSH Agent on save.".into());
+    }
+    sloosh::system_hosts::save(&host.summary(), replace).map_err(|error| error.to_string())?;
+    Ok(sync_saved_key(sync).await)
 }
 
 fn host_auth(input: &mut HostInput) -> Result<HostAuth, String> {
@@ -38,6 +80,73 @@ fn host_auth(input: &mut HostInput) -> Result<HostAuth, String> {
                 .filter(|path| !path.trim().is_empty())
                 .ok_or_else(|| "Choose a private key file path.".to_string())?,
         }),
+        HostAuthKind::PrivateKey => {
+            let private_key = input
+                .private_key
+                .take()
+                .ok_or_else(|| "Paste a private key.".to_string())?;
+            sloosh::daemon::ssh::decode_vault_private_key(private_key.expose_secret())
+                .map_err(|_| "Invalid or unsupported private key (maximum 256 KiB).".to_string())?;
+            Ok(HostAuth::PrivateKey { private_key })
+        }
+    }
+}
+
+/// Only run after the vault save succeeds. Report partial success separately;
+/// do not encourage retrying an already committed add operation.
+async fn sync_saved_key(auth: Option<HostAuth>) -> Option<String> {
+    let auth = auth?;
+    let result = tauri::async_runtime::spawn_blocking(move || -> std::io::Result<bool> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("/usr/bin/ssh-add");
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("SSH_ASKPASS_REQUIRE", "force");
+        match auth {
+            HostAuth::KeyFile { path } => {
+                let path = if let Some(relative) = path.strip_prefix("~/") {
+                    std::path::PathBuf::from(
+                        std::env::var_os("HOME")
+                            .ok_or_else(|| std::io::Error::other("HOME is not set"))?,
+                    )
+                    .join(relative)
+                } else {
+                    std::path::PathBuf::from(path)
+                };
+                // An absolute path cannot be interpreted as an ssh-add option.
+                let path = std::path::absolute(path)?;
+                Ok(command.arg(path).stdin(Stdio::null()).status()?.success())
+            }
+            HostAuth::PrivateKey { private_key } => {
+                let mut child = command.arg("-").stdin(Stdio::piped()).spawn()?;
+                let written = child
+                    .stdin
+                    .take()
+                    .expect("piped stdin")
+                    .write_all(private_key.expose_secret().as_bytes());
+                let status = child.wait()?;
+                written?;
+                Ok(status.success())
+            }
+            _ => Ok(false),
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => None,
+        _ => Some("Host saved, but ssh-add failed. Check the app's SSH_AUTH_SOCK and, for encrypted keys, configure SSH_ASKPASS or load the key manually. The daemon must use the same agent socket.".into()),
+    }
+}
+
+fn key_to_sync(auth: &HostAuth, enabled: bool) -> Result<Option<HostAuth>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    match auth {
+        HostAuth::KeyFile { .. } | HostAuth::PrivateKey { .. } => Ok(Some(auth.clone())),
+        _ => Err("Only private-key authentication can be loaded into SSH Agent.".into()),
     }
 }
 
@@ -60,17 +169,46 @@ async fn host_inventory(
 #[tauri::command]
 pub(crate) async fn list_hosts(
     controller: tauri::State<'_, Controller>,
-) -> Result<Vec<HostSummary>, String> {
-    let controller = controller.inner().clone();
-    let password = controller.master_password()?;
-    host_inventory(&controller, password).await
+) -> Result<Vec<ManagedHost>, String> {
+    let mut hosts = sloosh::system_hosts::list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|entry| ManagedHost {
+            host: entry.host,
+            source: "ssh_config",
+            edit_error: entry.edit_error,
+        })
+        .collect::<Vec<_>>();
+    if controller.unlock_snapshot().state == "unlocked" {
+        let password = controller.master_password()?;
+        for host in host_inventory(controller.inner(), password).await? {
+            // Explicit SSH config aliases own the route, never the old vault copy.
+            if !hosts.iter().any(|system| system.host.alias == host.alias) {
+                hosts.push(ManagedHost {
+                    host,
+                    source: "vault",
+                    edit_error: None,
+                });
+            }
+        }
+    }
+    hosts.sort_by(|left, right| left.host.alias.cmp(&right.host.alias));
+    Ok(hosts)
 }
 
 #[tauri::command]
 pub(crate) async fn add_host(
     controller: tauri::State<'_, Controller>,
     mut host: HostInput,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    if host.source == "ssh_config" {
+        return save_system_host(&mut host, false).await;
+    }
+    if sloosh::daemon::ssh::SshConfig::load_default().contains_alias(&host.alias) {
+        return Err(
+            "This alias is owned by SSH config. Edit the system host or use another alias.".into(),
+        );
+    }
     let controller = controller.inner().clone();
     let master_password = controller.master_password()?;
     let existing_hosts = host_inventory(&controller, master_password.clone()).await?;
@@ -81,6 +219,7 @@ pub(crate) async fn add_host(
         ));
     }
     let auth = host_auth(&mut host)?;
+    let sync = key_to_sync(&auth, host.sync_to_agent)?;
     match controller
         .client()
         .request(&Request::AddCred {
@@ -96,7 +235,7 @@ pub(crate) async fn add_host(
         .await
         .map_err(|_| daemon_request_failed("adding a host"))?
     {
-        Response::Ok => Ok(()),
+        Response::Ok => Ok(sync_saved_key(sync).await),
         Response::Error { message } => Err(message),
         _ => Err(unexpected_daemon_response("adding a host")),
     }
@@ -107,13 +246,36 @@ pub(crate) async fn update_host(
     controller: tauri::State<'_, Controller>,
     mut host: HostInput,
     change_auth: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    if host.source == "ssh_config" {
+        let exists = sloosh::daemon::ssh::SshConfig::load_default().contains_alias(&host.alias);
+        if !exists {
+            return Err(
+                "This system host no longer exists. Reload the list before editing.".into(),
+            );
+        }
+        return save_system_host(&mut host, true).await;
+    }
+    if sloosh::daemon::ssh::SshConfig::load_default().contains_alias(&host.alias) {
+        return Err(
+            "This alias is owned by SSH config; use a different alias for a vault profile.".into(),
+        );
+    }
     let controller = controller.inner().clone();
     let master_password = controller.master_password()?;
     let auth = if change_auth {
         Some(host_auth(&mut host)?)
     } else {
         None
+    };
+    let sync = match &auth {
+        Some(auth) => key_to_sync(auth, host.sync_to_agent)?,
+        None if host.sync_to_agent => {
+            return Err(
+                "Select Change authentication and supply the key to load it into SSH Agent.".into(),
+            );
+        }
+        None => None,
     };
     match controller
         .client()
@@ -129,7 +291,7 @@ pub(crate) async fn update_host(
         .await
         .map_err(|_| daemon_request_failed("updating a host"))?
     {
-        Response::Ok => Ok(()),
+        Response::Ok => Ok(sync_saved_key(sync).await),
         Response::Error { message } => Err(message),
         _ => Err(unexpected_daemon_response("updating a host")),
     }
@@ -139,7 +301,11 @@ pub(crate) async fn update_host(
 pub(crate) async fn remove_host(
     controller: tauri::State<'_, Controller>,
     alias: String,
+    source: String,
 ) -> Result<(), String> {
+    if source == "ssh_config" {
+        return sloosh::system_hosts::remove(&alias).map_err(|error| error.to_string());
+    }
     let controller = controller.inner().clone();
     let master_password = controller.master_password()?;
     match controller
@@ -161,8 +327,37 @@ pub(crate) async fn remove_host(
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_loading_requires_explicit_key_opt_in() {
+        let key = HostAuth::KeyFile {
+            path: "/fixture/key".into(),
+        };
+        assert!(key_to_sync(&key, false).unwrap().is_none());
+        assert_eq!(key_to_sync(&key, true).unwrap(), Some(key));
+        assert!(key_to_sync(&HostAuth::Agent, true).is_err());
+        assert!(
+            key_to_sync(
+                &HostAuth::Password {
+                    password: SecretString::new("fixture")
+                },
+                true
+            )
+            .is_err()
+        );
+        let inline = HostAuth::PrivateKey {
+            private_key: SecretString::new("fixture-key"),
+        };
+        assert_eq!(key_to_sync(&inline, true).unwrap(), Some(inline));
+        let mut input = host_input(HostAuthKind::PrivateKey);
+        input.private_key = Some(SecretString::new("invalid-key-fixture"));
+        let error = host_auth(&mut input).unwrap_err();
+        assert!(!error.contains("invalid-key-fixture"));
+        assert!(input.private_key.is_none());
+    }
+
     fn host_input(auth: HostAuthKind) -> HostInput {
         HostInput {
+            source: "vault".into(),
             alias: "example".into(),
             hostname: "example.test".into(),
             port: None,
@@ -170,6 +365,8 @@ mod tests {
             auth,
             password: None,
             key_file: None,
+            private_key: None,
+            sync_to_agent: false,
             route: HostRoute::Direct,
         }
     }

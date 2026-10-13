@@ -27,6 +27,27 @@ fn ed25519_key() -> PrivateKey {
 }
 
 #[test]
+fn inline_keys_decode_without_broadening_authority_or_leaking_errors() {
+    let key = ed25519_key();
+    let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+    let loaded = decode_vault_private_key(&pem).unwrap();
+    assert_eq!(loaded.public_key(), key.public_key());
+    let auth = vault::AuthMethod::PrivateKey {
+        private_key: crate::proto::SecretString::new(pem.to_string()),
+    };
+    assert!(!auth_matches_system_agent_policy(Some(&auth), None));
+    assert!(!format!("{auth:?}").contains(pem.as_str()));
+    let encrypted = key
+        .encrypt(&mut russh::keys::key::safe_rng(), "test-passphrase")
+        .unwrap();
+    let pem = encrypted.to_openssh(ssh_key::LineEnding::LF).unwrap();
+    assert!(decode_vault_private_key(&pem).unwrap().is_encrypted());
+    let error = decode_vault_private_key("secret-invalid-input").unwrap_err();
+    assert!(!error.to_string().contains("secret-invalid-input"));
+    assert!(decode_vault_private_key(&"x".repeat(MAX_VAULT_KEY_FILE_BYTES as usize + 1)).is_err());
+}
+
+#[test]
 fn vault_key_file_reads_encrypted_public_identity_without_decryption() {
     let fixture = Fixture::new();
     let key = ed25519_key();

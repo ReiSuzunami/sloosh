@@ -47,6 +47,8 @@ struct AppSnapshot {
     daemon: DaemonSnapshot,
     vault_exists: bool,
     skill_ready: bool,
+    skill_detail: String,
+    skill_error: Option<String>,
     native_approval_available: bool,
     touch_id_enrolled: bool,
     pin: PinSnapshot,
@@ -152,10 +154,20 @@ impl Controller {
         } else {
             false
         };
+        let (skill_ready, skill_detail, skill_error) = match sloosh::cli::embedded_skill_status() {
+            Ok((ready, detail)) => (ready, detail, None),
+            Err(error) => (
+                false,
+                "Could not check Skill installation.".into(),
+                Some(error.to_string()),
+            ),
+        };
         AppSnapshot {
             daemon,
             vault_exists,
-            skill_ready: sloosh::cli::embedded_skill_ready().unwrap_or(false),
+            skill_ready,
+            skill_detail,
+            skill_error,
             native_approval_available,
             touch_id_enrolled,
             pin: PinStore::current_user().status().into(),

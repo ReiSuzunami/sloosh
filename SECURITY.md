@@ -387,7 +387,7 @@ Specific files use these controls:
 - local download temp: random `create_new` file requested at `0666`, reduced by
   the caller's umask in the destination directory, then atomic commit.
 
-Agent Skill installation is a CLI-only operation and never contacts the daemon
+Agent Skill installation is a local operation (CLI or desktop adapter) and never contacts the daemon
 or reads the vault. Targets are fixed beneath the current `HOME`:
 `~/.agents/skills/sloosh` for Codex-compatible readers and
 `~/.claude/skills/sloosh` for Claude Code. Each path component is opened
@@ -404,6 +404,15 @@ Externally managed, malformed-marker, or locally modified content is preserved
 unless the human explicitly uses `--force` or `--force-skill`. A Skill already
 matching the embedded content remains externally managed rather than silently
 changing ownership.
+
+Read-only status checks may resolve a final Skill-directory symlink beneath
+the same HOME after validating its parent. The resolved directory is opened
+with the same ownership, permissions, bounded-read, and no-follow checks.
+Broken links and targets outside HOME are errors, not missing installations.
+An already-current linked Skill needs no write; installation skips it without
+changing ownership. Updates and forced writes through links remain refused:
+update the direct managed target instead. Auto installation processes the
+portable Codex target before Claude's possible link to it.
 
 These controls protect against other users and common symlink/path mistakes.
 They do not stop the owner UID from modifying its own files.
@@ -436,7 +445,7 @@ macOS filesystem permissions, Gatekeeper, or Privacy controls.
 
 The vault uses Argon2id and ChaCha20-Poly1305. A fresh salt and nonce are used
 for each save. Successful AEAD decryption is the password check.
-Vault envelope version 2 adds typed authentication and routing. Version-1
+Vault envelope version 3 adds inline private keys; version 2 added typed authentication and routing. Version-1/2
 plaintext is accepted and rewritten on the next mutation; unknown newer
 versions fail with an upgrade-required error before decryption.
 
@@ -472,11 +481,16 @@ identity is readable without decrypting its private payload. Encrypted formats
 without readable OpenSSH public metadata are rejected. Vault key-file reads
 are bounded to 256 KiB and the input buffer is zeroizing.
 
-KeyFile remains KeyFile authority and does not qualify for system-agent-only
-automatic leases just because signing is delegated. Sloosh never loads keys
-into the agent, changes its persistence or configuration, decrypts these keys,
-or generates public-key sidecars. The human must load the key into the same
-agent socket used by the daemon. Agent key comments are not logged.
+KeyFile and PrivateKey remain key authority and do not qualify for system-agent-only
+automatic leases just because signing is delegated. Inline keys use redacted,
+zeroizing secret buffers, encrypted vault storage, and the same 256 KiB limit.
+The desktop can run `/usr/bin/ssh-add` once after a successful save when the
+human explicitly selects it. Inline keys use child stdin, never argv, env, or
+plaintext temporary files. Child output is suppressed to avoid key comments;
+failure is a warning distinct from the successful vault save. The inherited
+SSH_AUTH_SOCK must match the daemon; encrypted keys require SSH_ASKPASS or
+manual loading. Other clients of that agent gain use of the key. Sloosh does
+not configure persistence, decrypt these keys, or generate public-key sidecars.
 SSH-config hosts retain their existing agent-first, then unencrypted
 IdentityFile authentication order, including rejection of local RSA signing.
 
@@ -485,14 +499,41 @@ append-only, remote, signed, or tamper-resistant security control.
 
 ### 4.7 Host-key bootstrap
 
+HostKeyAlias is honored for both lookups and Sloosh-owned trust writes, verbatim
+without adding the network port, as in OpenSSH. The real network endpoint stays
+unchanged and is shown alongside the key alias in confirmation previews. The
+alias is part of the stale-preview comparison; mismatches remain fail closed.
+
+Explicit named SSH-config aliases are system-owned and resolve before vault
+lookup, even while the vault is locked. Their system endpoint, route and
+authentication are authoritative; a legacy vault record cannot shadow them.
+Unmatched aliases retain vault-first resolution and fail closed when locked.
+System-agent automatic grants still reject IdentityFile fallback/custom agents.
+Desktop system edits and Agent-auth CLI additions write SSH config directly:
+bounded owner-checked no-follow reads, validated directive values, unique exact
+root stanzas only, same-directory 0600 temporary file and atomic rename.
+Include/shared/ambiguous definitions require manual editing; no private key is
+written into config or duplicated into the vault for system-managed hosts.
+The desktop's public-key preview may run without vault unlock for explicit
+system aliases; vault-backed dependencies still require their credentials.
+
 Approval orders host-key confirmation by dependency: jump hosts first, then
 targets. A target reachable through ProxyJump is probed through that route.
 Intermediate hops use strict known-host verification and normal authentication.
 Only the final unknown target uses a temporary key-capture handler, and the
 probe stops before authenticating to that target.
 
-No key is recorded without human confirmation. Probe failure or rejection
-leaves the host unknown, and real SSH connection attempts remain fail closed.
+By default, keys require human confirmation. Explicit
+`sloosh request --trust-new-host` opts into TOFU for that request's targets and
+ProxyJump route after normal lease authorization. It creates no global trust
+policy and cannot bypass method-restricted leases. Pending approval does not
+connect. Each target connection is limited to 30 seconds and is discarded
+after authentication; no reusable session is created. Unknown keys may be
+recorded before authentication succeeds. A later failure does not roll back
+recorded keys or the lease. Existing-key and algorithm changes remain errors
+in either trust store. TOFU does not independently authenticate first contact.
+Without explicit TOFU or Dangerous Bypass Mode, probe failure or rejection
+leaves the host unknown and connections remain fail closed.
 
 The desktop Hosts screen and `sloosh host trust` expose the same bootstrap as
 an explicit human-only operation. It temporarily unlocks a process-local vault
@@ -549,6 +590,7 @@ credential-cache expiry, SSH authentication, and resource bounds are not bypasse
 | `VaultExists` | no lease | metadata only |
 | `InitVault` | no existing vault plus new master password | CLI requires TTY |
 | `AddCred` | master password | may create first vault; carries explicit agent/password/key-file auth; CLI requires TTY |
+| `EnrollHost` | existing vault; native master-password prompt, or existing Keychain credential in bypass | Agent-callable, add-only; no replacement, lease grant, or host-key trust; SSH passwords entered in native helper; no master password returned to caller |
 | `ListHosts` | master password | returns sorted non-secret connection metadata; CLI requires TTY |
 | `UpdateHost` | master password | preserves current auth unless an explicit replacement is supplied; CLI requires TTY |
 | `RmCred` | master password | CLI requires TTY |

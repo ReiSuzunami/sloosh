@@ -206,14 +206,7 @@ fn cmd_skill_install(args: SkillInstallArgs) -> anyhow::Result<()> {
 
 fn cmd_skill_status(args: SkillStatusArgs) -> anyhow::Result<()> {
     for target in skill_targets(args.agent)? {
-        let state = match skill::inspect_target(&target)? {
-            skill::SkillStatus::Missing => "missing",
-            skill::SkillStatus::CurrentManaged => "current (managed by sloosh)",
-            skill::SkillStatus::CurrentExternal => "current (externally managed)",
-            skill::SkillStatus::UpgradeAvailable => "upgrade available",
-            skill::SkillStatus::Modified => "locally modified",
-            skill::SkillStatus::External => "externally managed",
-        };
+        let state = skill::inspect_target(&target)?.label();
         println!("{}: {state} ({})", target.agent, target.directory.display());
     }
     Ok(())
@@ -229,13 +222,20 @@ fn skill_targets(agent: SkillAgent) -> anyhow::Result<Vec<skill::SkillTarget>> {
 }
 
 /// Read-only desktop seam for the embedded Skill's auto-detected targets.
-pub fn embedded_skill_ready() -> anyhow::Result<bool> {
-    Ok(skill_targets(SkillAgent::Auto)?.iter().all(|target| {
-        matches!(
-            skill::inspect_target(target),
-            Ok(skill::SkillStatus::CurrentManaged | skill::SkillStatus::CurrentExternal)
-        )
-    }))
+pub fn embedded_skill_status() -> anyhow::Result<(bool, String)> {
+    let mut ready = true;
+    let mut details = Vec::new();
+    for target in skill_targets(SkillAgent::Auto)? {
+        let status = skill::inspect_target(&target)?;
+        ready &= status.is_current();
+        details.push(format!(
+            "{}: {} ({})",
+            target.agent,
+            status.label(),
+            target.directory.display()
+        ));
+    }
+    Ok((ready, details.join("\n")))
 }
 
 /// Install/update the embedded Skill without exposing a general process API.
@@ -243,7 +243,7 @@ pub fn install_embedded_skill() -> anyhow::Result<bool> {
     for target in skill_targets(SkillAgent::Auto)? {
         skill::install_target(&target, false)?;
     }
-    embedded_skill_ready()
+    embedded_skill_status().map(|(ready, _)| ready)
 }
 
 #[cfg(test)]

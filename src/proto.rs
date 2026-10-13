@@ -26,7 +26,7 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Exact local client/daemon wire contract version. Bump this for any incompatible
 /// message shape or sequencing change; package versions may differ while this
 /// remains equal.
-pub const WIRE_PROTOCOL_VERSION: u32 = 3;
+pub const WIRE_PROTOCOL_VERSION: u32 = 5;
 
 /// A password/secret that crosses the CLI<->daemon socket (docs/internals/architecture.md:
 /// "passwords/keys crossing the socket is acceptable, same-user 0600" — but
@@ -70,6 +70,8 @@ impl PartialEq for SecretString {
     }
 }
 
+impl Eq for SecretString {}
+
 impl Drop for SecretString {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -84,6 +86,7 @@ pub enum HostAuth {
     Agent,
     Password { password: SecretString },
     KeyFile { path: String },
+    PrivateKey { private_key: SecretString },
 }
 
 /// Non-secret authentication label returned in host inventory responses.
@@ -93,6 +96,7 @@ pub enum HostAuthKind {
     Agent,
     Password,
     KeyFile,
+    PrivateKey,
 }
 
 /// Explicit route for a vault-managed host.
@@ -194,6 +198,15 @@ pub enum Request {
     /// Request an access lease for one or more hosts (agent side of
     /// docs/internals/architecture.md's out-of-band approval flow).
     RequestLease { hosts: Vec<String> },
+    /// Authorize normally, then connect once and trust only previously unknown
+    /// host keys on the target and its ProxyJump route. Never replace keys.
+    RequestLeaseTrustNew { hosts: Vec<String> },
+    /// Verify an authorized SSH connection and session channel without executing
+    /// a platform-specific command or creating a persistent shell.
+    TestConnection {
+        host: String,
+        lease_token: Option<String>,
+    },
     /// Fetch details of a still-pending lease request, for the human about
     /// to `approve` it.
     DescribeLeaseRequest { id: String },
@@ -238,6 +251,17 @@ pub enum Request {
         #[serde(default)]
         replace: bool,
         #[serde(default)]
+        route: HostRoute,
+    },
+    /// Agent-safe, add-only enrollment. The daemon obtains secrets through
+    /// the native helper; this request never carries the master password.
+    EnrollHost {
+        alias: String,
+        hostname: String,
+        port: Option<u16>,
+        user: Option<String>,
+        auth: HostAuthKind,
+        key_file: Option<String>,
         route: HostRoute,
     },
     /// Return every vault-managed host as non-secret connection metadata.
@@ -335,11 +359,14 @@ impl Request {
             Self::Ls { .. } => "Ls",
             Self::Kill { .. } => "Kill",
             Self::RequestLease { .. } => "RequestLease",
+            Self::RequestLeaseTrustNew { .. } => "RequestLeaseTrustNew",
+            Self::TestConnection { .. } => "TestConnection",
             Self::DescribeLeaseRequest { .. } => "DescribeLeaseRequest",
             Self::ApproveLease { .. } => "ApproveLease",
             Self::VaultExists => "VaultExists",
             Self::InitVault { .. } => "InitVault",
             Self::AddCred { .. } => "AddCred",
+            Self::EnrollHost { .. } => "EnrollHost",
             Self::ListHosts { .. } => "ListHosts",
             Self::UpdateHost { .. } => "UpdateHost",
             Self::RmCred { .. } => "RmCred",
@@ -928,6 +955,26 @@ mod tests {
 
     #[test]
     fn credential_enrollment_requests_round_trip() {
+        round_trip(Request::RequestLeaseTrustNew {
+            hosts: vec!["target".into(), "jump".into()],
+        });
+        round_trip(Request::EnrollHost {
+            alias: "web".into(),
+            hostname: "example.com".into(),
+            port: None,
+            user: None,
+            auth: HostAuthKind::Agent,
+            key_file: None,
+            route: HostRoute::Direct,
+        });
+        let inline = HostAuth::PrivateKey {
+            private_key: SecretString::new("private-key-fixture"),
+        };
+        assert!(!format!("{inline:?}").contains("private-key-fixture"));
+        assert_eq!(
+            serde_json::from_str::<HostAuth>(&serde_json::to_string(&inline).unwrap()).unwrap(),
+            inline
+        );
         round_trip(Request::AddCred {
             alias: "web".to_string(),
             hostname: "example.com".to_string(),

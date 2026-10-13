@@ -94,8 +94,8 @@
     if (!snapshot.skillReady) {
       return {
         tone: 'blocked',
-        title: 'Agent Skill required',
-        description: 'Install the Agent Skill in Setup.',
+        title: snapshot.skillError ? 'Skill check failed' : 'Agent Skill needs attention',
+        description: snapshot.skillError ?? snapshot.skillDetail,
         action: 'setup',
         actionLabel: 'Continue setup',
       };
@@ -279,8 +279,15 @@
     const updateMotion = () => (reducedMotion = query.matches);
     updateMotion();
     query.addEventListener('change', updateMotion);
+    const refreshOnFocus = () => {
+      if (!loading && activeAction === null) void refresh();
+    };
+    window.addEventListener('focus', refreshOnFocus);
     void refresh();
-    return () => query.removeEventListener('change', updateMotion);
+    return () => {
+      query.removeEventListener('change', updateMotion);
+      window.removeEventListener('focus', refreshOnFocus);
+    };
   });
 </script>
 
@@ -365,16 +372,15 @@
   </aside>
 
   <main id="main-content">
+    {#if view !== 'hosts'}
     <header class="topbar">
       <div>
         <h1>
           {view === 'overview'
             ? 'Overview'
-            : view === 'hosts'
-              ? 'Hosts'
-              : view === 'security'
-                ? 'Security'
-                : 'Setup'}
+            : view === 'security'
+              ? 'Security'
+              : 'Setup'}
         </h1>
       </div>
       <button
@@ -387,6 +393,7 @@
         <RefreshCw size={18} class={loading ? 'spin' : undefined} />
       </button>
     </header>
+    {/if}
 
     {#if error}
       <div class="notice error" role="alert" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
@@ -431,7 +438,7 @@
           <li class:complete={snapshot?.skillReady}>
             <span class="requirement-mark">{#if snapshot?.skillReady}<Check size={12} />{/if}</span>
             <span>Agent Skill</span>
-            <strong>{snapshot?.skillReady ? 'Ready' : 'Required'}</strong>
+            <strong>{snapshot?.skillReady ? 'Ready' : snapshot?.skillError ? 'Check failed' : 'Needs attention'}</strong>
           </li>
           <li class:complete={snapshot?.daemon.online}>
             <span class="requirement-mark">{#if snapshot?.daemon.online}<Check size={12} />{/if}</span>
@@ -605,13 +612,15 @@
       <ol class="setup-flow">
         <li class:complete={snapshot?.skillReady} class:current={!snapshot?.skillReady}>
           <span class="step-number">{#if snapshot?.skillReady}<Check size={14} />{:else}1{/if}</span>
-          <div class="step-copy"><h3>Agent Skill</h3><p>{snapshot?.skillReady ? 'Installed and current' : 'Installation required'}</p></div>
-          {#if !snapshot?.skillReady}
+          <div class="step-copy"><h3>Agent Skill</h3><p>{snapshot?.skillDetail ?? 'Checking installation…'}</p>
+            {#if snapshot?.skillError}<span class="constraint">{snapshot.skillError}</span>{/if}
+          </div>
+          {#if snapshot && !snapshot.skillReady && !snapshot.skillError}
             <button
               class="secondary-button"
               disabled={activeAction !== null}
               onclick={() => runAction('install_skill', 'Agent Skill installed.')}
-            >{activeAction === 'install_skill' ? 'Installing...' : 'Install'}</button>
+            >{activeAction === 'install_skill' ? 'Installing...' : 'Install / update'}</button>
           {/if}
         </li>
 

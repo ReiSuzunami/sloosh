@@ -11,7 +11,51 @@ use crate::human_host_key::{
 use crate::proto::{self, HostAuth, HostRoute, HostSummary, Request, Response, SecretString};
 
 pub(super) async fn cmd_add(args: AddArgs) -> anyhow::Result<()> {
-    require_tty("add")?;
+    if args.auth == HostAuthArg::Agent {
+        anyhow::ensure!(
+            args.key_file.is_none(),
+            "--key-file requires --auth key-file"
+        );
+        crate::system_hosts::save(
+            &HostSummary {
+                alias: args.alias.clone(),
+                hostname: args.hostname,
+                port: args.port,
+                user: args.user,
+                auth: proto::HostAuthKind::Agent,
+                route: host_route_input(args.via, args.proxy_jump, args.jump),
+            },
+            false,
+        )?;
+        println!("added '{}' to ~/.ssh/config", args.alias);
+        return Ok(());
+    }
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        if args.key_file.is_some() && args.auth != HostAuthArg::KeyFile {
+            anyhow::bail!("--key-file can only be used with --auth key-file");
+        }
+        let auth = match args.auth {
+            HostAuthArg::Agent => proto::HostAuthKind::Agent,
+            HostAuthArg::Password => proto::HostAuthKind::Password,
+            HostAuthArg::KeyFile => proto::HostAuthKind::KeyFile,
+        };
+        let req = Request::EnrollHost {
+            alias: args.alias.clone(),
+            hostname: args.hostname,
+            port: args.port,
+            user: args.user,
+            auth,
+            key_file: args.key_file,
+            route: host_route_input(args.via, args.proxy_jump, args.jump),
+        };
+        bail_on_error_or_unexpected(send_request(&req).await?)?;
+        println!(
+            "added '{}' to the vault (connection authorization is separate)",
+            args.alias
+        );
+        return Ok(());
+    }
     let auth = host_auth_input(args.auth, args.key_file, &args.alias)?;
     let route = host_route_input(args.via, args.proxy_jump, args.jump);
 
@@ -118,6 +162,9 @@ pub(super) async fn cmd_host_show(args: HostShowArgs) -> anyhow::Result<()> {
 
 fn print_host_key_preview(preview: &HostKeyTrustPreview) {
     println!();
+    if let Some(alias) = &preview.host_key_alias {
+        println!("Host-key lookup alias: {}", escape_terminal_controls(alias));
+    }
     println!(
         "{}",
         match preview.state {
@@ -197,7 +244,8 @@ pub(super) async fn cmd_host_trust(args: HostTrustArgs) -> anyhow::Result<()> {
     require_tty("host trust")?;
     let master_password = SecretString::new(rpassword::prompt_password("Master password: ")?);
     loop {
-        let Some(preview) = human_host_key::preview_host_key(&args.alias, &master_password).await?
+        let Some(preview) =
+            human_host_key::preview_host_key(&args.alias, Some(&master_password)).await?
         else {
             println!("all host keys for '{}' are trusted", args.alias);
             return Ok(());
@@ -215,7 +263,8 @@ pub(super) async fn cmd_host_trust(args: HostTrustArgs) -> anyhow::Result<()> {
         let Some(action) = prompt_host_key_action(&preview)? else {
             continue;
         };
-        match human_host_key::apply_host_key_action(&preview, action, &master_password).await {
+        match human_host_key::apply_host_key_action(&preview, action, Some(&master_password)).await
+        {
             Ok(()) => {}
             Err(HostKeyTrustError::PreviewChanged | HostKeyTrustError::AlreadyTrusted) => {
                 eprintln!("Host-key state changed; refreshing before any write.");
@@ -337,6 +386,7 @@ fn host_auth_label(auth: proto::HostAuthKind) -> &'static str {
         proto::HostAuthKind::Agent => "agent",
         proto::HostAuthKind::Password => "password",
         proto::HostAuthKind::KeyFile => "key-file",
+        proto::HostAuthKind::PrivateKey => "private-key",
     }
 }
 

@@ -119,15 +119,66 @@ fn host_trust_refuses_non_tty_before_prompting_for_a_secret() {
 }
 
 #[test]
-fn embedded_skill_explains_split_cli_and_desktop_approval() {
-    assert!(EMBEDDED_SKILL.contains("optional desktop"));
-    assert!(EMBEDDED_SKILL.contains("control plane and does not install the CLI"));
-    assert!(EMBEDDED_SKILL.contains("Setup and Security"));
-    assert!(EMBEDDED_SKILL.contains("Always Allow"));
-    assert!(EMBEDDED_SKILL.contains("command-line-only installs"));
+fn embedded_skill_keeps_operational_boundaries_without_duplicate_setup() {
+    assert!(EMBEDDED_SKILL.contains("sloosh <command> --help"));
     assert!(EMBEDDED_SKILL.contains("sloosh approve <ID>"));
     assert!(EMBEDDED_SKILL.contains("sloosh host trust <alias>"));
-    assert!(EMBEDDED_SKILL.contains("Never invoke the"));
+    assert!(EMBEDDED_SKILL.contains("without a TTY or vault copy"));
+    assert!(EMBEDDED_SKILL.contains("explicit user opt-in"));
+    assert!(EMBEDDED_SKILL.contains("do not run the command again"));
+}
+
+#[test]
+fn auto_install_updates_a_shared_skill_without_replacing_its_link() {
+    let home = TestHome::new("shared-auto");
+    assert!(
+        sloosh(home.path(), &["skill", "install", "--agent", "codex"])
+            .status
+            .success()
+    );
+    let claude = home.path().join(".claude/skills/sloosh");
+    std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(home.skill_path().parent().unwrap(), &claude).unwrap();
+    // Emulate an unchanged older managed installation, including its marker.
+    use sha2::{Digest, Sha256};
+    let old = b"previous managed skill\n";
+    std::fs::write(home.skill_path(), old).unwrap();
+    let marker = home.skill_path().with_file_name(".sloosh-managed.json");
+    let mut data: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    use std::fmt::Write as _;
+    let mut hash = String::new();
+    for byte in Sha256::digest(old) {
+        write!(&mut hash, "{byte:02x}").unwrap();
+    }
+    data["skill_sha256"] = hash.into();
+    std::fs::write(marker, serde_json::to_vec(&data).unwrap()).unwrap();
+    let before = sloosh(home.path(), &["skill", "status"]);
+    assert!(before.status.success(), "{before:?}");
+    assert_eq!(
+        String::from_utf8(before.stdout)
+            .unwrap()
+            .matches("upgrade available")
+            .count(),
+        2
+    );
+    let install = sloosh(home.path(), &["skill", "install"]);
+    assert!(install.status.success(), "{install:?}");
+    assert!(
+        std::fs::symlink_metadata(&claude)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let after = sloosh(home.path(), &["skill", "status"]);
+    assert!(after.status.success(), "{after:?}");
+    assert_eq!(
+        String::from_utf8(after.stdout)
+            .unwrap()
+            .matches("current (managed by sloosh)")
+            .count(),
+        2
+    );
 }
 
 #[test]

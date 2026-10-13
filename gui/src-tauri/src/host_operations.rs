@@ -6,12 +6,9 @@ use sloosh::human_host_key::{
     HostKeyTrustState,
 };
 use sloosh::proto::{Request, Response};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::Controller;
 use super::gui_error::{daemon_request_failed, unexpected_daemon_response};
-
-static CONNECTION_TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +16,7 @@ pub(crate) struct HostKeyPreview {
     requested_host: String,
     host: String,
     hostname: String,
+    host_key_alias: Option<String>,
     port: u16,
     algorithm: String,
     fingerprint: String,
@@ -34,6 +32,7 @@ impl From<HostKeyTrustPreview> for HostKeyPreview {
             requested_host: preview.requested_host,
             host: preview.host,
             hostname: preview.hostname,
+            host_key_alias: preview.host_key_alias,
             port: preview.port,
             algorithm: preview.algorithm,
             fingerprint: preview.fingerprint,
@@ -51,6 +50,7 @@ impl From<HostKeyPreview> for HostKeyTrustPreview {
             requested_host: preview.requested_host,
             host: preview.host,
             hostname: preview.hostname,
+            host_key_alias: preview.host_key_alias,
             port: preview.port,
             algorithm: preview.algorithm,
             fingerprint: preview.fingerprint,
@@ -73,8 +73,12 @@ async fn next_host_key_preview(
     controller: &Controller,
     alias: &str,
 ) -> Result<Option<HostKeyPreview>, String> {
-    let master_password = controller.master_password()?;
-    human_host_key::preview_host_key(alias, &master_password)
+    let master_password = if controller.unlock_snapshot().state == "unlocked" {
+        Some(controller.master_password()?)
+    } else {
+        None
+    };
+    human_host_key::preview_host_key(alias, master_password.as_ref())
         .await
         .map(|preview| preview.map(Into::into))
         .map_err(|error| error.to_string())
@@ -96,8 +100,14 @@ pub(crate) async fn trust_host_key(
 ) -> Result<HostKeyActionResult, String> {
     let controller = controller.inner().clone();
     let requested_host = preview.requested_host.clone();
-    let master_password = controller.master_password()?;
-    match human_host_key::apply_host_key_action(&preview.into(), action, &master_password).await {
+    let master_password = if controller.unlock_snapshot().state == "unlocked" {
+        Some(controller.master_password()?)
+    } else {
+        None
+    };
+    match human_host_key::apply_host_key_action(&preview.into(), action, master_password.as_ref())
+        .await
+    {
         Ok(()) => Ok(HostKeyActionResult {
             preview: next_host_key_preview(&controller, &requested_host).await?,
             refreshed: false,
@@ -112,41 +122,10 @@ pub(crate) async fn trust_host_key(
     }
 }
 
-fn connection_test_session() -> String {
-    format!(
-        "__sloosh_gui_connection_test_{}_{}",
-        std::process::id(),
-        CONNECTION_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-async fn kill_test_session(controller: &Controller, host: &str, session: &str) {
-    let _ = controller
-        .client()
-        .request(&Request::Kill {
-            host: host.to_string(),
-            session: Some(session.to_string()),
-            lease_token: None,
-        })
-        .await;
-}
-
 fn connection_test_result(alias: &str, response: Response) -> Result<String, String> {
     match response {
-        Response::Run(reply) if reply.state == "done" && reply.exit_code == Some(0) => Ok(format!(
-            "Connected to {alias}; SSH handshake, host key, authentication, and remote shell all passed."
-        )),
-        Response::Run(reply) if reply.state == "running" => Err(format!(
-            "Connected to {alias}, but the remote shell did not finish the test command within 15 seconds."
-        )),
-        Response::Run(reply) if reply.state == "dead" => Err(reply
-            .dead_reason
-            .unwrap_or_else(|| format!("The SSH session for {alias} closed during the test."))),
-        Response::Run(reply) => Err(format!(
-            "The SSH connection to {alias} opened, but the remote test command exited with {}.",
-            reply
-                .exit_code
-                .map_or_else(|| "an unknown status".to_string(), |code| code.to_string())
+        Response::Ok => Ok(format!(
+            "Connected to {alias}; host key, authentication, and SSH session channel passed. No remote command was executed."
         )),
         Response::Error { message } => Err(message),
         _ => Err(unexpected_daemon_response("testing the SSH connection")),
@@ -170,8 +149,8 @@ pub(crate) async fn test_host_connection(
         Response::Ok => {}
         Response::LeaseRequestPending(info) => {
             return Err(format!(
-                "Approval {} is still pending. Trust every unknown host key in this route, then retry the connection test.",
-                info.id
+                "Connection-test approval {} is still pending. Complete the native approval prompt or ask the user to run sloosh approve {} in another terminal, then test again.",
+                info.id, info.id
             ));
         }
         Response::Error { message } => return Err(message),
@@ -182,19 +161,13 @@ pub(crate) async fn test_host_connection(
         }
     }
 
-    let session = connection_test_session();
     let response = client
-        .request(&Request::Run {
+        .request(&Request::TestConnection {
             host: alias.clone(),
-            command: "true".to_string(),
-            session: Some(session.clone()),
-            timeout_secs: 15,
-            raw: false,
             lease_token: None,
         })
         .await
         .map_err(|_| daemon_request_failed("testing the SSH connection"));
-    kill_test_session(&controller, &alias, &session).await;
 
     connection_test_result(&alias, response?)
 }
@@ -202,7 +175,6 @@ pub(crate) async fn test_host_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sloosh::proto::RunReply;
 
     #[test]
     fn host_key_preview_round_trips_through_the_desktop_shape() {
@@ -210,6 +182,7 @@ mod tests {
             requested_host: "target".into(),
             host: "jump".into(),
             hostname: "jump.example.com".into(),
+            host_key_alias: Some("jump-key".into()),
             port: 2222,
             algorithm: "ssh-ed25519".into(),
             fingerprint: "SHA256:example".into(),
@@ -222,38 +195,19 @@ mod tests {
         assert_eq!(HostKeyTrustPreview::from(desktop), core);
     }
 
-    fn run_reply(state: &str, exit_code: Option<i32>) -> Response {
-        Response::Run(RunReply {
-            host: "jump".into(),
-            session: "test".into(),
-            state: state.into(),
-            exit_code,
-            ..RunReply::default()
-        })
-    }
-
     #[test]
-    fn connection_test_requires_a_completed_zero_exit() {
-        assert!(connection_test_result("jump", run_reply("done", Some(0))).is_ok());
-        assert!(
-            connection_test_result("jump", run_reply("done", Some(7)))
-                .unwrap_err()
-                .contains("exited with 7")
+    fn connection_test_reports_protocol_success_and_visible_failures() {
+        assert!(connection_test_result("jump", Response::Ok).is_ok());
+        assert_eq!(
+            connection_test_result(
+                "jump",
+                Response::Error {
+                    message: "fixture failure".into()
+                }
+            )
+            .unwrap_err(),
+            "fixture failure"
         );
-        assert!(
-            connection_test_result("jump", run_reply("running", None))
-                .unwrap_err()
-                .contains("within 15 seconds")
-        );
-        assert!(
-            connection_test_result("jump", run_reply("dead", None))
-                .unwrap_err()
-                .contains("closed during the test")
-        );
-        assert!(
-            connection_test_result("jump", Response::Ok)
-                .unwrap_err()
-                .contains("unexpected response")
-        );
+        assert!(connection_test_result("jump", Response::VaultExists { exists: false }).is_err());
     }
 }

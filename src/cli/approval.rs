@@ -14,7 +14,8 @@ struct ApprovalPlan {
 }
 
 /// Refuse to run a human-only command outside a real terminal. Credential
-/// enrollment and lease approval must never be driven by an agent.
+/// prompts and lease approval must never be driven by an agent. Non-TTY host
+/// enrollment uses a separate daemon/native-helper request instead.
 pub(super) fn require_tty(command: &str) -> anyhow::Result<()> {
     if std::io::stdin().is_terminal() {
         Ok(())
@@ -29,8 +30,14 @@ pub(super) fn require_tty(command: &str) -> anyhow::Result<()> {
 }
 
 pub(super) async fn cmd_request(args: RequestArgs) -> anyhow::Result<()> {
-    let req = Request::RequestLease {
-        hosts: args.hosts.clone(),
+    let req = if args.trust_new_host {
+        Request::RequestLeaseTrustNew {
+            hosts: args.hosts.clone(),
+        }
+    } else {
+        Request::RequestLease {
+            hosts: args.hosts.clone(),
+        }
     };
     let resp = bail_on_error_or_unexpected(send_request(&req).await?)?;
     match resp {
@@ -122,7 +129,8 @@ pub(super) async fn cmd_approve(args: ApproveArgs) -> anyhow::Result<()> {
         .await?;
 
         for target in host_key_targets {
-            if ssh::host_has_known_key(&target.hostname, target.port) {
+            let (key_host, key_port) = target.known_host_endpoint();
+            if ssh::host_has_known_key(key_host, key_port) {
                 continue;
             }
             confirm_and_record_host_key(&target).await?;
@@ -264,6 +272,9 @@ async fn confirm_and_record_host_key(
 
     let fingerprint = probe.key.fingerprint(russh::keys::HashAlg::Sha256);
     let endpoint_display = format!("{:?}:{}", probe.hostname, probe.port);
+    if let Some(alias) = &probe.host_key_alias {
+        println!("Host-key lookup alias: {alias:?}");
+    }
     print!(
         "Host key fingerprint for {host_display} ({endpoint_display}):\n    {fingerprint}\nTrust this key and remember it? [y/N] "
     );
@@ -271,7 +282,8 @@ async fn confirm_and_record_host_key(
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     if answer.trim().eq_ignore_ascii_case("y") {
-        ssh::record_sloosh_known_host(&probe.hostname, probe.port, &probe.key)?;
+        let (key_host, key_port) = probe.known_host_endpoint();
+        ssh::record_sloosh_known_host(key_host, key_port, &probe.key)?;
         println!("recorded in ~/.sloosh/known_hosts");
     } else {
         println!(

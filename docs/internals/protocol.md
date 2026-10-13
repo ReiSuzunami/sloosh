@@ -20,9 +20,16 @@ or a change to message shapes, defaults, framing, or sequencing; normal mode is 
 
 This document specifies the current local client-to-daemon wire contract used
 by both `sloosh` and the desktop app. The exact
-version constant is `WIRE_PROTOCOL_VERSION = 3` in `src/proto.rs`.
+version constant is `WIRE_PROTOCOL_VERSION = 5` in `src/proto.rs`.
 
-Protocol 3 is local IPC over a Unix domain socket. It combines NDJSON control
+Protocol 5 adds `RequestLeaseTrustNew { hosts }`: normal authorization followed
+by a bounded TOFU SSH connection for each target and route, never a changed-key
+override. Explicit named system SSH aliases now resolve ahead of vault copies.
+`TestConnection { host, lease_token }` checks an existing lease before networking,
+then opens and closes an authenticated SSH session channel within 30 seconds.
+It returns `Ok` or `Error`, executes no command, and creates no persistent session.
+Protocol 4 added `EnrollHost` and inline `private_key` authentication; older peers
+must upgrade before ordinary requests. Framing remains local IPC over a Unix domain socket. It combines NDJSON control
 messages with bounded binary frames for SFTP data. It is not a network API and
 has no compatibility promise for arbitrary raw clients.
 
@@ -38,10 +45,10 @@ For ordinary new client connections:
    `slooshd` executable path.
 2. Client sends `{"type":"Status"}\n` as the first request.
 3. Daemon returns a `Status` response containing `wire_protocol`.
-4. Client requires an exact value of `3`.
-5. Client sends `{"type":"Hello","wire_protocol":3}\n`.
+4. Client requires an exact value of `5`.
+5. Client sends `{"type":"Hello","wire_protocol":5}\n`.
 6. Daemon replies
-   `{"type":"ProtocolReady","wire_protocol":3}\n` and marks that connection
+   `{"type":"ProtocolReady","wire_protocol":5}\n` and marks that connection
    negotiated.
 7. Only then may the client send an ordinary request on that connection.
 
@@ -86,8 +93,8 @@ terminated by one newline byte:
 
 ```text
 {"type":"Status"}\n
-{"type":"Hello","wire_protocol":3}\n
-{"type":"ProtocolReady","wire_protocol":3}\n
+{"type":"Hello","wire_protocol":5}\n
+{"type":"ProtocolReady","wire_protocol":5}\n
 {"type":"Ok"}\n
 {"type":"Error","message":"..."}\n
 ```
@@ -114,13 +121,21 @@ multiplexing of independent operations on one connection.
 
 ### Host management requests
 
-Protocol 3 makes vault host authentication and routing explicit:
+Host authentication and routing are explicit:
 
 - `ListHosts { master_password }` returns `Hosts { hosts }` sorted by alias.
 - Each host summary contains only `alias`, `hostname`, optional `port`, optional
   `user`, non-secret `auth` kind, and typed `route`.
-- `HostAuth` is exactly one of `agent`, `password { password }`, or
-  `key_file { path }`. The selected method is exclusive for vault profiles.
+- `HostAuth` is exactly one of `agent`, `password { password }`,
+  `key_file { path }`, or `private_key { private_key }`. The latter wraps a
+  redacted, zeroizing secret and is limited to 256 KiB. The selected method is exclusive for vault profiles.
+- `EnrollHost { alias, hostname, port, user, auth, key_file, route }` carries
+  metadata, an auth kind, and an optional key path, never the master password.
+  It requires an existing vault and adds without replacement. The daemon
+  obtains the master password via the native helper (existing Keychain in
+  bypass), and any SSH password through a human native prompt. Inline-key
+  enrollment uses the desktop `AddCred` path instead. No lease or host-key
+  approval is implied; errors leave authorization unchanged.
 - `HostRoute` is exactly one of `direct`, `managed_host { alias }`, or
   `proxy_jump { spec }`. Managed-host routes reuse another profile; advanced
   ProxyJump preserves OpenSSH comma-chain syntax.
@@ -134,8 +149,10 @@ Protocol 3 makes vault host authentication and routing explicit:
   route that names the host itself. Removing a referenced managed host fails.
 - `AddCred`, `ListHosts`, `UpdateHost`, and `RmCred` remain daemon-owned. Human
   CLI commands require a real TTY. The desktop adapter collects secrets through
-  the bundled native helper before constructing wire requests; secrets never
-  enter Svelte or Tauri command arguments.
+  the bundled native helper for the master password. SSH passwords and pasted
+  keys enter the form and Tauri arguments only while changing authentication,
+  are cleared after submission, and never appear in host summaries. Optional
+  save-time ssh-add is desktop-local, not a wire request.
 
 ## 3. Raw frame format
 
@@ -300,7 +317,7 @@ last control message:
 ```text
 UNNEGOTIATED
   | Status -> Status                 (stay UNNEGOTIATED)
-  | Hello(3) -> ProtocolReady(3)
+  | Hello(5) -> ProtocolReady(5)
   v
 CONTROL
   | Put/Get accepted

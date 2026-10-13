@@ -1,5 +1,13 @@
 # sloosh
 
+System-managed hosts live only in `~/.ssh/config`; `ssh-agent` owns loaded keys.
+The desktop reads system hosts without unlocking the vault. `sloosh host add
+--auth agent` writes SSH config, not a duplicate vault profile. Private vault
+profiles remain available for passwords and keys not delegated to the system.
+Connection testing includes fingerprint confirmation; Agents can explicitly
+opt into TOFU with `sloosh request --trust-new-host <host>`.
+See [Configure hosts](docs/manual.md#configure-hosts).
+
 Dangerous Bypass Mode supports a startup argument and persistent configuration,
 with explicit opt-in in GUI Security (applied on restart; default off). Same-user clients
 have all access without lease requests, scope limits, or renewal. SSH authentication

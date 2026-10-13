@@ -13,6 +13,8 @@ export type AppSnapshot = {
   daemon: DaemonSnapshot;
   vaultExists: boolean;
   skillReady: boolean;
+  skillDetail: string;
+  skillError: string | null;
   nativeApprovalAvailable: boolean;
   touchIdEnrolled: boolean;
   pin: {
@@ -35,11 +37,13 @@ export type VaultUnlockSnapshot = {
 };
 
 export type HostSummary = {
+  editError: string | null;
+  source: 'ssh_config' | 'vault';
   alias: string;
   hostname: string;
   port: number | null;
   user: string | null;
-  auth: 'agent' | 'password' | 'key_file';
+  auth: 'agent' | 'password' | 'key_file' | 'private_key';
   route:
     | { type: 'direct' }
     | { type: 'managed_host'; alias: string }
@@ -47,6 +51,7 @@ export type HostSummary = {
 };
 
 export type HostKeyPreview = {
+  hostKeyAlias: string | null;
   requestedHost: string;
   host: string;
   hostname: string;

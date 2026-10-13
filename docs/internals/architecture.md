@@ -125,10 +125,15 @@ Ownership is deliberate:
   default-system-agent-only scope may activate it without human approval. SSH
   Password is transient WebView state, crosses the local Tauri
   command boundary as `SecretString`, and is cleared after submission. Host
-  form serialization sends SSH Password or key-file path only while adding a
+  form serialization sends SSH Password, inline private key, or key-file path only while adding a
   profile or explicitly changing its authentication; ordinary edits send
-  neither. The key-file path may be typed directly or selected with the native
-  file picker. Hosts also provides a human-only host-key bootstrap that
+  none. The key-file path may be typed directly or selected with the native
+  file picker. Inline keys are encrypted in vault version 3. Optional save-time
+  ssh-add runs in the desktop after daemon save, with a separate warning on
+  failure. Non-TTY host additions use `EnrollHost`: the daemon gets the master
+  password from the native helper, or Keychain only in bypass, and never
+  returns it to the Agent. This adds no lease or host-key authority.
+  Hosts also provides a human-only host-key bootstrap that
   re-probes a confirmed endpoint/fingerprint before recording it, plus an
   end-to-end connection test that uses an ordinary daemon lease and a
   short-lived reserved PTY session. On macOS, the packaged desktop leaves the
@@ -263,8 +268,8 @@ each vault-backed ProxyJump alias independently.
 
 `src/daemon/ssh/config.rs` parses without logging. It attaches normalized,
 value-free diagnostics to global or `Host` scopes, then surfaces only those
-selected after vault precedence and host-pattern matching. Direct vault
-profiles therefore ignore unrelated OpenSSH configuration. Unsupported
+selected after explicit-system-alias precedence and host-pattern matching.
+Other vault profiles ignore unrelated OpenSSH configuration. Unsupported
 directives known to change a selected stanza's route or host-key identity and
 invalid selected ports return typed errors. File-backed loading expands `Include`
 in lexical order, with nested paths rooted at `~/.ssh`, caller Host guards,
@@ -402,12 +407,13 @@ cleared after last lease expires. Exact cryptography, permissions, symlink/ACL
 checks, and zeroization guarantees belong to `SECURITY.md`.
 
 Vault format 2 stores an explicit authentication method and route per host.
-Authentication is exactly one of SSH agent, encrypted password, or an
-private-key path; vault profiles do not silently fall back to a different
+Authentication is exactly one of SSH agent, encrypted password, a
+private-key path, or an inline private key encrypted in the vault; vault profiles do not silently fall back to a different
 method. Unencrypted Ed25519/ECDSA KeyFile profiles sign directly. RSA and
 encrypted OpenSSH KeyFile profiles select only their corresponding public
 identity from the daemon's ssh-agent and delegate signing, without changing
-their lease classification or importing keys. Missing identities, agent
+their lease classification. The desktop offers explicit save-time ssh-add;
+inline keys use stdin, not plaintext files. Missing identities, agent
 failures, and server rejection have distinct errors. Encrypted formats without
 OpenSSH public metadata fail explicitly. Local RSA signing stays rejected
 because the available implementation has a timing side channel. Config-backed
@@ -416,13 +422,25 @@ for individual IdentityFile paths. Routing is exactly direct, through
 another managed profile, or an advanced OpenSSH ProxyJump expression.
 Version-1 entries are accepted:
 missing `jump` becomes direct and a legacy string becomes advanced ProxyJump;
-the next mutation rewrites the envelope as version 2. Vault mutation rejects
+version-2 entries are also accepted, and the next mutation rewrites the envelope as version 3. Vault mutation rejects
 missing managed hosts, managed-route cycles, over-depth chains, and removal of
 a profile still referenced by another managed route. `src/daemon/ssh.rs`
 repeats ProxyJump cycle/depth enforcement before dialing and owns lease and
 host-key ordering.
 
 ## 9. Module map
+
+`system_hosts.rs` owns system inventory and conservative root-file SSH config
+edits. The desktop always lists system aliases, adding non-shadowed vault
+profiles only when unlocked. System saves never call AddCred/UpdateHost;
+private-key loading is ephemeral ssh-add input, not duplicate vault storage.
+
+`RequestLeaseTrustNew` uses normal request/approval policy, then makes a bounded
+connection with connection-local TOFU enabled. Native approval may defer the
+unknown-key check only for this explicit request; actual SSH verification still
+rejects changes. `LeaseContext` carries the one-attempt trust flag to all hops,
+never stores it in a lease or daemon-global setting. Desktop Hosts uses one
+connection-test action with fingerprint confirmation and continuation.
 
 ```text
 src/

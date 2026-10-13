@@ -45,7 +45,7 @@ use crate::daemon::vault;
 use crate::diagnostics::{WarningAction, warning_occurrence, warning_recovered};
 use crate::transport::unix::sloosh_home;
 
-mod config;
+pub(crate) mod config;
 mod known_hosts;
 mod route;
 
@@ -125,7 +125,8 @@ pub enum SshError {
     #[error(
         "SSH handshake with {host}:{port} failed before authentication — whatever answered on \
          that port closed or rejected the connection, so it may not be an SSH server at all \
-         (wrong port? captive proxy?). Try `ssh {host}` by hand to see what answers. \
+         (wrong port? captive proxy?). Check the saved hostname, port, and route: vault profiles \
+         do not inherit an SSH alias's ProxyJump. Try `ssh {host}` by hand to compare. \
          (russh: {source})"
     )]
     Handshake {
@@ -287,22 +288,28 @@ fn sloosh_known_hosts_path() -> PathBuf {
     sloosh_home().join("known_hosts")
 }
 
-/// Dangerous mode is trust-on-first-use, never a changed-key override.
+/// Explicit TOFU is never a changed-key override.
 fn verify_server_key_with_policy_at_paths(
     host: &str,
     port: u16,
     key: &PublicKey,
     openssh_path: &Path,
     sloosh_path: &Path,
-    dangerous_bypass: bool,
+    trust_new_host: bool,
 ) -> Result<bool, SshError> {
     match verify_server_key_at_paths(host, port, key, openssh_path, sloosh_path) {
-        Err(SshError::UnknownHostKey { .. }) if dangerous_bypass => {
+        Err(SshError::UnknownHostKey { .. }) if trust_new_host => {
+            if !matches!(
+                known_hosts::inspect_at_paths(host, port, key, openssh_path, sloosh_path)?,
+                HostKeyTrustState::Unknown
+            ) {
+                return Err(SshError::HostKeyStateChanged);
+            }
             known_hosts::commit_at_path(sloosh_path, host, port, key, KnownHostMutation::Add)?;
             tracing::warn!(
                 host,
                 port,
-                "DANGEROUS BYPASS MODE: trusted unknown SSH host key"
+                "explicit TOFU policy: trusted unknown SSH host key"
             );
             Ok(true)
         }
@@ -379,6 +386,8 @@ pub struct LeaseContext {
     /// enforces it against the same credential snapshot it consumes, closing
     /// the host-edit race between lease validation and SSH authentication.
     pub target_requires_system_agent: bool,
+    /// Explicit, connection-local TOFU. Does not grant access or override a mismatch.
+    pub trust_new_host: bool,
 }
 
 /// `russh::client::Handler` doing strict host-key verification against
@@ -389,6 +398,7 @@ pub struct Handler {
     host: String,
     port: u16,
     route: Option<ForwardRoute>,
+    trust_new_host: bool,
 }
 
 impl russh::client::Handler for Handler {
@@ -412,7 +422,7 @@ impl russh::client::Handler for Handler {
             key,
             &ssh_known_hosts_path(),
             &sloosh_known_hosts_path(),
-            super::dangerous_bypass_enabled(),
+            self.trust_new_host || super::dangerous_bypass_enabled(),
         )
     }
 
@@ -592,6 +602,30 @@ pub(crate) struct HostKeyProbeResult {
     pub hostname: String,
     pub port: u16,
     pub key: PublicKey,
+    pub host_key_alias: Option<String>,
+}
+
+impl HostConfig {
+    /// OpenSSH uses HostKeyAlias verbatim, without adding the network port.
+    pub(crate) fn known_host_endpoint(&self) -> (&str, u16) {
+        self.host_key_alias
+            .as_deref()
+            .map_or((self.hostname.as_str(), self.port), |alias| (alias, 22))
+    }
+}
+
+impl HostKeyProbeResult {
+    pub(crate) fn known_host_endpoint(&self) -> (&str, u16) {
+        self.host_key_alias
+            .as_deref()
+            .map_or((self.hostname.as_str(), self.port), |alias| (alias, 22))
+    }
+}
+
+impl HostKeyConfirmationTarget {
+    pub(crate) fn known_host_endpoint(&self) -> (&str, u16) {
+        self.route.target.known_host_endpoint()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,6 +740,7 @@ pub(crate) async fn fetch_host_key_for_confirmation_target(
         hostname,
         port,
         key,
+        host_key_alias: route.target.host_key_alias.clone(),
     })
 }
 
@@ -760,7 +795,7 @@ async fn capture_host_key_via_hops(
     for (index, hop) in hops.iter().enumerate() {
         let handle = if index == 0 {
             let tcp = open_tcp(&hop.hostname, hop.port).await?;
-            connect_over_stream(tcp, hop, None, false).await?
+            connect_over_stream(tcp, hop, None, false, false).await?
         } else {
             let previous = handles
                 .last()
@@ -773,7 +808,7 @@ async fn capture_host_key_via_hops(
                     port: hop.port,
                     source,
                 })?;
-            connect_over_stream(channel.into_stream(), hop, None, false).await?
+            connect_over_stream(channel.into_stream(), hop, None, false, false).await?
         };
         handles.push(handle);
     }
@@ -836,6 +871,12 @@ pub async fn resolve_endpoint(alias: &str) -> Result<(String, u16), SshError> {
     Ok((host_cfg.hostname.clone(), host_cfg.port))
 }
 
+pub(crate) async fn resolve_host_key_endpoint(alias: &str) -> Result<(String, u16), SshError> {
+    let host = resolve_host_config(&SshConfig::load_default(), alias).await?;
+    let (name, port) = host.known_host_endpoint();
+    Ok((name.to_string(), port))
+}
+
 /// Connect to `alias`, resolving it through `~/.ssh/config`, dialing the full
 /// `ProxyJump` chain if configured (checking a lease for each vault-backed
 /// hop along the way), verifying the host key, and authenticating via
@@ -865,6 +906,14 @@ pub(crate) async fn connect_with_route(
 /// Capture endpoint and auth together. A locked vault is not an absent alias;
 /// config fallback is allowed only when absence is actually known.
 async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<ResolvedHost, SshError> {
+    // An explicit system Host owns its endpoint and route, even while the
+    // vault is locked or an obsolete vault copy has the same alias.
+    if config.contains_alias(alias) {
+        return Ok(ResolvedHost {
+            config: config.resolve_for_connection(alias)?,
+            auth: None,
+        });
+    }
     vault::ensure_bypass_unlocked().await?;
     match vault::lookup_entry(alias).await {
         vault::EntryLookup::Locked => Err(SshError::VaultLocked),
@@ -882,6 +931,7 @@ async fn resolve_host_config(config: &SshConfig, alias: &str) -> Result<Resolved
                 config: HostConfig {
                     alias: alias.to_string(),
                     hostname: entry.hostname,
+                    host_key_alias: None,
                     port: entry.port.unwrap_or(22),
                     user: entry.user.unwrap_or_else(current_user),
                     identity_files: Vec::new(),
@@ -910,6 +960,7 @@ async fn connect_resolved(
         &host_cfg,
         route,
         lease_ctx.target_requires_system_agent,
+        lease_ctx.trust_new_host,
     )
     .await?;
     Ok(Connection {
@@ -948,6 +999,7 @@ async fn connect_via_proxy_jump(
             &target_cfg,
             route,
             lease_ctx.target_requires_system_agent,
+            lease_ctx.trust_new_host,
         )
         .await?;
         return Ok(Connection {
@@ -967,7 +1019,14 @@ async fn connect_via_proxy_jump(
             let tcp = open_tcp(&hop_cfg.hostname, hop_cfg.port).await?;
             // Intermediate hops never route forwarded-tcpip channels: only
             // the final target's `Handler` gets `route`.
-            let handle = connect_over_stream(tcp, hop_cfg, None, hop_requires_system_agent).await?;
+            let handle = connect_over_stream(
+                tcp,
+                hop_cfg,
+                None,
+                hop_requires_system_agent,
+                lease_ctx.trust_new_host,
+            )
+            .await?;
             handles.push(handle);
         } else {
             let prev = handles
@@ -987,8 +1046,14 @@ async fn connect_via_proxy_jump(
                     source,
                 })?;
             let stream = channel.into_stream();
-            let handle =
-                connect_over_stream(stream, hop_cfg, None, hop_requires_system_agent).await?;
+            let handle = connect_over_stream(
+                stream,
+                hop_cfg,
+                None,
+                hop_requires_system_agent,
+                lease_ctx.trust_new_host,
+            )
+            .await?;
             handles.push(handle);
         }
     }
@@ -1013,6 +1078,7 @@ async fn connect_via_proxy_jump(
         &target_cfg,
         route,
         lease_ctx.target_requires_system_agent,
+        lease_ctx.trust_new_host,
     )
     .await?;
 
@@ -1121,9 +1187,7 @@ pub async fn expand_lease_hosts_for_request(hosts: &[String]) -> Result<Vec<Stri
 /// This keeps an automatic lease from silently authorizing key-file or custom
 /// agent credentials.
 pub async fn scope_uses_system_agent(hosts: &[String]) -> Result<bool, SshError> {
-    if vault::exists() && !vault::is_cached().await {
-        return Ok(false);
-    }
+    let vault_locked = vault::exists() && !vault::is_cached().await;
 
     // Unit tests must not consume the developer's real ~/.ssh/config.
     #[cfg(test)]
@@ -1131,6 +1195,15 @@ pub async fn scope_uses_system_agent(hosts: &[String]) -> Result<bool, SshError>
     #[cfg(not(test))]
     let config = SshConfig::load_default();
     for host in hosts {
+        if config.contains_alias(host) {
+            if !config_uses_system_agent_only(&config.resolve_for_connection(host)?) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if vault_locked {
+            return Ok(false);
+        }
         if let Some(entry) = vault::get_entry(host).await {
             if !auth_matches_system_agent_policy(Some(&entry.auth), None) {
                 return Ok(false);
@@ -1353,15 +1426,18 @@ async fn connect_over_stream<S>(
     host_cfg: &ResolvedHost,
     route: Option<ForwardRoute>,
     require_system_agent: bool,
+    trust_new_host: bool,
 ) -> Result<russh::client::Handle<Handler>, SshError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let config = Arc::new(russh::client::Config::default());
+    let (key_host, key_port) = host_cfg.known_host_endpoint();
     let handler = Handler {
-        host: host_cfg.hostname.clone(),
-        port: host_cfg.port,
+        host: key_host.to_string(),
+        port: key_port,
         route,
+        trust_new_host,
     };
     let mut handle = russh::client::connect_stream(config, stream, handler)
         .await
@@ -1427,9 +1503,19 @@ async fn authenticate<H: russh::client::Handler>(
                     }
                 }
             }
-            vault::AuthMethod::KeyFile { path } => {
-                let path = expand_tilde(&path);
-                let key = load_vault_key_file(&path)?;
+            auth @ (vault::AuthMethod::KeyFile { .. } | vault::AuthMethod::PrivateKey { .. }) => {
+                let (path, key) = match auth {
+                    vault::AuthMethod::KeyFile { path } => {
+                        let path = expand_tilde(&path);
+                        let key = load_vault_key_file(&path)?;
+                        (path, key)
+                    }
+                    vault::AuthMethod::PrivateKey { private_key } => (
+                        PathBuf::from("<vault private key>"),
+                        decode_vault_private_key(private_key.expose_secret())?,
+                    ),
+                    _ => unreachable!(),
+                };
                 if key.is_encrypted() || matches!(key.algorithm(), Algorithm::Rsa { .. }) {
                     let public_key = key.public_key().clone();
                     drop(key);
@@ -1509,7 +1595,11 @@ fn auth_matches_system_agent_policy(
 ) -> bool {
     match vault_auth {
         Some(vault::AuthMethod::Agent) => true,
-        Some(vault::AuthMethod::Password { .. } | vault::AuthMethod::KeyFile { .. }) => false,
+        Some(
+            vault::AuthMethod::Password { .. }
+            | vault::AuthMethod::KeyFile { .. }
+            | vault::AuthMethod::PrivateKey { .. },
+        ) => false,
         None => host_cfg.is_some_and(config_uses_system_agent_only),
     }
 }
@@ -1543,6 +1633,24 @@ fn load_vault_key_file(path: &Path) -> Result<PrivateKey, SshError> {
             path: path.to_path_buf(),
         });
     }
+    decode_vault_key(&contents, path)
+}
+
+/// Bounded decoder shared by vault validation and authentication. Errors never
+/// echo supplied private-key bytes.
+pub fn decode_vault_private_key(contents: &str) -> Result<PrivateKey, SshError> {
+    let path = Path::new("<vault private key>");
+    if contents.len() as u64 > MAX_VAULT_KEY_FILE_BYTES {
+        return Err(SshError::KeyFileTooLarge {
+            path: path.to_path_buf(),
+        });
+    }
+    decode_vault_key(contents, path).map_err(|_| SshError::KeyFilePublicIdentityUnavailable {
+        path: path.to_path_buf(),
+    })
+}
+
+fn decode_vault_key(contents: &str, path: &Path) -> Result<PrivateKey, SshError> {
     // PKCS#8 encryption encloses the public identity too; do not feed it to
     // a decoder with no passphrase and report a misleading parse error.
     if contents
@@ -1553,7 +1661,7 @@ fn load_vault_key_file(path: &Path) -> Result<PrivateKey, SshError> {
             path: path.to_path_buf(),
         });
     }
-    match russh::keys::decode_secret_key(&contents, None) {
+    match russh::keys::decode_secret_key(contents, None) {
         Ok(key) => Ok(key),
         Err(russh::keys::Error::KeyIsEncrypted) => {
             // OpenSSH keeps public identity outside the encrypted payload.
@@ -1564,7 +1672,10 @@ fn load_vault_key_file(path: &Path) -> Result<PrivateKey, SshError> {
                 }
             })
         }
-        Err(error) => Err(load_error(error)),
+        Err(source) => Err(SshError::KeyFileLoad {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -1596,10 +1707,12 @@ fn key_file_agent_error(
     };
     let quote = |value: &Path| format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"));
     let advice = match reason {
+        AgentAuthFailure::NoMatchingIdentity if path == Path::new("<vault private key>") =>
+            "In Sloosh Hosts, change authentication, paste the key again, and select Load into system SSH Agent on save. The app and daemon must use the same SSH_AUTH_SOCK. Private-key lease approval is unchanged.".to_string(),
         AgentAuthFailure::NoMatchingIdentity => match socket {
             Some(socket) => format!(
                 "Ask your user to load this key into the daemon's agent: SSH_AUTH_SOCK={} ssh-add {}. \
-                 Sloosh does not load keys or change the KeyFile profile's approval policy.",
+                 Alternatively select Load into system SSH Agent on save in Sloosh Hosts. KeyFile approval policy is unchanged.",
                 quote(&socket),
                 quote(&path),
             ),
@@ -1724,6 +1837,34 @@ mod tests {
         guard
     }
 
+    #[tokio::test]
+    async fn explicit_system_host_wins_over_a_locked_vault_copy() {
+        let _guard = clean_config_fixture().await;
+        vault::add_entry(
+            "FMDev",
+            vault::HostEntry {
+                hostname: "wrong.example".into(),
+                port: Some(22),
+                user: None,
+                auth: vault::AuthMethod::Agent,
+                route: crate::proto::HostRoute::Direct,
+            },
+            b"fixture",
+            false,
+        )
+        .await
+        .unwrap();
+        vault::clear_cache().await;
+        let config = SshConfig::parse(
+            "Host FMDev\n HostName fmdev.example\n User Administrator\n ProxyJump Jump\nHost Jump\n HostName gateway.example\n",
+        );
+        let resolved = resolve_host_config(&config, "FMDev").await.unwrap();
+        assert_eq!(resolved.hostname, "fmdev.example");
+        assert_eq!(resolved.user, "Administrator");
+        assert_eq!(resolved.proxy_jump.as_deref(), Some("Jump"));
+        assert!(resolved.auth.is_none());
+    }
+
     const TEST_KEY_A: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     const TEST_KEY_B: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
 
@@ -1785,6 +1926,33 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn host_key_alias_uses_verbatim_lookup_not_the_network_port() {
+        let fixture = KnownHostsFixture::new("host-key-alias");
+        fixture.write(Some(TEST_KEY_A), None);
+        let config = SshConfig::parse(
+            "Host tunnel\n HostName network.example\n Port 2222\n HostKeyAlias example.com\nHost *\n HostKeyAlias fallback\n",
+        );
+        let host = config.resolve_for_connection("tunnel").unwrap();
+        assert_eq!(host.hostname, "network.example");
+        assert_eq!(host.port, 2222);
+        assert_eq!(host.known_host_endpoint(), ("example.com", 22));
+        let (name, port) = host.known_host_endpoint();
+        assert!(
+            verify_server_key_at_paths(
+                name,
+                port,
+                &test_public_key(TEST_KEY_A),
+                &fixture.openssh,
+                &fixture.sloosh
+            )
+            .unwrap()
+        );
+        let direct = SshConfig::parse("Host direct\n HostName network.example\n Port 2222\n")
+            .resolve("direct");
+        assert_eq!(direct.known_host_endpoint(), ("network.example", 2222));
     }
 
     #[test]
@@ -1853,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_bypass_trusts_unknown_key_but_rejects_changes() {
+    fn explicit_tofu_trusts_unknown_key_but_rejects_changes() {
         let fixture = KnownHostsFixture::new("dangerous-bypass");
         let key = test_public_key(TEST_KEY_A);
         assert!(matches!(
@@ -1935,6 +2103,29 @@ mod tests {
             &fixture.openssh,
             &fixture.sloosh,
         ));
+    }
+
+    #[test]
+    fn explicit_tofu_does_not_treat_algorithm_rotation_as_a_new_host() {
+        let fixture = KnownHostsFixture::new("tofu-algorithm-change");
+        fixture.write(Some(TEST_KEY_A), None);
+        let replacement = PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            Algorithm::Rsa { hash: None },
+        )
+        .unwrap();
+        assert!(
+            verify_server_key_with_policy_at_paths(
+                "example.com",
+                22,
+                replacement.public_key(),
+                &fixture.openssh,
+                &fixture.sloosh,
+                true
+            )
+            .is_err()
+        );
+        assert!(std::fs::read(&fixture.sloosh).unwrap().is_empty());
     }
 
     #[test]

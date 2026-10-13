@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "version": 2,
+//!   "version": 3,
 //!   "kdf": { "m_cost": 65536, "t_cost": 3, "p_cost": 4, "salt": "<hex>" },
 //!   "nonce": "<hex>",
 //!   "ciphertext": "<hex>"
@@ -60,7 +60,7 @@ const MAX_HOST_USER_BYTES: usize = 255;
 const MAX_JUMP_BYTES: usize = 1024;
 const MAX_MANAGED_ROUTE_HOPS: usize = 8;
 
-const VAULT_VERSION: u32 = 2;
+const VAULT_VERSION: u32 = 3;
 const LEGACY_VAULT_VERSION: u32 = 1;
 
 /// Standard vault location: `~/.sloosh/vault`.
@@ -177,7 +177,8 @@ impl Drop for VaultData {
 
 /// One vault entry: enough connection info to dial a host plus an auth
 /// method. Vault version 2 adds explicit agent/key-file authentication and
-/// typed routes; version 1 plaintext is accepted and migrated on next write.
+/// typed routes; version 3 adds encrypted inline keys. Versions 1 and 2 are
+/// accepted and migrated on next write.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HostEntry {
     pub hostname: String,
@@ -252,9 +253,16 @@ impl fmt::Debug for HostEntry {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthMethod {
-    Password { password: String },
+    Password {
+        password: String,
+    },
     Agent,
-    KeyFile { path: String },
+    KeyFile {
+        path: String,
+    },
+    PrivateKey {
+        private_key: crate::proto::SecretString,
+    },
 }
 
 impl AuthMethod {
@@ -263,6 +271,7 @@ impl AuthMethod {
             Self::Password { .. } => HostAuthKind::Password,
             Self::Agent => HostAuthKind::Agent,
             Self::KeyFile { .. } => HostAuthKind::KeyFile,
+            Self::PrivateKey { .. } => HostAuthKind::PrivateKey,
         }
     }
 }
@@ -271,6 +280,9 @@ impl AuthMethod {
     pub(crate) fn zeroize_secrets(&mut self) {
         match self {
             AuthMethod::Password { password } => password.zeroize(),
+            AuthMethod::PrivateKey { private_key } => {
+                *private_key = crate::proto::SecretString::new(String::new());
+            }
             AuthMethod::Agent | AuthMethod::KeyFile { .. } => {}
         }
     }
@@ -285,6 +297,7 @@ impl fmt::Debug for AuthMethod {
                 .finish(),
             AuthMethod::Agent => f.write_str("Agent"),
             AuthMethod::KeyFile { path } => f.debug_struct("KeyFile").field("path", path).finish(),
+            AuthMethod::PrivateKey { .. } => f.write_str("PrivateKey(<redacted>)"),
         }
     }
 }
@@ -591,7 +604,7 @@ fn unlock_material_at(
         nonce,
         ciphertext,
     } = read_vault_file(path)?;
-    if version != LEGACY_VAULT_VERSION && version != VAULT_VERSION {
+    if !(LEGACY_VAULT_VERSION..=VAULT_VERSION).contains(&version) {
         return Err(VaultError::UnsupportedVersion {
             found: version,
             supported: VAULT_VERSION,
@@ -666,6 +679,15 @@ fn validate_host_update(metadata: &HostUpdate) -> Result<(), VaultError> {
 }
 
 fn validate_auth(auth: &AuthMethod) -> Result<(), VaultError> {
+    if let AuthMethod::PrivateKey { private_key } = auth {
+        crate::daemon::ssh::decode_vault_private_key(private_key.expose_secret()).map_err(
+            |_| {
+                VaultError::InvalidHost(
+                    "invalid or unsupported private key (maximum 256 KiB)".into(),
+                )
+            },
+        )?;
+    }
     if let AuthMethod::KeyFile { path } = auth {
         validate_host_field("key file path", path, MAX_JUMP_BYTES)?;
     }
@@ -1492,19 +1514,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_one_envelope_is_rewritten_as_version_two_on_mutation() {
-        let path = temp_vault_path("legacy-envelope");
-        let _ = std::fs::remove_file(&path);
-        create_at(&path, &VaultData::default(), b"pw").unwrap();
-        let mut file = read_vault_file(&path).unwrap();
-        file.version = LEGACY_VAULT_VERSION;
-        write_vault_file_atomic(&path, &file).unwrap();
+    async fn legacy_envelopes_are_rewritten_as_current_on_mutation() {
+        for version in [1, 2] {
+            let path = temp_vault_path("legacy-envelope");
+            let _ = std::fs::remove_file(&path);
+            create_at(&path, &VaultData::default(), b"pw").unwrap();
+            let mut file = read_vault_file(&path).unwrap();
+            file.version = version;
+            write_vault_file_atomic(&path, &file).unwrap();
 
-        add_entry_at(&path, "web", sample_entry(), b"pw", false)
-            .await
+            add_entry_at(&path, "web", sample_entry(), b"pw", false)
+                .await
+                .unwrap();
+            assert_eq!(read_vault_file(&path).unwrap().version, VAULT_VERSION);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn inline_private_key_is_encrypted_and_round_trips() {
+        let path = temp_vault_path("inline-key");
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pem = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
             .unwrap();
-        assert_eq!(read_vault_file(&path).unwrap().version, VAULT_VERSION);
-        let _ = std::fs::remove_file(&path);
+        let mut entry = sample_entry();
+        entry.auth = AuthMethod::PrivateKey {
+            private_key: crate::proto::SecretString::new(pem.to_string()),
+        };
+        validate_auth(&entry.auth).unwrap();
+        let mut data = VaultData::default();
+        data.hosts.insert("inline".into(), entry);
+        create_at(&path, &data, b"pw").unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("PRIVATE KEY")
+        );
+        let loaded = unlock_at(&path, b"pw").unwrap();
+        assert_eq!(loaded.hosts["inline"].auth, data.hosts["inline"].auth);
+        assert_eq!(host_metadata(&loaded)[0].auth, HostAuthKind::PrivateKey);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1526,7 +1580,9 @@ mod tests {
         assert_eq!(entry.hostname, "example.com");
         match &entry.auth {
             AuthMethod::Password { password } => assert_eq!(password, "hunter2"),
-            AuthMethod::Agent | AuthMethod::KeyFile { .. } => panic!("wrong auth method"),
+            AuthMethod::Agent | AuthMethod::KeyFile { .. } | AuthMethod::PrivateKey { .. } => {
+                panic!("wrong auth method")
+            }
         }
 
         let _ = std::fs::remove_file(&path);

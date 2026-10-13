@@ -45,12 +45,29 @@ test('host dialogs clear component state after native Escape closes them', () =>
   }
 });
 
-test('host-key actions do not promise a connection retry', () => {
+test('one connection test owns trust confirmation and continues afterward', () => {
   const trustDialog = source.slice(
     source.indexOf('{#if keyPreview}'),
     source.indexOf("{#if mode === 'delete'"),
   );
-  assert.match(trustDialog, /'Trust host key'/);
-  assert.match(trustDialog, /'Replace host key'/);
-  assert.doesNotMatch(trustDialog, /(?:Trust|Replace)[^\n]*retry/i);
+  assert.match(trustDialog, /'Trust and continue'/);
+  assert.match(trustDialog, /'Replace and continue'/);
+  assert.doesNotMatch(source, /aria-label=\{`Trust host key for/);
+  const action = source.slice(source.indexOf('async function applyHostKeyAction'), source.indexOf('function endpoint'));
+  assert.match(action, /if \(!result.preview\)/);
+  assert.match(action, /invoke<string>\('test_host_connection'/);
+  assert.match(action, /else error = errorMessage\(cause\)/);
+});
+
+test('adding a vault host offers inline unlock instead of disabling the destination', () => {
+  const vaultRadio = source.match(/<input[^\n]+checked=\{form.source === 'vault'\}[^\n]*\/>/)?.[0];
+  assert.ok(vaultRadio);
+  assert.doesNotMatch(vaultRadio, /disabled/);
+  const addDialog = source.slice(source.indexOf("{#if mode === 'add' || mode === 'edit'}"), source.indexOf('{#if keyPreview}'));
+  assert.match(addDialog, /aria-label="Unlock vault for this host"/);
+  assert.match(addDialog, /type="button"[^\n]+unlockHosts\('unlock_vault_with_master'\)/);
+  assert.match(addDialog, /Unlock to save/);
+  const unlockAction = source.slice(source.indexOf('async function unlockHosts'), source.indexOf('async function lockHosts'));
+  assert.match(unlockAction, /formError = errorMessage\(cause\)/);
+  assert.doesNotMatch(unlockAction, /closeDialog\(/);
 });

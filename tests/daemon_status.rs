@@ -133,6 +133,17 @@ async fn status_round_trip_against_running_daemon() {
         "{invalid_route:?}"
     );
 
+    chan.send(&Request::TestConnection {
+        host: "not-authorized.invalid".into(),
+        lease_token: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        chan.recv::<Response>().await.unwrap(),
+        Some(Response::Error { .. })
+    ));
+
     chan.send(&Request::RequestLease {
         hosts: vec!["agent-only".to_string()],
     })
@@ -145,7 +156,7 @@ async fn status_round_trip_against_running_daemon() {
         Some(Response::Ok)
     );
 
-    chan.send(&Request::RequestLease {
+    chan.send(&Request::RequestLeaseTrustNew {
         hosts: vec!["custom-agent".to_string()],
     })
     .await
@@ -156,6 +167,21 @@ async fn status_round_trip_against_running_daemon() {
             .expect("recv custom-agent RequestLease response"),
         Some(Response::LeaseRequestPending(_))
     ));
+
+    chan.send(&Request::EnrollHost {
+        alias: "agent-added".into(),
+        hostname: "example.com".into(),
+        port: None,
+        user: None,
+        auth: HostAuthKind::Agent,
+        key_file: None,
+        route: HostRoute::Direct,
+    })
+    .await
+    .expect("send enrollment without a vault");
+    assert!(
+        matches!(chan.recv::<Response>().await.unwrap(), Some(Response::Error { message }) if message.contains("Initialize the vault"))
+    );
 
     chan.send(&Request::InitVault {
         master_password: SecretString::new("masterpw"),

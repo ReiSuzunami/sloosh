@@ -619,7 +619,16 @@ pub async fn approve_lease_system_agent(
     // that an alias is config-backed. Native macOS preview unlocks it before
     // retrying this policy check.
     if vault::exists() && !vault::is_cached().await {
-        return Ok(SystemAgentApprovalOutcome::NotEligible);
+        #[cfg(test)]
+        let config = ssh::SshConfig::default();
+        #[cfg(not(test))]
+        let config = ssh::SshConfig::load_default();
+        if !requested_hosts
+            .iter()
+            .all(|host| config.contains_alias(host))
+        {
+            return Ok(SystemAgentApprovalOutcome::NotEligible);
+        }
     }
 
     let resolved_hosts = expand_approval_hosts(&requested_hosts).await?;

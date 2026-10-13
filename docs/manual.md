@@ -105,12 +105,50 @@ sloosh skill status --agent auto
 sloosh status
 ```
 
+Skill status distinguishes missing, current, upgrade available, locally
+modified, and externally managed content. Desktop Setup shows the detected
+paths and reports inspection errors separately; it refreshes on window focus.
+The portable Codex target is `~/.agents/skills/sloosh`; Claude Code uses
+`~/.claude/skills/sloosh`. A Claude directory link to the shared target is
+recognized without duplicate writes. Updates never write through links or
+overwrite customized content: update the direct managed target instead.
+
 Installation, checksums, upgrades, and platform-specific recovery are covered
 by the [installation guide](getting-started/installation.md).
 
 ## Configure hosts
 
-Host management is interactive and human-only:
+**System management is single-source:** Hosts lists concrete aliases from
+`~/.ssh/config`, including Include files, without unlocking the vault. System
+SSH authentication and the key-loading option save connection settings only in
+SSH config; the latter runs ssh-add and discards pasted key input, never storing
+another vault copy. Without key loading, password/private-key profiles remain
+vault-managed and require unlock. Explicit system aliases take precedence over
+same-named legacy vault records, including hostname and ProxyJump. Legacy vault
+copies are retained, not silently migrated or deleted. Wildcard patterns supply
+defaults but are not rows. Editing/removal supports a unique exact root-file
+Host stanza; shared/duplicate/included definitions require editing their source
+file. Unrelated settings and comments are preserved; overrides are rejected.
+`sloosh host add --auth agent` needs no vault and writes the same system config.
+
+The host list groups system and vault entries separately. **Save to** is an
+explicit choice when adding, and stays fixed while editing. A locked vault
+remains selectable: unlock directly in the Add dialog without discarding entered
+host details before saving. Within the system
+destination, file/pasted key inputs run ssh-add on save; vault key inputs remain
+in the vault. The vault group owns its compact unlock controls. Read-only system
+definitions show their reason before editing; source-specific removal text
+identifies which store changes. A saved-host/ssh-add warning is one warning,
+not simultaneous success and failure notices.
+
+Host editing, listing, removal, and trust remain interactive and human-only.
+Agents may run `sloosh host add` without a TTY: the daemon performs add-only
+enrollment, never replacement. For vault credentials, initialize the vault first. Normal mode opens
+the bundled native helper for the master password; bypass mode reads its
+existing Keychain credential. SSH passwords are entered by the user in the
+native helper, never passed to the Agent. Without that helper, use the human
+terminal flow below. Adding a profile does not grant a connection lease or
+trust its host key.
 
 ```sh
 sloosh host list
@@ -121,11 +159,13 @@ sloosh host trust myhost
 sloosh host rm myhost
 ```
 
-Authentication choices are SSH agent, a vault-backed password, or a key-file
-path. Unencrypted Ed25519/ECDSA key files sign directly. For RSA or encrypted
+Authentication choices are SSH agent, a vault-backed password, a key-file
+path, or a private key pasted into the desktop host editor. Pasted keys are
+stored encrypted in the vault, never in a plaintext key file (maximum 256 KiB).
+Unencrypted Ed25519/ECDSA keys sign directly. For RSA or encrypted
 OpenSSH key files, keep the KeyFile profile and load that same key into the
 daemon's SSH Agent. Sloosh selects only its corresponding public identity;
-it does not decrypt, load, or sign RSA keys locally. Encrypted formats without
+it does not decrypt or sign RSA keys locally. Encrypted formats without
 readable OpenSSH public metadata are unsupported.
 
 If the identity is missing, the error gives a shell-quoted command targeting
@@ -135,6 +175,15 @@ instead requires checking the remote user's authorized keys. Loading other
 keys does not change this profile's selected identity. KeyFile lease approval
 requirements are unchanged, and Sloosh does not configure automatic loading
 after an agent restart. SSH-config hosts keep their existing agent-first order.
+
+For either key input, select **Load into system SSH Agent on save** to run
+`ssh-add` once after a successful save. This is off by default and must be
+selected again when changing authentication. Pasted keys travel over stdin,
+not command arguments, environment variables, or temporary files. The app's
+`SSH_AUTH_SOCK` must match the daemon's agent; encrypted keys need a configured
+`SSH_ASKPASS` helper or manual loading. Other applications using that agent may
+also use the loaded key. A loading failure reports **Host saved** plus a warning;
+it does not undo the saved host. No login/startup configuration is changed.
 
 A vault profile configured with `--auth agent` uses the default system
 `$SSH_AUTH_SOCK` and can skip human lease approval once the daemon can inspect
@@ -169,7 +218,7 @@ Unreadable files, include limits, dynamic `%`/`$` paths, `~user`, and recursive
 Unsupported directives in unrelated `Host` blocks stay silent. A selected
 host gets one concise diagnostic for lower-impact ignored options. Directives
 known to change its endpoint, route, or host-key identity (
-`ProxyCommand`, `ProxyUseFdpass`, `HostKeyAlias`, and hostname
+`ProxyCommand`, `ProxyUseFdpass`, and hostname
 canonicalization) fail instead of falling back to guessed settings. Because
 Sloosh does not evaluate `Match` predicates, any `Match` section is a
 fail-closed barrier for SSH-config-backed hosts. Direct vault profiles do not
@@ -200,11 +249,11 @@ entered in Hosts is transient, crosses the local command boundary as a redacted
 secret, and is cleared after submission. A private-key path can be typed
 directly when Finder hides `.ssh`, or selected with the file picker.
 
-Each host row also provides manual host-key trust and an end-to-end connection
-test. Trust shows the exact resolved endpoint, key algorithm, and SHA256
+Each host row provides one **Test connection** action. Its trust dialog shows
+the exact resolved endpoint, key algorithm, and SHA256
 fingerprint. A changed key shows both stored and newly observed fingerprints
 plus the owning file. Compare the new value with an independent source before
-choosing `Trust host key` or `Replace host key`. Sloosh re-resolves and re-probes
+choosing `Trust and continue` or `Replace and continue`. Sloosh re-resolves and re-probes
 before changing only `~/.sloosh/known_hosts`; it never modifies
 `~/.ssh/known_hosts`. If the preview changes, the dialog refreshes without
 writing. ProxyJump keys are presented dependency-first.
@@ -213,10 +262,23 @@ writing. ProxyJump keys are presented dependency-first.
 The connection-test action opens this trust dialog first when needed. After
 all route keys have been trusted, it automatically retries the normal lease flow and
 verifies the TCP connection, SSH handshake, host key,
-configured authentication, and remote shell before cleaning up its reserved
-test session. Opening trust directly from a host row does not start a connection
-test. Removing a host deletes its vault entry, including any stored password;
+configured authentication, and an SSH session channel, without executing a
+Unix-specific command or creating a persistent shell. The test is limited to
+30 seconds. Errors after confirmation remain visible on the Hosts page.
+Explicit SSH-config aliases always use their system hostname/port/route, not a
+stale same-named vault copy. Other vault profiles use their saved settings.
+Removing a host deletes its vault entry, including any stored password;
 existing SSH sessions stay open.
+
+Agents may explicitly choose trust-on-first-use with
+`sloosh request --trust-new-host myhost`. After normal lease authorization,
+Sloosh makes one SSH connection per requested host (30-second limit), recording
+only previously unknown target and ProxyJump keys. Changed keys, including
+algorithm changes, still fail. This does not enable Dangerous Bypass Mode or
+skip credential/lease checks. TOFU cannot verify the first server's identity
+independently. Pending approval makes no connection; after approval, repeat the
+flagged request. Connection failure does not revoke the granted lease or keys
+already recorded during this attempt. Then use normal `sloosh run` commands.
 
 The app locks the vault session after its configured idle period and on system
 sleep, screen lock, user switch, manual lock, app exit, or the absolute session
