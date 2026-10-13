@@ -341,7 +341,7 @@ fn hex_decode<const N: usize>(value: &str) -> Result<[u8; N], PinError> {
         return Err(PinError::Corrupt);
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0]).ok_or(PinError::Corrupt)?;
         let low = hex_nibble(pair[1]).ok_or(PinError::Corrupt)?;
         output[index] = (high << 4) | low;

@@ -74,10 +74,10 @@ pub fn resolve_socket_path() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn default_socket_path() -> PathBuf {
-    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join("sloosh.sock");
-        }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        return PathBuf::from(runtime_dir).join("sloosh.sock");
     }
     linux_fallback_socket_path(effective_uid())
 }
