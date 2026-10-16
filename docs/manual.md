@@ -141,6 +141,10 @@ definitions show their reason before editing; source-specific removal text
 identifies which store changes. A saved-host/ssh-add warning is one warning,
 not simultaneous success and failure notices.
 
+**Through saved host** accepts either source: a system SSH alias is saved as
+ProxyJump, while a vault profile retains a managed-host route. Selecting a
+system jump does not copy it into the vault.
+
 Host editing, listing, removal, and trust remain interactive and human-only.
 Agents may run `sloosh host add` without a TTY: the daemon performs add-only
 enrollment, never replacement. For vault credentials, initialize the vault first. Normal mode opens

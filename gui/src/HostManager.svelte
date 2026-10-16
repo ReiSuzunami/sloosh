@@ -347,7 +347,7 @@
     }
     let submission;
     try {
-      submission = buildHostSubmission(form, mode);
+      submission = buildHostSubmission(form, mode, hosts ?? []);
     } catch (cause) {
       const message = errorMessage(cause);
       formError = message;

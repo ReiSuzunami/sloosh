@@ -14,6 +14,40 @@ const hostForm = await import(
   `data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`
 );
 
+test('saved jump hosts use routes matching their inventory source', () => {
+  for (const source of ['ssh_config', 'vault']) {
+    for (const mode of ['add', 'edit']) {
+      const jump = {
+        source,
+        alias: 'Jump',
+        hostname: 'jump.example',
+        port: 56875,
+        user: 'deploy',
+        auth: source === 'ssh_config' ? 'agent' : 'password',
+        editError: null,
+        route: { type: 'direct' },
+      };
+      const form = {
+        ...hostForm.emptyHostForm(),
+        source: 'vault',
+        alias: 'target',
+        hostname: 'target.example',
+        auth: 'password',
+        password: 'fixture',
+        routeMode: 'managed_host',
+        managedHost: 'Jump',
+      };
+      const result = hostForm.buildHostSubmission(form, mode, [jump]);
+      assert.equal(result.ok, true);
+      const expected = source === 'ssh_config'
+        ? { type: 'proxy_jump', spec: 'Jump' }
+        : { type: 'managed_host', alias: 'Jump' };
+      assert.deepEqual(result.value.host.route, expected);
+      assert.deepEqual(result.value.commandHost.route, expected);
+    }
+  }
+});
+
 test('ordinary edits omit stale authentication fields', () => {
   const form = hostForm.hostFormFromSummary({
     source: 'vault',
@@ -29,7 +63,7 @@ test('ordinary edits omit stale authentication fields', () => {
   form.privateKey = 'stale-private-key';
   form.syncToAgent = true;
 
-  const result = hostForm.buildHostSubmission(form, 'edit');
+  const result = hostForm.buildHostSubmission(form, 'edit', []);
 
   assert.equal(result.ok, true);
   assert.equal(result.value.commandHost.password, null);
@@ -47,7 +81,7 @@ test('add and explicit auth change send only the selected credential', () => {
   add.source = 'vault';
   add.password = 'one-use-password';
 
-  const added = hostForm.buildHostSubmission(add, 'add');
+  const added = hostForm.buildHostSubmission(add, 'add', []);
   assert.equal(added.ok, true);
   assert.equal(added.value.commandHost.password, 'one-use-password');
   assert.equal(added.value.commandHost.keyFile, null);
@@ -57,7 +91,7 @@ test('add and explicit auth change send only the selected credential', () => {
   edit.auth = 'key_file';
   edit.keyFile = '/Users/test/.ssh/id_ed25519';
 
-  const changed = hostForm.buildHostSubmission(edit, 'edit');
+  const changed = hostForm.buildHostSubmission(edit, 'edit', []);
   assert.equal(changed.ok, true);
   assert.equal(changed.value.commandHost.password, null);
   assert.equal(changed.value.commandHost.keyFile, '/Users/test/.ssh/id_ed25519');
@@ -69,16 +103,16 @@ test('host validation rejects invalid port and routes', () => {
   form.alias = 'web';
   form.hostname = 'web.internal';
   form.port = '65536';
-  assert.match(hostForm.buildHostSubmission(form, 'add').error, /Port/);
+  assert.match(hostForm.buildHostSubmission(form, 'add', []).error, /Port/);
 
   form.port = '22';
   form.routeMode = 'managed_host';
   form.managedHost = 'web';
-  assert.match(hostForm.buildHostSubmission(form, 'add').error, /cannot route through itself/);
+  assert.match(hostForm.buildHostSubmission(form, 'add', []).error, /cannot route through itself/);
 
   form.routeMode = 'proxy_jump';
   form.proxyJump = '   ';
-  assert.match(hostForm.buildHostSubmission(form, 'add').error, /ProxyJump/);
+  assert.match(hostForm.buildHostSubmission(form, 'add', []).error, /ProxyJump/);
 });
 
 test('numeric values from an input[type=number] are accepted', () => {
@@ -87,7 +121,7 @@ test('numeric values from an input[type=number] are accepted', () => {
   form.hostname = 'jump.example.com';
   form.port = 56875;
 
-  const result = hostForm.buildHostSubmission(form, 'add');
+  const result = hostForm.buildHostSubmission(form, 'add', []);
 
   assert.equal(result.ok, true);
   assert.equal(result.value.host.port, 56875);
@@ -99,19 +133,19 @@ test('pasted keys stay out of summaries and agent loading is opt-in', () => {
   form.hostname = 'web.example';
   form.auth = 'private_key';
   form.source = 'vault';
-  assert.match(hostForm.buildHostSubmission(form, 'add').error, /Paste/);
+  assert.match(hostForm.buildHostSubmission(form, 'add', []).error, /Paste/);
   form.privateKey = 'private-key-fixture';
-  let result = hostForm.buildHostSubmission(form, 'add');
+  let result = hostForm.buildHostSubmission(form, 'add', []);
   assert.equal(result.value.commandHost.privateKey, 'private-key-fixture');
   assert.equal(result.value.commandHost.syncToAgent, false);
   assert.equal(JSON.stringify(result.value.host).includes('private-key-fixture'), false);
   form.source = 'ssh_config';
-  result = hostForm.buildHostSubmission(form, 'add');
+  result = hostForm.buildHostSubmission(form, 'add', []);
   assert.equal(result.value.commandHost.syncToAgent, true);
   assert.equal(result.value.commandHost.source, 'ssh_config');
   assert.equal(result.value.host.auth, 'agent');
   form.auth = 'agent';
-  result = hostForm.buildHostSubmission(form, 'add');
+  result = hostForm.buildHostSubmission(form, 'add', []);
   assert.equal(result.value.commandHost.privateKey, null);
   assert.equal(result.value.commandHost.syncToAgent, false);
 });

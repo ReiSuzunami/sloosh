@@ -434,6 +434,9 @@ host-key ordering.
 edits. The desktop always lists system aliases, adding non-shadowed vault
 profiles only when unlocked. System saves never call AddCred/UpdateHost;
 private-key loading is ephemeral ssh-add input, not duplicate vault storage.
+The desktop saved-host route picker serializes system aliases as ProxyJump
+and vault profiles as managed-host routes; vault reference validation remains
+vault-only.
 
 `RequestLeaseTrustNew` uses normal request/approval policy, then makes a bounded
 connection with connection-local TOFU enabled. Native approval may defer the

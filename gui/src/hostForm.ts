@@ -71,7 +71,11 @@ export function hostFormFromSummary(host: HostSummary): HostForm {
   };
 }
 
-export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmissionResult {
+export function buildHostSubmission(
+  form: HostForm,
+  mode: HostMode,
+  hosts: HostSummary[],
+): HostSubmissionResult {
   if (mode !== 'add' && mode !== 'edit') {
     return { ok: false, error: 'Choose add or edit before saving a host.' };
   }
@@ -106,7 +110,7 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
     return { ok: false, error: 'Enter the SSH password.' };
   }
 
-  const route =
+  let route =
     form.routeMode === 'managed_host'
       ? { type: 'managed_host' as const, alias: form.managedHost.trim() }
       : form.routeMode === 'proxy_jump'
@@ -120,6 +124,13 @@ export function buildHostSubmission(form: HostForm, mode: HostMode): HostSubmiss
   }
   if (route.type === 'proxy_jump' && !route.spec) {
     return { ok: false, error: 'Enter an OpenSSH ProxyJump specification.' };
+  }
+  if (route.type === 'managed_host') {
+    const jumpAlias = route.alias;
+    const jump = hosts.find((host) => host.alias === jumpAlias);
+    if (jump?.source === 'ssh_config') {
+      route = { type: 'proxy_jump', spec: jumpAlias };
+    }
   }
 
   const host: HostSummary = {
