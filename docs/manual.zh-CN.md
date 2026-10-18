@@ -106,14 +106,17 @@ hostname 和 ProxyJump 均以系统为准；旧记录保留，不擅自迁移或
 Include、共享或重复定义需修改源文件。其他设置和注释原样保留，存在优先级覆盖时拒绝写入。
 `sloosh host add --auth agent` 同样直接写系统配置，无需初始化 vault。
 
-列表按系统与 vault 分组；新增时明确选择 **Save to**，编辑时来源固定，不做隐式迁移。
+列表一次只显示一个来源：**System SSH config / Sloosh vault** 切换器标注各来源主机数
+（vault 锁定时显示锁标记），下方为所选来源的标题、解锁控件、空状态与主机行；
+保存主机后自动切到其来源。新增时明确选择 **Save to**，编辑时来源固定，不做隐式迁移。
 Vault 锁定时仍可选中，在添加窗口内解锁后继续保存，已填主机信息不会丢失。
 系统来源中的文件／粘贴密钥在保存时执行 ssh-add；vault 来源的密钥保留在 vault。
-解锁控件只放在 vault 分组。不可编辑条目提前显示原因；删除确认按来源说明实际操作。
+解锁控件只放在 vault 来源。不可编辑条目提前显示原因；删除确认按来源说明实际操作。
 主机保存成功但密钥加载失败时只显示一条警告，不同时出现成功和失败提示。
 
-**Through saved host** 可选系统或 vault 主机：系统 SSH 别名保存为 ProxyJump，
-vault 主机保留 managed-host 路由。选择系统跳板不会将其复制进 vault。
+**Through saved host** 只显示与目标同来源的主机：系统目标只选系统 SSH 跳板，vault 目标只选 vault 跳板。
+切换 **Save to** 会清空已选跳板。系统 SSH 别名保存为 ProxyJump，vault 主机保留 managed-host 路由。
+路由只提供 **Direct** 和 **Through saved host**。已有 ProxyJump 配置只读显示，除非明确选择新路由，否则原样保留。
 
 编辑、列出、删除和信任主机仍由人类操作。Agent 可无 TTY 执行
 `sloosh host add`，只新增、不覆盖。需先初始化 vault：普通模式通过内嵌原生窗口

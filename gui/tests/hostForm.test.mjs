@@ -48,6 +48,24 @@ test('saved jump hosts use routes matching their inventory source', () => {
   }
 });
 
+test('ordinary edits preserve an existing ProxyJump route', () => {
+  for (const source of ['ssh_config', 'vault']) {
+    const route = { type: 'proxy_jump', spec: 'user@edge:2222,bastion' };
+    const form = hostForm.hostFormFromSummary({
+      source,
+      alias: 'target',
+      hostname: 'target.example',
+      port: 22,
+      user: null,
+      auth: 'agent',
+      route,
+    });
+    const result = hostForm.buildHostSubmission(form, 'edit', []);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.value.commandHost.route, route);
+  }
+});
+
 test('ordinary edits omit stale authentication fields', () => {
   const form = hostForm.hostFormFromSummary({
     source: 'vault',

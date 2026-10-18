@@ -56,6 +56,7 @@
   let success = $state<string | null>(null);
   let warning = $state<string | null>(null);
   const hostSources = ['ssh_config', 'vault'] as const;
+  let hostSource = $state<HostSummary['source']>('ssh_config');
   let formError = $state<string | null>(null);
   let form = $state<HostForm>(emptyHostForm());
   let keyPreview = $state<HostKeyPreview | null>(null);
@@ -83,11 +84,23 @@
       : [],
   );
 
+  const sourceHosts = $derived((hosts ?? []).filter((host) => host.source === hostSource));
+  const systemHostCount = $derived((hosts ?? []).filter((host) => host.source === 'ssh_config').length);
+  const vaultHostCount = $derived((hosts ?? []).filter((host) => host.source === 'vault').length);
+
   const blocker = $derived(
     !snapshot
       ? 'Local status is unavailable.'
       : null,
   );
+
+  function sourceLabel(source: HostSummary['source']): string {
+    return source === 'ssh_config' ? 'System SSH config' : 'Sloosh vault';
+  }
+
+  function jumpChoices(): HostSummary[] {
+    return (hosts ?? []).filter((host) => host.source === form.source && host.alias !== form.alias);
+  }
 
   function errorMessage(cause: unknown): string {
     return cause instanceof Error ? cause.message : String(cause);
@@ -296,6 +309,7 @@
 
   function chooseSource(source: HostSummary['source']) {
     form.source = source;
+    form.managedHost = '';
     form.auth = source === 'ssh_config' ? 'agent' : 'password';
     form.password = '';
     form.privateKey = '';
@@ -378,6 +392,7 @@
           : [...(hosts ?? []), host].sort((left, right) => left.alias.localeCompare(right.alias));
         success = command === 'update_host' ? `Updated ${host.alias}.` : `Added ${host.alias}.`;
         if (agentWarning) { success = null; warning = agentWarning; }
+        hostSource = host.source;
         mode = null;
         selected = null;
       }
@@ -549,15 +564,27 @@
   {#if blocker}
     <p class="constraint">{blocker}</p>
   {:else if hosts !== null}
-    {#each hostSources as source}
-      {@const groupHosts = hosts.filter((host) => host.source === source)}
-      <section class="host-source-group" aria-label={source === 'ssh_config' ? 'System SSH config' : 'Sloosh vault'}>
+    <div class="seg-choices host-source-switch" role="radiogroup" aria-label="Host source">
+      {#each hostSources as source}
+        <label class:chosen={hostSource === source}>
+          <input bind:group={hostSource} type="radio" name="host-list-source" value={source} />
+          <span>{sourceLabel(source)}</span>
+          {#if source === 'ssh_config' || unlock.state === 'unlocked'}
+            <span class="host-source-count">{source === 'ssh_config' ? systemHostCount : vaultHostCount}</span>
+          {:else}
+            <span class="host-source-count" title="Locked"><LockKeyhole size={11} /><span class="sr-only">locked</span></span>
+          {/if}
+        </label>
+      {/each}
+    </div>
+    {#key hostSource}
+      <section class="host-source-group" aria-label={sourceLabel(hostSource)}>
         <header class="host-source-header">
           <div>
-            <h3>{source === 'ssh_config' ? 'System SSH config' : 'Sloosh vault'}</h3>
-            <p>{source === 'ssh_config' ? '~/.ssh/config · keys stay in your SSH Agent' : unlock.state === 'locked' ? 'Locked · private credentials' : 'Unlocked · private credentials'}</p>
+            <h3>{sourceLabel(hostSource)}</h3>
+            <p>{hostSource === 'ssh_config' ? '~/.ssh/config · keys stay in your SSH Agent' : unlock.state === 'locked' ? 'Locked · private credentials' : 'Unlocked · private credentials'}</p>
           </div>
-          {#if source === 'vault'}
+          {#if hostSource === 'vault'}
             <div class="unlock-actions">
               {#if unlock.state === 'unlocked'}
                 <span class="unlock-status">{unlockMethodLabel()} · {formatCountdown(unlock.idleRemainingSecs)}</span>
@@ -572,9 +599,9 @@
             </div>
           {/if}
         </header>
-        {#if groupHosts.length > 0}
-    <ul class="host-list" aria-label="SSH hosts">
-      {#each groupHosts as host (host.alias)}
+        {#if sourceHosts.length > 0}
+    <ul class="host-list" aria-label={`${sourceLabel(hostSource)} hosts`}>
+      {#each sourceHosts as host (host.alias)}
         <li
           animate:flip={{ duration: reducedMotion ? 0 : 160 }}
           in:fade={{ duration: enterDuration }}
@@ -617,11 +644,11 @@
         </li>
       {/each}
     </ul>
-        {:else if source === 'ssh_config' || unlock.state === 'unlocked'}
+        {:else if hostSource === 'ssh_config' || unlock.state === 'unlocked'}
           <p class="constraint">No hosts saved here.</p>
         {/if}
       </section>
-    {/each}
+    {/key}
   {/if}
 </section>
 
@@ -776,6 +803,9 @@
 
           <fieldset class="form-section">
             <legend><GitBranch size={15} /> Route</legend>
+            {#if form.routeMode === 'proxy_jump'}
+              <p class="field-hint">Existing ProxyJump: <code>{form.proxyJump}</code>. Preserved unless you choose a route below.</p>
+            {/if}
             <div class="seg-choices" role="radiogroup" aria-label="Route">
               <label class:chosen={form.routeMode === 'direct'}>
                 <input bind:group={form.routeMode} type="radio" value="direct" />
@@ -785,26 +815,16 @@
                 <input bind:group={form.routeMode} type="radio" value="managed_host" />
                 <span>Through saved host</span>
               </label>
-              <label class:chosen={form.routeMode === 'proxy_jump'}>
-                <input bind:group={form.routeMode} type="radio" value="proxy_jump" />
-                <span>ProxyJump</span>
-              </label>
             </div>
             {#if form.routeMode === 'managed_host'}
               <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
                 <span>Jump host</span>
                 <select bind:value={form.managedHost} required>
                   <option value="" disabled>Select a saved host</option>
-                  {#each (hosts ?? []).filter((host) => host.alias !== form.alias) as host}
+                  {#each jumpChoices() as host (host.alias)}
                     <option value={host.alias}>{host.alias} · {endpoint(host)}</option>
                   {/each}
                 </select>
-              </label>
-            {:else if form.routeMode === 'proxy_jump'}
-              <label class="conditional-field" in:fade={{ duration: enterDuration }} out:fade={{ duration: exitDuration }}>
-                <span>ProxyJump</span>
-                <input bind:value={form.proxyJump} autocomplete="off" placeholder="user@bastion:22,edge" />
-                <small>Comma-separated OpenSSH jumps. No cycles; up to 8 hops.</small>
               </label>
             {/if}
           </fieldset>
@@ -951,3 +971,30 @@
       </footer>
     </dialog>
 {/if}
+
+<style>
+  .host-source-switch { margin-top: var(--space-xl); }
+  .host-source-switch + .host-source-group { margin-top: var(--space-lg); }
+
+  .host-source-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.25rem;
+    height: 1.125rem;
+    padding-inline: 0.3rem;
+    color: var(--muted);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    background: var(--sidebar);
+    border-radius: 999px;
+    transition: color 140ms var(--ease-out), background-color 140ms var(--ease-out);
+  }
+
+  .host-source-switch label.chosen .host-source-count {
+    color: var(--brand-ink);
+    background: color-mix(in oklch, var(--brand) 24%, transparent);
+  }
+</style>

@@ -131,19 +131,26 @@ Host stanza; shared/duplicate/included definitions require editing their source
 file. Unrelated settings and comments are preserved; overrides are rejected.
 `sloosh host add --auth agent` needs no vault and writes the same system config.
 
-The host list groups system and vault entries separately. **Save to** is an
+The host list shows one source at a time: a **System SSH config / Sloosh
+vault** switcher carries each source's host count (a lock mark while the vault
+is locked), and the selected source's header, unlock controls, empty state, and
+rows appear below it. Saving a host switches to its source. **Save to** is an
 explicit choice when adding, and stays fixed while editing. A locked vault
 remains selectable: unlock directly in the Add dialog without discarding entered
 host details before saving. Within the system
 destination, file/pasted key inputs run ssh-add on save; vault key inputs remain
-in the vault. The vault group owns its compact unlock controls. Read-only system
+in the vault. The vault source owns its compact unlock controls. Read-only system
 definitions show their reason before editing; source-specific removal text
 identifies which store changes. A saved-host/ssh-add warning is one warning,
 not simultaneous success and failure notices.
 
-**Through saved host** accepts either source: a system SSH alias is saved as
-ProxyJump, while a vault profile retains a managed-host route. Selecting a
-system jump does not copy it into the vault.
+**Through saved host** lists only hosts from the destination's source:
+system SSH hosts for a system destination, vault hosts for a vault destination.
+Changing **Save to** clears the selected jump host. A system SSH alias is saved
+as ProxyJump, while a vault profile retains a managed-host route.
+The route controls offer only **Direct** and **Through saved host**. Existing
+ProxyJump configurations are shown read-only and preserved unless you explicitly
+choose a replacement route.
 
 Host editing, listing, removal, and trust remain interactive and human-only.
 Agents may run `sloosh host add` without a TTY: the daemon performs add-only
