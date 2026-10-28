@@ -124,6 +124,8 @@ Vault 锁定时仍可选中，在添加窗口内解锁后继续保存，已填�
 输入，Agent 不接触密码。未安装原生 helper 时，仍由人类在终端添加。
 新增配置不授予连接租约，也不自动信任主机指纹。
 
+原生密码输入窗口支持 Command-V 粘贴和 Command-A 全选。
+
 ```sh
 sloosh host list
 sloosh host show myhost

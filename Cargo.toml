@@ -1,6 +1,6 @@
 [package]
 name = "sloosh"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.89"
 default-run = "sloosh"
@@ -54,7 +54,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "fs", "process"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "fs", "process"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = { version = "1.9.0", features = ["derive"] }

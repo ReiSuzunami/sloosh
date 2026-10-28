@@ -161,6 +161,8 @@ native helper, never passed to the Agent. Without that helper, use the human
 terminal flow below. Adding a profile does not grant a connection lease or
 trust its host key.
 
+Native password prompts support Command-V to paste and Command-A to select all.
+
 ```sh
 sloosh host list
 sloosh host show myhost

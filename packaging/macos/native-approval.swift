@@ -259,8 +259,24 @@ private func loadCredential(allowInteraction: Bool = true) -> CredentialResult {
     return .success(stored)
 }
 
+private func installEditMenu() {
+    let app = NSApplication.shared
+    guard app.mainMenu == nil else { return }
+
+    // Standalone helpers need menu key equivalents even without a visible menu bar.
+    let edit = NSMenu(title: "Edit")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    let editItem = NSMenuItem()
+    editItem.submenu = edit
+    let mainMenu = NSMenu()
+    mainMenu.addItem(editItem)
+    app.mainMenu = mainMenu
+}
+
 private func activateApplication() {
     NSApplication.shared.setActivationPolicy(.accessory)
+    installEditMenu()
     NSApplication.shared.activate(ignoringOtherApps: true)
 }
 
