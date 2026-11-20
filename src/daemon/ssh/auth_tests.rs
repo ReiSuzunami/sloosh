@@ -262,9 +262,9 @@ impl russh::server::Handler for TestServer {
     async fn auth_publickey_offered(
         &mut self,
         _: &str,
-        key: &PublicKey,
+        offer: russh::server::PublicKeyOffer<'_>,
     ) -> Result<russh::server::Auth, Self::Error> {
-        self.offered.lock().unwrap().push(key.clone());
+        self.offered.lock().unwrap().push(offer.public_key.clone());
         Ok(if self.accept {
             russh::server::Auth::Accept
         } else {
@@ -274,7 +274,7 @@ impl russh::server::Handler for TestServer {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &PublicKey,
+        _: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<russh::server::Auth, Self::Error> {
         Ok(russh::server::Auth::Accept)
     }
