@@ -17,15 +17,28 @@ Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebr
 | macOS 11 或更新版本，Apple silicon 或 Intel | `Sloosh-<version>-macos-universal.dmg` 或 `sloosh-macos-universal.tar.gz` |
 | Linux x86_64，且 procfs 可读 | `sloosh-linux-x86_64-musl.tar.gz` |
 
-同时下载 `SHA256SUMS`，安装前校验所选文件。
+同时下载同一个 Release 的 `SHA256SUMS`。在下载目录运行下面对应的命令；
+校验失败时，命令不会打开 DMG，也不会解压或安装。示例使用 v0.3.3 的
+DMG 文件名；如果下载了其他版本，请把 `file` 改为实际文件名。
 
 macOS DMG：
 
 ```sh
-version=0.2.8
-dmg="Sloosh-$version-macos-universal.dmg"
-grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
-open "$dmg"
+(
+  file="Sloosh-0.3.3-macos-universal.dmg"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | shasum -a 256 -c - &&
+    open "$file"
+)
 ```
 
 双击 `Install Sloosh`，检查确认信息后选择“Install”。安装器会先停止任何正在运行的
@@ -42,21 +55,49 @@ App bundle 中的 Tauri 桌面程序位于 `Contents/MacOS/Sloosh`，私有 daem
 macOS 压缩包备选方式：
 
 ```sh
-grep '  sloosh-macos-universal.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-tar -xzf sloosh-macos-universal.tar.gz
-install -d "$HOME/.local/bin"
-install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
-install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
+(
+  file="sloosh-macos-universal.tar.gz"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | shasum -a 256 -c - &&
+    work=$(mktemp -d) &&
+    trap 'rm -rf "$work"' EXIT &&
+    tar -xzf "$file" -C "$work" &&
+    install -d "$HOME/.local/bin" &&
+    install -m 0755 "$work"/sloosh-*/sloosh "$work"/sloosh-*/slooshd "$HOME/.local/bin/"
+)
 ```
 
 Linux：
 
 ```sh
-grep '  sloosh-linux-x86_64-musl.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf sloosh-linux-x86_64-musl.tar.gz
-install -d "$HOME/.local/bin"
-install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
-install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
+(
+  file="sloosh-linux-x86_64-musl.tar.gz"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | sha256sum -c - &&
+    work=$(mktemp -d) &&
+    trap 'rm -rf "$work"' EXIT &&
+    tar -xzf "$file" -C "$work" &&
+    install -d "$HOME/.local/bin" &&
+    install -m 0755 "$work"/sloosh-*/sloosh "$work"/sloosh-*/slooshd "$HOME/.local/bin/"
+)
 ```
 
 如果需要，把 `$HOME/.local/bin` 加入 `PATH`，然后验证：
