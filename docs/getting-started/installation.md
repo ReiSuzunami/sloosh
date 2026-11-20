@@ -20,15 +20,29 @@ When available, download these files from the
 | macOS 11 or newer, Apple silicon or Intel | `Sloosh-<version>-macos-universal.dmg` or `sloosh-macos-universal.tar.gz` |
 | Linux x86_64 with readable procfs | `sloosh-linux-x86_64-musl.tar.gz` |
 
-Download `SHA256SUMS` from the same release and verify the selected file.
+Download `SHA256SUMS` from the same release and run the corresponding commands
+below in your download directory. A failed check stops before opening,
+extracting, or installing. The DMG example uses v0.3.3; set `file` to the exact
+filename you downloaded if using another version.
 
 macOS DMG:
 
 ```sh
-version=0.2.8
-dmg="Sloosh-$version-macos-universal.dmg"
-grep "  $dmg$" SHA256SUMS | shasum -a 256 -c -
-open "$dmg"
+(
+  file="Sloosh-0.3.3-macos-universal.dmg"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | shasum -a 256 -c - &&
+    open "$file"
+)
 ```
 
 Double-click `Install Sloosh`, review the confirmation, and choose Install. The
@@ -49,21 +63,49 @@ the local protocol rather than shelling out to a CLI.
 macOS archive alternative:
 
 ```sh
-grep '  sloosh-macos-universal.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-tar -xzf sloosh-macos-universal.tar.gz
-install -d "$HOME/.local/bin"
-install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
-install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
+(
+  file="sloosh-macos-universal.tar.gz"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | shasum -a 256 -c - &&
+    work=$(mktemp -d) &&
+    trap 'rm -rf "$work"' EXIT &&
+    tar -xzf "$file" -C "$work" &&
+    install -d "$HOME/.local/bin" &&
+    install -m 0755 "$work"/sloosh-*/sloosh "$work"/sloosh-*/slooshd "$HOME/.local/bin/"
+)
 ```
 
 Linux:
 
 ```sh
-grep '  sloosh-linux-x86_64-musl.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf sloosh-linux-x86_64-musl.tar.gz
-install -d "$HOME/.local/bin"
-install -m 0755 sloosh-*/sloosh "$HOME/.local/bin/sloosh"
-install -m 0755 sloosh-*/slooshd "$HOME/.local/bin/slooshd"
+(
+  file="sloosh-linux-x86_64-musl.tar.gz"
+  checksum=$(awk -v file="$file" '
+    substr($0, 65) == "  " file { count++; line = $0 }
+    END {
+      if (count != 1 || substr(line, 1, 64) !~ /^[[:xdigit:]]+$/) exit 1
+      print line
+    }
+  ' SHA256SUMS) || {
+    printf 'Expected one checksum entry for %s in SHA256SUMS\n' "$file" >&2
+    exit 1
+  }
+  printf '%s\n' "$checksum" | sha256sum -c - &&
+    work=$(mktemp -d) &&
+    trap 'rm -rf "$work"' EXIT &&
+    tar -xzf "$file" -C "$work" &&
+    install -d "$HOME/.local/bin" &&
+    install -m 0755 "$work"/sloosh-*/sloosh "$work"/sloosh-*/slooshd "$HOME/.local/bin/"
+)
 ```
 
 Add `$HOME/.local/bin` to `PATH` if needed, then verify the installation:
