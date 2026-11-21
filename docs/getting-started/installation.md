@@ -22,14 +22,14 @@ When available, download these files from the
 
 Download `SHA256SUMS` from the same release and run the corresponding commands
 below in your download directory. A failed check stops before opening,
-extracting, or installing. The DMG example uses v0.3.3; set `file` to the exact
+extracting, or installing. The DMG example uses v0.3.4; set `file` to the exact
 filename you downloaded if using another version.
 
 macOS DMG:
 
 ```sh
 (
-  file="Sloosh-0.3.3-macos-universal.dmg"
+  file="Sloosh-0.3.4-macos-universal.dmg"
   checksum=$(awk -v file="$file" '
     substr($0, 65) == "  " file { count++; line = $0 }
     END {
