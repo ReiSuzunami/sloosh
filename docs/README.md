@@ -28,6 +28,11 @@ Repository-only, non-canonical research notes:
   options.
 - [`cloud-mcp-ssh-research.md`](https://github.com/ReiSuzunami/sloosh/blob/main/docs/research/cloud-mcp-ssh-research.md)
   compares hosted MCP/SSH execution models.
+- [`chat-mcp-requirements.md`](research/chat-mcp-requirements.md)
+  ([简体中文](research/chat-mcp-requirements.zh-CN.md)) drafts a ChatGPT /
+  Claude Chat MCP that keeps daemon authority: outbound bridge, first-class
+  `local` target, system-agent-only allowlist, and host-scoped YOLO. It is not
+  shipped behavior.
 
 Research records dated external facts and design exploration; it is not shipped
 in release archives or the crates.io package. `SECURITY.md`, `architecture.md`,
