@@ -18,14 +18,14 @@ Rust 用户准备的次要源码安装渠道，始终会在本机编译。Homebr
 | Linux x86_64，且 procfs 可读 | `sloosh-linux-x86_64-musl.tar.gz` |
 
 同时下载同一个 Release 的 `SHA256SUMS`。在下载目录运行下面对应的命令；
-校验失败时，命令不会打开 DMG，也不会解压或安装。示例使用 v0.3.3 的
+校验失败时，命令不会打开 DMG，也不会解压或安装。示例使用 v0.3.4 的
 DMG 文件名；如果下载了其他版本，请把 `file` 改为实际文件名。
 
 macOS DMG：
 
 ```sh
 (
-  file="Sloosh-0.3.3-macos-universal.dmg"
+  file="Sloosh-0.3.4-macos-universal.dmg"
   checksum=$(awk -v file="$file" '
     substr($0, 65) == "  " file { count++; line = $0 }
     END {
